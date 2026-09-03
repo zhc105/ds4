@@ -1223,6 +1223,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
         if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
             cfg->engine.tp.role == DS4_TP_LEADER ||
             getenv("DS4_CLI_FORCE_SESSION") != NULL ||
+            ds4_engine_is_qwen35(engine) ||
             cfg->gen.temperature > 0.0f ||
             ds4_engine_mtp_draft_tokens(engine) > 1) {
             /* TP leaders always drive the session path: the sync/eval

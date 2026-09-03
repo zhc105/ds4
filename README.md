@@ -241,6 +241,34 @@ Vision-Exp has its own DSpark checkpoint. Do not use the 0731 support model:
   --mtp-model gguf/DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf
 ```
 
+## Qwen3.5 (work in progress)
+
+Qwen3.5 dense models (Gated DeltaNet + gated GQA attention) load from a
+llama.cpp-layout `qwen35` GGUF, BF16/F16/Q8_0 or NVFP4 with the companion
+`.scale` tensors.  They run on the CPU reference path and on the CUDA graph
+(DGX Spark is the target; Metal and ROCm builds refuse Qwen graph sessions).
+This is the foundation for the Qwen3.8-Flash-Next work.
+
+```sh
+python3 gguf-tools/qwen35_convert.py hf/Qwen3.5-2B-NVFP4 -o gguf/Qwen3.5-2B-NVFP4.gguf
+make cpu                    # or: make cuda-spark
+./ds4 -m gguf/Qwen3.5-2B-NVFP4.gguf --cpu -p "What is the capital of France?" -n 64
+./ds4 -m gguf/Qwen3.5-2B-NVFP4.gguf --cuda -p "What is the capital of France?" -n 64
+tests/qwen35_smoke.sh gguf/Qwen3.5-2B-NVFP4.gguf gguf/Qwen3.5-2B-F16.gguf   # CPU logits vs llama.cpp
+```
+
+`DS4_QWEN35_DUMP_LOGITS=FILE` appends teacher-forced logits on either backend
+(every prompt position on the CPU; on the graph one normal prefill chunk, then
+single tokens), which is how the CUDA kernels are checked against the CPU
+reference.
+
+The smoke test feeds the same token ids to the ds4 CPU path and to libllama
+and compares the per-position logits; pass the F16 requantization of the same
+model on the llama.cpp side so its 8-bit activation quantization of NVFP4
+matmuls does not enter the comparison.  Supported prompt format is ChatML
+with `<think>` handling; disk KV checkpoints and the MTP block are not wired
+up yet.
+
 ## GLM 5.3 Flash
 
 GLM 5.3 Flash uses a separate graph for its recurrent KDA layers, sparse DSA

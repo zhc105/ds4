@@ -3113,6 +3113,61 @@ int ds4_gpu_glm53_scatter_image_hc(
         uint32_t              n_hc);
 
 /* GLM-5.3 Kimi Delta Attention. Recurrent and convolution state stay FP32. */
+/* Qwen3.5 (CUDA only): NVFP4 matmul, Gated DeltaNet, gated GQA attention.
+ * See ds4_qwen35_gpu.cuh for the buffer layouts. */
+int ds4_gpu_qwen35_matmul_nvfp4(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        float                 scale,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tok);
+int ds4_gpu_qwen35_scale(ds4_gpu_tensor *x, uint64_t n, float scale);
+int ds4_gpu_qwen35_gdn(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *ssm_state,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_w_offset,
+        uint64_t              a_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              norm_offset,
+        uint32_t              n_k,
+        uint32_t              n_v,
+        uint32_t              n_conv,
+        uint32_t              n_tokens,
+        float                 eps);
+int ds4_gpu_qwen35_attention(
+        ds4_gpu_tensor       *att,
+        ds4_gpu_tensor       *part,
+        ds4_gpu_tensor       *qg,
+        ds4_gpu_tensor       *k_cache,
+        ds4_gpu_tensor       *v_cache,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_norm_offset,
+        uint64_t              k_norm_offset,
+        uint32_t              n_head,
+        uint32_t              n_kv,
+        uint32_t              hd,
+        uint32_t              n_rot,
+        uint32_t              ctx,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        float                 freq_base,
+        float                 eps);
+
 int ds4_gpu_glm53_kda_decode(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
