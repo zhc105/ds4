@@ -191,3 +191,33 @@ make -C gguf-tools quality-score
 gguf-tools/quality-testing/score_official MODEL.gguf gguf-tools/quality-testing/data/manifest.tsv /tmp/model.tsv 4096
 python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
 ```
+
+## Qwen3.5 (HF safetensors to GGUF)
+
+`qwen35_convert.py` converts a Qwen3.5 dense checkpoint, BF16 or ModelOpt
+NVFP4 (for example `AxionML/Qwen3.5-2B-NVFP4`), into a GGUF that follows the
+llama.cpp `qwen35` layout.  It needs only numpy; the shared reader/writer and
+the NVFP4 repacking live in `hf_gguf.py` and are meant to be reused for the
+Qwen3.8-Flash-Next NVFP4 conversion.
+
+```sh
+python3 gguf-tools/qwen35_convert.py hf/Qwen3.5-2B-NVFP4 -o gguf/Qwen3.5-2B-NVFP4.gguf
+python3 gguf-tools/qwen35_convert.py hf/Qwen3.5-2B-NVFP4 -o /dev/null --dry-run   # print the plan
+python3 gguf-tools/tests/test_hf_gguf.py                                            # unit tests
+```
+
+Format notes, all matching upstream llama.cpp so either converter's output
+loads the same way:
+
+- NVFP4 weights are GGML type 40: 64-element super-blocks of four UE4M3 block
+  scales plus 32 packed E2M1 bytes.  The ModelOpt per-tensor global scale is
+  written unchanged as `<tensor>.scale` (F32, one element) and the activation
+  scale as `<tensor>.input_scale`, so block scales stay exact for tensor-core
+  NVFP4 GEMMs.
+- Zero-centered RMSNorm weights are stored as `1 + w`; `linear_attn.norm` is
+  stored as is.  `A_log` is stored as `-exp(A_log)` in `blk.N.ssm_a`, and
+  `dt_bias` as `blk.N.ssm_dt.bias`.
+- GDN V heads are reordered from grouped to tiled order when there are more V
+  than K heads (identity for the 2B model).
+- The MTP block becomes layer `num_hidden_layers` with `blk.L.nextn.*` tensors
+  and `qwen35.nextn_predict_layers`.  The vision tower is not converted.
