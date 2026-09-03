@@ -215,6 +215,64 @@ def nvfp4_dequant_gguf(raw, n_cols, scale2):
     return (_E2M1[vals] * d[..., None] * np.float32(scale2)).reshape(out_features, n_cols)
 
 
+def nvfp4_stack_experts(read_weight, read_scale, n_expert):
+    """Stack per-expert ModelOpt NVFP4 tensors into one [n_expert][out][in]
+    GGML NVFP4 tensor.  read_weight(e) / read_scale(e) return expert e's
+    packed weight and E4M3 scale arrays; every expert must share one shape."""
+    raw0, shape = nvfp4_repack(read_weight(0), read_scale(0))
+    out = np.empty((n_expert,) + raw0.shape, dtype=np.uint8)
+    out[0] = raw0
+    for e in range(1, n_expert):
+        raw, s = nvfp4_repack(read_weight(e), read_scale(e))
+        if s != shape:
+            fail(f"expert {e} has shape {s}, expected {shape}")
+        out[e] = raw
+    return out, [n_expert] + shape
+
+
+# ---------------------------------------------------------------------------
+# PLE n-gram table sidecar (ds4 .ngram file, not GGUF)
+# ---------------------------------------------------------------------------
+
+NGRAM_MAGIC = b"DS4NGRAM"
+NGRAM_VERSION = 1
+NGRAM_HEADER_BYTES = 4096      # rows start page aligned
+NGRAM_DTYPE_E4M3 = 1
+
+
+def ngram_header(rows, row_bytes, global_scale, multipliers, head_offsets, head_vocab_sizes):
+    """Fixed 4 KiB header: magic, version, layout, hash constants.  Row i of
+    the table lives at NGRAM_HEADER_BYTES + i * row_bytes; row = 16 heads x
+    (row_bytes / 16) E4M3 values scaled by global_scale."""
+    if len(head_offsets) != len(head_vocab_sizes):
+        fail("PLE head offsets and vocab sizes differ in length")
+    body = NGRAM_MAGIC
+    body += struct.pack("<IIQIfII", NGRAM_VERSION, row_bytes, rows, NGRAM_DTYPE_E4M3, global_scale,
+                        len(multipliers), len(head_offsets))
+    body += struct.pack(f"<{len(multipliers)}Q", *multipliers)
+    body += struct.pack(f"<{len(head_offsets)}Q", *head_offsets)
+    body += struct.pack(f"<{len(head_vocab_sizes)}Q", *head_vocab_sizes)
+    if len(body) > NGRAM_HEADER_BYTES:
+        fail("PLE header does not fit")
+    return body + bytes(NGRAM_HEADER_BYTES - len(body))
+
+
+def read_ngram_header(path):
+    with open(path, "rb") as fp:
+        raw = fp.read(NGRAM_HEADER_BYTES)
+    if raw[:8] != NGRAM_MAGIC:
+        fail(f"{path}: not a ds4 n-gram table")
+    version, row_bytes, rows, dtype, scale, n_mult, n_heads = struct.unpack_from("<IIQIfII", raw, 8)
+    pos = 8 + struct.calcsize("<IIQIfII")
+    multipliers = list(struct.unpack_from(f"<{n_mult}Q", raw, pos))
+    pos += 8 * n_mult
+    offsets = list(struct.unpack_from(f"<{n_heads}Q", raw, pos))
+    pos += 8 * n_heads
+    sizes = list(struct.unpack_from(f"<{n_heads}Q", raw, pos))
+    return {"version": version, "row_bytes": row_bytes, "rows": rows, "dtype": dtype, "scale": scale,
+            "multipliers": multipliers, "head_offsets": offsets, "head_vocab_sizes": sizes}
+
+
 # ---------------------------------------------------------------------------
 # Linear-attention V head reorder (grouped -> tiled), as llama.cpp expects
 # ---------------------------------------------------------------------------
@@ -276,6 +334,10 @@ class GGUFWriter:
     def add_i32_array(self, key, values):
         """Integer arrays are INT32: llama.cpp's vocab loader insists on it for token types."""
         self._add(key, struct.pack("<IIQ", KV_ARRAY, KV_INT32, len(values)) + struct.pack(f"<{len(values)}i", *values))
+
+    def add_u64_array(self, key, values):
+        """PLE hash constants: 45-bit multipliers and row ranges past int32."""
+        self._add(key, struct.pack("<IIQ", KV_ARRAY, KV_UINT64, len(values)) + struct.pack(f"<{len(values)}Q", *values))
 
     def add_string_array(self, key, values):
         self._add(key, struct.pack("<IIQ", KV_ARRAY, KV_STRING, len(values)) + b"".join(_pack_string(v) for v in values))

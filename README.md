@@ -250,7 +250,7 @@ llama.cpp-layout `qwen35` GGUF, BF16/F16/Q8_0 or NVFP4 with the companion
 This is the foundation for the Qwen3.8-Flash-Next work.
 
 ```sh
-python3 gguf-tools/qwen35_convert.py hf/Qwen3.5-2B-NVFP4 -o gguf/Qwen3.5-2B-NVFP4.gguf
+python3 gguf-tools/qwen_convert.py hf/Qwen3.5-2B-NVFP4 -o gguf/Qwen3.5-2B-NVFP4.gguf
 make cpu                    # or: make cuda-spark
 ./ds4 -m gguf/Qwen3.5-2B-NVFP4.gguf --cpu -p "What is the capital of France?" -n 64
 ./ds4 -m gguf/Qwen3.5-2B-NVFP4.gguf --cuda -p "What is the capital of France?" -n 64

@@ -192,19 +192,30 @@ gguf-tools/quality-testing/score_official MODEL.gguf gguf-tools/quality-testing/
 python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
 ```
 
-## Qwen3.5 (HF safetensors to GGUF)
+## Qwen3.5 and Qwen3.8-Flash-Next (HF safetensors to GGUF)
 
-`qwen35_convert.py` converts a Qwen3.5 dense checkpoint, BF16 or ModelOpt
-NVFP4 (for example `AxionML/Qwen3.5-2B-NVFP4`), into a GGUF that follows the
-llama.cpp `qwen35` layout.  It needs only numpy; the shared reader/writer and
-the NVFP4 repacking live in `hf_gguf.py` and are meant to be reused for the
-Qwen3.8-Flash-Next NVFP4 conversion.
+`qwen_convert.py` converts a Qwen3.5 dense checkpoint or a Qwen3.8-Flash-Next
+(`qwen4_exp`) checkpoint, BF16 or ModelOpt NVFP4 (`AxionML/Qwen3.5-2B-NVFP4`,
+`RadixArk/Qwen3.8-Flash-Next-NVFP4`), into a GGUF that follows the llama.cpp
+`qwen35` / `qwen4exp` layouts.  It needs only numpy; the shared reader/writer,
+the NVFP4 repacking and expert stacking live in `hf_gguf.py`.
 
 ```sh
-python3 gguf-tools/qwen35_convert.py hf/Qwen3.5-2B-NVFP4 -o gguf/Qwen3.5-2B-NVFP4.gguf
-python3 gguf-tools/qwen35_convert.py hf/Qwen3.5-2B-NVFP4 -o /dev/null --dry-run   # print the plan
-python3 gguf-tools/tests/test_hf_gguf.py                                            # unit tests
+python3 gguf-tools/qwen_convert.py hf/Qwen3.5-2B-NVFP4 -o gguf/Qwen3.5-2B-NVFP4.gguf
+python3 gguf-tools/qwen_convert.py hf/Qwen3.8-Flash-Next-NVFP4 -o gguf/Qwen3.8-Flash-Next-NVFP4.gguf
+python3 gguf-tools/qwen_convert.py hf/Qwen3.5-2B-NVFP4 -o /dev/null --dry-run   # print the plan
+python3 gguf-tools/tests/test_hf_gguf.py                                          # unit tests
 ```
+
+Flash-Next specifics: routed experts are stacked per layer into
+`blk.N.ffn_{gate,up,down}_exps` NVFP4 tensors with `.scale` / `.input_scale`
+arrays of one entry per expert; the QSA indexer's fused qk projection is split
+into `indexer.q_proj` / `indexer.k_proj`; the Gated Residual tensors become
+`hc_attn_*`, `hc_ffn_*` and `output_hc_*`.  The 47.7 GiB n-gram table is not a
+GGUF tensor: it is written as `<out>.ngram`, a ds4 sidecar with a 4 KiB header
+(`hf_gguf.ngram_header`) followed by the E4M3 rows in their original order,
+and the GGUF metadata records the hash constants plus `qwen4exp.ple.table_file`.
+The MTP head and the vision tower are not converted.
 
 Format notes, all matching upstream llama.cpp so either converter's output
 loads the same way:

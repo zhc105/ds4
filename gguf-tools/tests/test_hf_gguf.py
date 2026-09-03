@@ -59,6 +59,35 @@ class NVFP4Tests(unittest.TestCase):
             self.assertEqual(list(block >> 4), list(range(8, 16)))        # element j+8 high nibble
 
 
+class ExpertStackTests(unittest.TestCase):
+    def test_stack_matches_per_expert_repack(self):
+        rng = np.random.default_rng(3)
+        experts = [random_modelopt(rng, 4, 128) for _ in range(3)]
+        raw, shape = hg.nvfp4_stack_experts(lambda e: experts[e][0], lambda e: experts[e][1], 3)
+        self.assertEqual(shape, [3, 4, 128])
+        self.assertEqual(raw.shape, (3, 4, 128 // 64 * 36))
+        for e in range(3):
+            np.testing.assert_array_equal(raw[e], hg.nvfp4_repack(*experts[e])[0])
+
+
+class NgramHeaderTests(unittest.TestCase):
+    def test_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.ngram")
+            header = hg.ngram_header(320001536, 160, 0.125, [23703573157769, 20109073645365, 8052911324071],
+                                     [0, 20000003], [20000003, 20000023])
+            self.assertEqual(len(header), hg.NGRAM_HEADER_BYTES)
+            with open(path, "wb") as fp:
+                fp.write(header)
+            h = hg.read_ngram_header(path)
+        self.assertEqual(h["rows"], 320001536)
+        self.assertEqual(h["row_bytes"], 160)
+        self.assertEqual(h["scale"], 0.125)
+        self.assertEqual(h["multipliers"], [23703573157769, 20109073645365, 8052911324071])
+        self.assertEqual(h["head_offsets"], [0, 20000003])
+        self.assertEqual(h["head_vocab_sizes"], [20000003, 20000023])
+
+
 class ReorderTests(unittest.TestCase):
     def test_perm_is_tiled(self):
         # 2 K heads, 3 V per K: grouped [00 01 02 10 11 12] -> tiled [00 10 01 11 02 12]
