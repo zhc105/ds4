@@ -274,7 +274,10 @@ validate completely: hyper-connection mixers, routed NVFP4 experts with
 per-expert scales, the QSA indexer, the PLE projections, and the `.ngram`
 sidecar (mmapped, header checked against the GGUF hash constants).  The
 forward pass for that variant is the next step; `--inspect` shows the
-shape and the n-gram table.
+shape and the n-gram table.  `tests/qwen_vllm_compare.py` checks a
+`DS4_QWEN_DUMP_LOGITS` dump teacher-forced against a vLLM server serving the
+same checkpoint (argmax agreement, top-k overlap, and the log-prob gap on
+the tokens vLLM reports), which is the reference for the Flash-Next work.
 
 ## GLM 5.3 Flash
 
