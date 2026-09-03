@@ -269,6 +269,13 @@ matmuls does not enter the comparison.  Supported prompt format is ChatML
 with `<think>` handling; disk KV checkpoints and the MTP block are not wired
 up yet.
 
+Qwen3.8-Flash-Next (`qwen4exp`) GGUFs from the same converter load and
+validate completely: hyper-connection mixers, routed NVFP4 experts with
+per-expert scales, the QSA indexer, the PLE projections, and the `.ngram`
+sidecar (mmapped, header checked against the GGUF hash constants).  The
+forward pass for that variant is the next step; `--inspect` shows the
+shape and the n-gram table.
+
 ## GLM 5.3 Flash
 
 GLM 5.3 Flash uses a separate graph for its recurrent KDA layers, sparse DSA
