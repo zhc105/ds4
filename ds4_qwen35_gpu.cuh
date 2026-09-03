@@ -1,8 +1,9 @@
-/* Qwen3.5 CUDA kernels: NVFP4 matmul, Gated DeltaNet, gated GQA attention.
+/* Qwen family CUDA kernels, written for Qwen3.5 and shared by Flash-Next:
+ * NVFP4 matmul, Gated DeltaNet, gated GQA attention.
  *
  * Included from ds4_cuda.cu so the helpers there (cuda_resolve_weight_ptr,
  * cuda_decode_stream, warp_sum_f32, cuda_ok) are visible.  The ds4.c graph
- * calls the extern "C" wrappers below under DS4_QWEN35_GPU; Metal and ROCm
+ * calls the extern "C" wrappers below under DS4_QWEN_GPU; Metal and ROCm
  * builds never reference them.  Layouts mirror the CPU reference in ds4.c:
  *   mixed      [n_tok][2*k_dim + v_dim]   conv+SiLU output, q/k L2-normalised
  *   conv_state [n_conv-1][conv_dim]        most recent inputs, oldest first

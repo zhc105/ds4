@@ -22,7 +22,7 @@ cc -O2 -I "$LLAMA_CPP_DIR/include" -I "$LLAMA_CPP_DIR/ggml/include" \
    -L "$LLAMA_CPP_DIR/build/bin" -lllama -lggml -lggml-base -Wl,-rpath,"$LLAMA_CPP_DIR/build/bin"
 
 ./ds4 -m "$DS4_MODEL" --cpu --dump-tokens -p "$PROMPT" 2>/dev/null | head -1 | tr -d '[],' > "$WORK/ids.txt"
-DS4_QWEN35_DUMP_LOGITS="$WORK/ds4.bin" ./ds4 -m "$DS4_MODEL" --cpu -c 512 -n 1 --temp 0 -p "$PROMPT" > /dev/null 2>&1
+DS4_QWEN_DUMP_LOGITS="$WORK/ds4.bin" ./ds4 -m "$DS4_MODEL" --cpu -c 512 -n 1 --temp 0 -p "$PROMPT" > /dev/null 2>&1
 "$WORK/llama_logits_dump" "$LLAMA_MODEL" "$WORK/ids.txt" "$WORK/llama.bin" 2>/dev/null
 
 python3 - "$WORK/ds4.bin" "$WORK/llama.bin" <<'PY'

@@ -112,7 +112,7 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 /* The Qwen3.5 GPU graph targets DGX Spark and exists only in the CUDA build;
  * Metal and ROCm keep the CPU reference for this family. */
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-#define DS4_QWEN35_GPU 1
+#define DS4_QWEN_GPU 1
 #endif
 
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
@@ -496,7 +496,7 @@ enum {
 typedef enum {
     DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
-    DS4_MODEL_FAMILY_QWEN35    = 2,
+    DS4_MODEL_FAMILY_QWEN    = 2,
 } ds4_model_family;
 
 typedef enum {
@@ -717,14 +717,16 @@ static const ds4_shape DS4_SHAPE_GLM53 = {
     .kda_gate_lower_bound = -5.0f,
 };
 
-/* Qwen3.5 dense hybrid: Gated DeltaNet layers with one gated GQA attention
- * layer every n_attn_interval layers, zero-centred RMSNorm folded into the
- * GGUF, MTP as a trailing nextn block.  Every size of the family shares this
- * structure, so the dimensions come from the GGUF in
- * config_validate_qwen35_model() rather than a fixed table entry. */
-static const ds4_shape DS4_SHAPE_QWEN35 = {
+/* Qwen family (Qwen3.5 dense, Qwen3.8-Flash-Next MoE): Gated DeltaNet layers
+ * with one gated GQA attention layer every n_attn_interval layers,
+ * zero-centred RMSNorm folded into the GGUF, MTP as a trailing nextn block.
+ * Every member shares this skeleton, so the dimensions come from the GGUF in
+ * config_validate_qwen_model() rather than a fixed table entry; the variant
+ * names which optional components (hyper-connections, routed experts, sparse
+ * attention, PLE) the layers carry. */
+static const ds4_shape DS4_SHAPE_QWEN = {
     .name = "Qwen3.5",
-    .family = DS4_MODEL_FAMILY_QWEN35,
+    .family = DS4_MODEL_FAMILY_QWEN,
     .variant = DS4_VARIANT_QWEN35,
     .rope_scale_factor = 1.0f,
 };
@@ -834,14 +836,15 @@ static bool ds4_glm53_layer_is_kda(uint32_t il) {
            il % 4u != 3u;
 }
 
-static bool ds4_model_is_qwen35(void) {
-    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35;
+static bool ds4_model_is_qwen(void) {
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN;
 }
 
-/* Qwen3.5 runs Gated DeltaNet everywhere except every n_attn_interval-th
- * layer; the trailing MTP block is a full-attention layer outside the pass. */
-static bool ds4_qwen35_layer_is_gdn(uint32_t il) {
-    return ds4_model_is_qwen35() &&
+/* The Qwen family runs Gated DeltaNet everywhere except every
+ * n_attn_interval-th layer; the trailing MTP block is a full-attention layer
+ * outside the pass. */
+static bool ds4_qwen_layer_is_gdn(uint32_t il) {
+    return ds4_model_is_qwen() &&
            il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER &&
            (il + 1u) % DS4_N_ATTN_INTERVAL != 0u;
 }
@@ -850,7 +853,7 @@ static bool ds4_qwen35_layer_is_gdn(uint32_t il) {
  * normal forward pass skips. */
 static bool ds4_model_has_nextn_block(void) {
     return (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) &&
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) &&
            DS4_N_LAYER > DS4_N_NEXTN_PREDICT;
 }
 
@@ -4992,7 +4995,7 @@ static void tensor_expect_routed_expert(
 
 static bool weights_have_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
         return w && w->output_norm && w->output;
     }
     return w &&
@@ -5005,7 +5008,7 @@ static bool weights_have_output_head(const ds4_weights *w) {
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
         return w && (w->output_norm || w->output);
     }
     return w &&
@@ -5083,12 +5086,12 @@ static bool weights_glm_dsa_layer_has_required(const ds4_layer_weights *l, uint3
     return true;
 }
 
-static bool weights_qwen35_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
+static bool weights_qwen_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l->attn_norm || !l->post_attention_norm ||
         !l->ffn_gate || !l->ffn_up || !l->ffn_down) {
         return false;
     }
-    if (ds4_qwen35_layer_is_gdn(il)) {
+    if (ds4_qwen_layer_is_gdn(il)) {
         return l->attn_qkv && l->attn_gate && l->ssm_alpha && l->ssm_beta &&
                l->ssm_out && l->ssm_conv1d && l->ssm_dt && l->ssm_a && l->ssm_norm;
     }
@@ -5101,8 +5104,8 @@ static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return weights_glm_dsa_layer_has_required(l, il);
     }
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
-        return weights_qwen35_layer_has_required(l, il);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        return weights_qwen_layer_has_required(l, il);
     }
     if (!l->hc_attn_fn ||
         !l->hc_attn_scale ||
@@ -5330,7 +5333,7 @@ static void weights_validate_glm_dsa_layout(
     }
 }
 
-static bool tensor_type_is_qwen35_linear(uint32_t type) {
+static bool tensor_type_is_qwen_linear(uint32_t type) {
     return type == DS4_TENSOR_F32 ||
            type == DS4_TENSOR_F16 ||
            type == DS4_TENSOR_BF16 ||
@@ -5338,9 +5341,9 @@ static bool tensor_type_is_qwen35_linear(uint32_t type) {
            type == DS4_TENSOR_NVFP4;
 }
 
-static void tensor_expect_qwen35_linear_layout(const ds4_tensor *t, uint64_t in_dim, uint64_t out_dim) {
+static void tensor_expect_qwen_linear_layout(const ds4_tensor *t, uint64_t in_dim, uint64_t out_dim) {
     if (!t) ds4_die("internal error: missing tensor while validating Qwen linear layout");
-    if (!tensor_type_is_qwen35_linear(t->type)) {
+    if (!tensor_type_is_qwen_linear(t->type)) {
         fprintf(stderr,
                 "ds4: tensor %.*s has type %s, expected f32, f16, bf16, q8_0, or nvfp4\n",
                 (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
@@ -5349,7 +5352,7 @@ static void tensor_expect_qwen35_linear_layout(const ds4_tensor *t, uint64_t in_
     tensor_expect_layout(t, t->type, 2, in_dim, out_dim, 0);
 }
 
-static void weights_validate_qwen35_layout(
+static void weights_validate_qwen_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
         uint32_t           layer_end,
@@ -5370,11 +5373,11 @@ static void weights_validate_qwen35_layout(
     }
 
     if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
-    if (w->token_embd) tensor_expect_qwen35_linear_layout(w->token_embd, n_embd, DS4_N_VOCAB);
+    if (w->token_embd) tensor_expect_qwen_linear_layout(w->token_embd, n_embd, DS4_N_VOCAB);
     if (require_output && !weights_have_output_head(w)) ds4_die("required output head tensors are missing");
     if (weights_have_partial_output_head(w) && !weights_have_output_head(w)) ds4_die("partial output head in GGUF");
     if (w->output_norm) tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, n_embd, 0, 0);
-    if (w->output) tensor_expect_qwen35_linear_layout(w->output, n_embd, DS4_N_VOCAB);
+    if (w->output) tensor_expect_qwen_linear_layout(w->output, n_embd, DS4_N_VOCAB);
 
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
@@ -5384,29 +5387,29 @@ static void weights_validate_qwen35_layout(
         }
         tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, n_embd, 0, 0);
         tensor_expect_layout(l->post_attention_norm, DS4_TENSOR_F32, 1, n_embd, 0, 0);
-        if (ds4_qwen35_layer_is_gdn(il)) {
-            tensor_expect_qwen35_linear_layout(l->attn_qkv, n_embd, 2u * k_dim + v_dim);
-            tensor_expect_qwen35_linear_layout(l->attn_gate, n_embd, v_dim);
-            tensor_expect_qwen35_linear_layout(l->ssm_alpha, n_embd, DS4_N_KDA_V_HEAD);
-            tensor_expect_qwen35_linear_layout(l->ssm_beta, n_embd, DS4_N_KDA_V_HEAD);
-            tensor_expect_qwen35_linear_layout(l->ssm_out, v_dim, n_embd);
+        if (ds4_qwen_layer_is_gdn(il)) {
+            tensor_expect_qwen_linear_layout(l->attn_qkv, n_embd, 2u * k_dim + v_dim);
+            tensor_expect_qwen_linear_layout(l->attn_gate, n_embd, v_dim);
+            tensor_expect_qwen_linear_layout(l->ssm_alpha, n_embd, DS4_N_KDA_V_HEAD);
+            tensor_expect_qwen_linear_layout(l->ssm_beta, n_embd, DS4_N_KDA_V_HEAD);
+            tensor_expect_qwen_linear_layout(l->ssm_out, v_dim, n_embd);
             tensor_expect_layout(l->ssm_conv1d, DS4_TENSOR_F32, 2, DS4_N_KDA_CONV, 2u * k_dim + v_dim, 0);
             tensor_expect_layout(l->ssm_dt, DS4_TENSOR_F32, 1, DS4_N_KDA_V_HEAD, 0, 0);
             tensor_expect_layout(l->ssm_a, DS4_TENSOR_F32, 1, DS4_N_KDA_V_HEAD, 0, 0);
             tensor_expect_layout(l->ssm_norm, DS4_TENSOR_F32, 1, DS4_N_KDA_HEAD_DIM, 0, 0);
         } else {
-            tensor_expect_qwen35_linear_layout(l->attn_q, n_embd, q_dim);
-            tensor_expect_qwen35_linear_layout(l->attn_k, n_embd, kv_dim);
-            tensor_expect_qwen35_linear_layout(l->attn_v, n_embd, kv_dim);
-            tensor_expect_qwen35_linear_layout(l->attn_output, o_dim, n_embd);
+            tensor_expect_qwen_linear_layout(l->attn_q, n_embd, q_dim);
+            tensor_expect_qwen_linear_layout(l->attn_k, n_embd, kv_dim);
+            tensor_expect_qwen_linear_layout(l->attn_v, n_embd, kv_dim);
+            tensor_expect_qwen_linear_layout(l->attn_output, o_dim, n_embd);
             tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
             tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
         }
-        tensor_expect_qwen35_linear_layout(l->ffn_gate, n_embd, DS4_N_FF_DENSE);
-        tensor_expect_qwen35_linear_layout(l->ffn_up, n_embd, DS4_N_FF_DENSE);
-        tensor_expect_qwen35_linear_layout(l->ffn_down, DS4_N_FF_DENSE, n_embd);
+        tensor_expect_qwen_linear_layout(l->ffn_gate, n_embd, DS4_N_FF_DENSE);
+        tensor_expect_qwen_linear_layout(l->ffn_up, n_embd, DS4_N_FF_DENSE);
+        tensor_expect_qwen_linear_layout(l->ffn_down, DS4_N_FF_DENSE, n_embd);
         if (il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER) {
-            tensor_expect_qwen35_linear_layout(l->nextn_eh_proj, 2u * n_embd, n_embd);
+            tensor_expect_qwen_linear_layout(l->nextn_eh_proj, 2u * n_embd, n_embd);
             tensor_expect_layout(l->nextn_enorm, DS4_TENSOR_F32, 1, n_embd, 0, 0);
             tensor_expect_layout(l->nextn_hnorm, DS4_TENSOR_F32, 1, n_embd, 0, 0);
             tensor_expect_layout(l->nextn_shared_head_norm, DS4_TENSOR_F32, 1, n_embd, 0, 0);
@@ -5420,8 +5423,8 @@ static void weights_validate_layout(
         uint32_t           layer_end,
         bool               require_token_embd,
         bool               require_output) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
-        weights_validate_qwen35_layout(w, layer_start, layer_end, require_token_embd, require_output);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        weights_validate_qwen_layout(w, layer_start, layer_end, require_token_embd, require_output);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -6350,57 +6353,67 @@ static void config_validate_glm53_model(const ds4_model *m) {
     config_validate_glm53_layer_types(m);
 }
 
-/* Qwen3.5 reads its dimensions from the llama.cpp-style qwen35.* keys.  The
- * ssm.* keys keep llama.cpp's Mamba naming: state_size is the K head size,
- * group_count the K head count, time_step_rank the V head count. */
-static void config_validate_qwen35_model(const ds4_model *m) {
-    g_ds4_shape = DS4_SHAPE_QWEN35;
+/* The Qwen family reads its dimensions from llama.cpp-style "<arch>.*" keys;
+ * the GDN layout is shared by every member, so this is the common part and
+ * the caller names the architecture.  The ssm.* keys keep llama.cpp's Mamba
+ * naming: state_size is the K head size, group_count the K head count,
+ * time_step_rank the V head count. */
+static const char *qwen_key(char *buf, size_t n, const char *arch, const char *suffix) {
+    snprintf(buf, n, "%s.%s", arch, suffix);
+    return buf;
+}
+
+static void config_validate_qwen_model(const ds4_model *m, const char *arch) {
+    g_ds4_shape = DS4_SHAPE_QWEN;
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
     ds4_shape *s = &g_ds4_shape;
+    char k[96];
+#define QK(suffix) qwen_key(k, sizeof k, arch, suffix)
 
-    s->n_layer = required_u32(m, "qwen35.block_count");
-    s->rope_orig_ctx = required_u64_compat(m, "qwen35.context_length");
-    s->n_embd = required_u32(m, "qwen35.embedding_length");
-    s->n_vocab = required_u32(m, "qwen35.vocab_size");
-    s->n_ff_dense = required_u32(m, "qwen35.feed_forward_length");
-    s->n_head = required_u32(m, "qwen35.attention.head_count");
-    s->n_head_kv = required_u32(m, "qwen35.attention.head_count_kv");
-    s->n_head_dim = required_u32(m, "qwen35.attention.key_length");
-    s->n_value_dim = required_u32(m, "qwen35.attention.value_length");
-    s->n_rot = required_u32(m, "qwen35.rope.dimension_count");
-    s->rms_eps = required_f32(m, "qwen35.attention.layer_norm_rms_epsilon");
-    s->rope_freq_base = required_f32(m, "qwen35.rope.freq_base");
-    s->n_kda_conv = required_u32(m, "qwen35.ssm.conv_kernel");
-    s->n_kda_head_dim = required_u32(m, "qwen35.ssm.state_size");
-    s->n_kda_head = required_u32(m, "qwen35.ssm.group_count");
-    s->n_kda_v_head = required_u32(m, "qwen35.ssm.time_step_rank");
-    s->n_attn_interval = required_u32(m, "qwen35.full_attention_interval");
-    const uint32_t inner = required_u32(m, "qwen35.ssm.inner_size");
+    s->n_layer = required_u32(m, QK("block_count"));
+    s->rope_orig_ctx = required_u64_compat(m, QK("context_length"));
+    s->n_embd = required_u32(m, QK("embedding_length"));
+    s->n_vocab = required_u32(m, QK("vocab_size"));
+    s->n_ff_dense = required_u32(m, QK("feed_forward_length"));
+    s->n_head = required_u32(m, QK("attention.head_count"));
+    s->n_head_kv = required_u32(m, QK("attention.head_count_kv"));
+    s->n_head_dim = required_u32(m, QK("attention.key_length"));
+    s->n_value_dim = required_u32(m, QK("attention.value_length"));
+    s->n_rot = required_u32(m, QK("rope.dimension_count"));
+    s->rms_eps = required_f32(m, QK("attention.layer_norm_rms_epsilon"));
+    s->rope_freq_base = required_f32(m, QK("rope.freq_base"));
+    s->n_kda_conv = required_u32(m, QK("ssm.conv_kernel"));
+    s->n_kda_head_dim = required_u32(m, QK("ssm.state_size"));
+    s->n_kda_head = required_u32(m, QK("ssm.group_count"));
+    s->n_kda_v_head = required_u32(m, QK("ssm.time_step_rank"));
+    s->n_attn_interval = required_u32(m, QK("full_attention_interval"));
+    const uint32_t inner = required_u32(m, QK("ssm.inner_size"));
     uint32_t nextn = 0;
-    model_get_u32(m, "qwen35.nextn_predict_layers", &nextn);
+    model_get_u32(m, QK("nextn_predict_layers"), &nextn);
     s->n_nextn_predict = nextn;
+#undef QK
 
     if (s->n_layer == 0 || s->n_layer > DS4_MAX_LAYER || s->n_layer <= nextn) {
-        ds4_die("qwen35: unsupported block_count");
+        ds4_die("qwen: unsupported block_count");
     }
     if (s->n_embd == 0 || s->n_embd > DS4_MAX_EMBD || s->n_vocab == 0 || s->n_vocab > DS4_MAX_VOCAB ||
         s->n_ff_dense == 0) {
-        ds4_die("qwen35: unsupported embedding, vocab, or feed-forward size");
+        ds4_die("qwen: unsupported embedding, vocab, or feed-forward size");
     }
     if (s->n_head == 0 || s->n_head > DS4_MAX_HEAD ||
         s->n_head_kv == 0 || s->n_head_kv > DS4_MAX_HEAD_KV || s->n_head % s->n_head_kv != 0 ||
         s->n_head_dim == 0 || s->n_head_dim > DS4_MAX_HEAD_DIM || s->n_head_dim != s->n_value_dim ||
         s->n_rot == 0 || s->n_rot > s->n_head_dim || s->n_rot % 2 != 0) {
-        ds4_die("qwen35: unsupported attention head layout");
+        ds4_die("qwen: unsupported attention head layout");
     }
     if (s->n_kda_head == 0 || s->n_kda_v_head == 0 || s->n_kda_v_head % s->n_kda_head != 0 ||
         s->n_kda_v_head > DS4_MAX_KDA_HEAD || s->n_kda_head_dim == 0 ||
         s->n_kda_head_dim > DS4_MAX_KDA_HEAD_DIM ||
         s->n_kda_conv < 2 || s->n_kda_conv > DS4_MAX_KDA_CONV ||
         inner != s->n_kda_v_head * s->n_kda_head_dim) {
-        ds4_die("qwen35: unsupported linear attention layout");
+        ds4_die("qwen: unsupported linear attention layout");
     }
-    if (s->n_attn_interval == 0) ds4_die("qwen35: full_attention_interval must be nonzero");
+    if (s->n_attn_interval == 0) ds4_die("qwen: full_attention_interval must be nonzero");
 }
 
 static void config_validate_model(const ds4_model *m) {
@@ -6408,7 +6421,7 @@ static void config_validate_model(const ds4_model *m) {
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch)) {
         if (ds4_streq(arch, "qwen35")) {
-            config_validate_qwen35_model(m);
+            config_validate_qwen_model(m, "qwen35");
             return;
         }
         if (ds4_streq(arch, "glm-dsa")) {
@@ -6737,14 +6750,14 @@ static void weights_bind_output(
         const ds4_model *m,
         bool             required,
         bool             optional) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
         if (required || optional) {
             w->output_norm = required ? required_tensor(m, "output_norm.weight")
                                       : model_find_tensor(m, "output_norm.weight");
             w->output = model_find_tensor(m, "output.weight");
             /* tie_word_embeddings: the head reads the token embedding rows */
             if (!w->output) w->output = w->token_embd;
-            if (required && !w->output) ds4_die("qwen35 output head is missing");
+            if (required && !w->output) ds4_die("qwen output head is missing");
         }
     } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (required) {
@@ -6775,10 +6788,10 @@ static void weights_bind_output(
     }
 }
 
-static void weights_bind_qwen35_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+static void weights_bind_qwen_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     l->attn_norm           = required_tensorf(m, "blk.%u.attn_norm.weight", il);
     l->post_attention_norm = required_tensorf(m, "blk.%u.post_attention_norm.weight", il);
-    if (ds4_qwen35_layer_is_gdn(il)) {
+    if (ds4_qwen_layer_is_gdn(il)) {
         l->attn_qkv   = required_tensorf(m, "blk.%u.attn_qkv.weight", il);
         l->attn_gate  = required_tensorf(m, "blk.%u.attn_gate.weight", il);
         l->ssm_alpha  = required_tensorf(m, "blk.%u.ssm_alpha.weight", il);
@@ -6884,8 +6897,8 @@ static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m,
 }
 
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
-        weights_bind_qwen35_layer(l, m, il);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        weights_bind_qwen_layer(l, m, il);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -14995,10 +15008,10 @@ typedef struct {
     float *state;   /* GDN: [n_v_head][head_dim (v)][head_dim (k)] */
     float *k;       /* attention: [ctx][n_head_kv * head_dim], RoPE applied */
     float *v;       /* attention: [ctx][n_head_kv * head_dim] */
-} ds4_qwen35_layer_state;
+} ds4_qwen_layer_state;
 
 typedef struct {
-    ds4_qwen35_layer_state layer[DS4_MAX_LAYER];
+    ds4_qwen_layer_state layer[DS4_MAX_LAYER];
     uint32_t ctx;
     uint32_t n_tokens;
     /* scratch, sized once for the largest projection of either layer kind */
@@ -15012,28 +15025,28 @@ typedef struct {
     float *kv;      /* [2 * n_head_kv * head_dim] k then v */
     float *att;     /* [max(v_dim, n_head * head_dim)] */
     float *scores;  /* [ctx] */
-} ds4_qwen35_state;
+} ds4_qwen_state;
 
-static uint64_t qwen35_conv_dim(void) {
+static uint64_t qwen_conv_dim(void) {
     return 2ull * DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM +
            (uint64_t)DS4_N_KDA_V_HEAD * DS4_N_KDA_HEAD_DIM;
 }
 
-static uint64_t qwen35_max_u64(uint64_t a, uint64_t b) {
+static uint64_t qwen_max_u64(uint64_t a, uint64_t b) {
     return a > b ? a : b;
 }
 
-static void qwen35_state_init(ds4_qwen35_state *st, uint32_t ctx) {
+static void qwen_state_init(ds4_qwen_state *st, uint32_t ctx) {
     memset(st, 0, sizeof(*st));
     st->ctx = ctx;
-    const uint64_t conv_dim = qwen35_conv_dim();
+    const uint64_t conv_dim = qwen_conv_dim();
     const uint64_t hd = DS4_N_KDA_HEAD_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_KDA_V_HEAD * hd;
     const uint64_t attn_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
-        ds4_qwen35_layer_state *l = &st->layer[il];
-        if (ds4_qwen35_layer_is_gdn(il)) {
+        ds4_qwen_layer_state *l = &st->layer[il];
+        if (ds4_qwen_layer_is_gdn(il)) {
             l->conv = xmalloc_zeroed((DS4_N_KDA_CONV - 1u) * conv_dim, sizeof(float));
             l->state = xmalloc_zeroed((uint64_t)DS4_N_KDA_V_HEAD * hd * hd, sizeof(float));
         } else {
@@ -15044,21 +15057,21 @@ static void qwen35_state_init(ds4_qwen35_state *st, uint32_t ctx) {
     st->x = xmalloc(DS4_N_EMBD * sizeof(float));
     st->h = xmalloc(DS4_N_EMBD * sizeof(float));
     st->y = xmalloc(DS4_N_EMBD * sizeof(float));
-    st->proj = xmalloc(qwen35_max_u64(conv_dim, 2u * attn_dim) * sizeof(float));
-    st->mixed = xmalloc(qwen35_max_u64(conv_dim, DS4_N_FF_DENSE) * sizeof(float));
-    st->z = xmalloc(qwen35_max_u64(v_dim, DS4_N_FF_DENSE) * sizeof(float));
+    st->proj = xmalloc(qwen_max_u64(conv_dim, 2u * attn_dim) * sizeof(float));
+    st->mixed = xmalloc(qwen_max_u64(conv_dim, DS4_N_FF_DENSE) * sizeof(float));
+    st->z = xmalloc(qwen_max_u64(v_dim, DS4_N_FF_DENSE) * sizeof(float));
     st->ab = xmalloc(2u * DS4_N_KDA_V_HEAD * sizeof(float));
     st->kv = xmalloc(2u * kv_dim * sizeof(float));
-    st->att = xmalloc(qwen35_max_u64(v_dim, attn_dim) * sizeof(float));
+    st->att = xmalloc(qwen_max_u64(v_dim, attn_dim) * sizeof(float));
     st->scores = xmalloc((uint64_t)ctx * sizeof(float));
 }
 
-static void qwen35_state_reset(ds4_qwen35_state *st) {
-    const uint64_t conv_dim = qwen35_conv_dim();
+static void qwen_state_reset(ds4_qwen_state *st) {
+    const uint64_t conv_dim = qwen_conv_dim();
     const uint64_t hd = DS4_N_KDA_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
-        ds4_qwen35_layer_state *l = &st->layer[il];
+        ds4_qwen_layer_state *l = &st->layer[il];
         if (l->conv) memset(l->conv, 0, (DS4_N_KDA_CONV - 1u) * conv_dim * sizeof(float));
         if (l->state) memset(l->state, 0, (uint64_t)DS4_N_KDA_V_HEAD * hd * hd * sizeof(float));
         if (l->k) memset(l->k, 0, (uint64_t)st->ctx * kv_dim * sizeof(float));
@@ -15067,7 +15080,7 @@ static void qwen35_state_reset(ds4_qwen35_state *st) {
     st->n_tokens = 0;
 }
 
-static void qwen35_state_free(ds4_qwen35_state *st) {
+static void qwen_state_free(ds4_qwen_state *st) {
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         free(st->layer[il].conv);
         free(st->layer[il].state);
@@ -15087,7 +15100,7 @@ static void qwen35_state_free(ds4_qwen35_state *st) {
     memset(st, 0, sizeof(*st));
 }
 
-static void qwen35_l2_norm_inplace(float *x, uint32_t n, float eps) {
+static void qwen_l2_norm_inplace(float *x, uint32_t n, float eps) {
     float ss = 0.0f;
     for (uint32_t i = 0; i < n; i++) ss += x[i] * x[i];
     const float inv = 1.0f / sqrtf(ss + eps);
@@ -15102,19 +15115,19 @@ static void qwen35_l2_norm_inplace(float *x, uint32_t n, float eps) {
  *   out = W_out( RMSNorm(o) * SiLU(z) )
  * With more V than K heads the V heads sit in llama.cpp's tiled order, so V
  * head hv reads K head hv % n_k_head. */
-static void qwen35_gdn_forward(
+static void qwen_gdn_forward(
         float                   *out,
         const ds4_model         *m,
         const ds4_layer_weights *l,
-        ds4_qwen35_layer_state  *ls,
-        ds4_qwen35_state        *st,
+        ds4_qwen_layer_state  *ls,
+        ds4_qwen_state        *st,
         const float             *x) {
     const uint32_t nk = DS4_N_KDA_HEAD;
     const uint32_t nv = DS4_N_KDA_V_HEAD;
     const uint32_t hd = DS4_N_KDA_HEAD_DIM;
     const uint32_t nconv = DS4_N_KDA_CONV;
     const uint64_t k_dim = (uint64_t)nk * hd;
-    const uint64_t conv_dim = qwen35_conv_dim();
+    const uint64_t conv_dim = qwen_conv_dim();
     const float eps = DS4_RMS_EPS;
 
     float *qkv = st->proj;
@@ -15146,8 +15159,8 @@ static void qwen35_gdn_forward(
     float *k = mixed + k_dim;
     float *v = mixed + 2 * k_dim;
     for (uint32_t h = 0; h < nk; h++) {
-        qwen35_l2_norm_inplace(q + (uint64_t)h * hd, hd, eps);
-        qwen35_l2_norm_inplace(k + (uint64_t)h * hd, hd, eps);
+        qwen_l2_norm_inplace(q + (uint64_t)h * hd, hd, eps);
+        qwen_l2_norm_inplace(k + (uint64_t)h * hd, hd, eps);
     }
 
     const float *dt_bias = tensor_data(m, l->ssm_dt);
@@ -15189,7 +15202,7 @@ static void qwen35_gdn_forward(
 /* NeoX-style rotation of the first n_rot dims of one head: pair (i, i+n_rot/2).
  * Qwen3.5 uses interleaved M-RoPE, which for text (all three position streams
  * equal) is exactly this. */
-static void qwen35_rope_inplace(float *head, uint32_t pos) {
+static void qwen_rope_inplace(float *head, uint32_t pos) {
     const uint32_t half = DS4_N_ROT / 2;
     for (uint32_t i = 0; i < half; i++) {
         const float theta = (float)pos * powf(DS4_ROPE_FREQ_BASE, -(float)(2 * i) / (float)DS4_N_ROT);
@@ -15205,12 +15218,12 @@ static void qwen35_rope_inplace(float *head, uint32_t pos) {
 /* Gated GQA attention for one token at position pos.  attn_q yields per head
  * [query | gate]; query and key heads are RMS-normalised before RoPE and the
  * attention output is multiplied by sigmoid(gate) before the output proj. */
-static void qwen35_attention_forward(
+static void qwen_attention_forward(
         float                   *out,
         const ds4_model         *m,
         const ds4_layer_weights *l,
-        ds4_qwen35_layer_state  *ls,
-        ds4_qwen35_state        *st,
+        ds4_qwen_layer_state  *ls,
+        ds4_qwen_state        *st,
         const float             *x,
         uint32_t                 pos) {
     const uint32_t n_head = DS4_N_HEAD;
@@ -15235,12 +15248,12 @@ static void qwen35_attention_forward(
     for (uint32_t h = 0; h < n_head; h++) {
         float *qh = qg + (uint64_t)h * 2 * hd;
         rms_norm_weight(qh, qh, q_norm, hd, eps);
-        qwen35_rope_inplace(qh, pos);
+        qwen_rope_inplace(qh, pos);
     }
     for (uint32_t h = 0; h < n_kv; h++) {
         float *kh = k + (uint64_t)h * hd;
         rms_norm_weight(kh, kh, k_norm, hd, eps);
-        qwen35_rope_inplace(kh, pos);
+        qwen_rope_inplace(kh, pos);
     }
     memcpy(ls->k + (uint64_t)pos * kv_dim, k, kv_dim * sizeof(float));
     memcpy(ls->v + (uint64_t)pos * kv_dim, v, kv_dim * sizeof(float));
@@ -15276,11 +15289,11 @@ static void qwen35_attention_forward(
     matvec_any(out, m, l->attn_output, att);
 }
 
-static void qwen35_ffn_forward(
+static void qwen_ffn_forward(
         float                   *out,
         const ds4_model         *m,
         const ds4_layer_weights *l,
-        ds4_qwen35_state        *st,
+        ds4_qwen_state        *st,
         const float             *x) {
     float *gate = st->mixed;
     float *up = st->z;
@@ -15292,30 +15305,30 @@ static void qwen35_ffn_forward(
 
 /* One token through every executable layer.  logits may be NULL for prompt
  * tokens whose distribution is not needed, which skips the output head. */
-static void qwen35_forward_token(
+static void qwen_forward_token(
         float             *logits,
         const ds4_model   *m,
         const ds4_weights *w,
-        ds4_qwen35_state  *st,
+        ds4_qwen_state  *st,
         int                token,
         uint32_t           pos) {
-    if (pos >= st->ctx) ds4_die("qwen35: token position exceeds the session context");
+    if (pos >= st->ctx) ds4_die("qwen: token position exceeds the session context");
     float *x = st->x;
     float *h = st->h;
     float *y = st->y;
     embed_token_any(m, w, token, x);
     for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
-        ds4_qwen35_layer_state *ls = &st->layer[il];
+        ds4_qwen_layer_state *ls = &st->layer[il];
         rms_norm_weight(h, x, tensor_data(m, l->attn_norm), DS4_N_EMBD, DS4_RMS_EPS);
-        if (ds4_qwen35_layer_is_gdn(il)) {
-            qwen35_gdn_forward(y, m, l, ls, st, h);
+        if (ds4_qwen_layer_is_gdn(il)) {
+            qwen_gdn_forward(y, m, l, ls, st, h);
         } else {
-            qwen35_attention_forward(y, m, l, ls, st, h, pos);
+            qwen_attention_forward(y, m, l, ls, st, h, pos);
         }
         for (uint32_t i = 0; i < DS4_N_EMBD; i++) x[i] += y[i];
         rms_norm_weight(h, x, tensor_data(m, l->post_attention_norm), DS4_N_EMBD, DS4_RMS_EPS);
-        qwen35_ffn_forward(y, m, l, st, h);
+        qwen_ffn_forward(y, m, l, st, h);
         for (uint32_t i = 0; i < DS4_N_EMBD; i++) x[i] += y[i];
     }
     st->n_tokens = pos + 1;
@@ -15327,14 +15340,14 @@ static void qwen35_forward_token(
 
 /* Qwen3.5 context memory: per-token K/V rows for the attention layers plus
  * the fixed GDN conv history and recurrent state, all f32 on the CPU path. */
-static ds4_context_memory qwen35_context_memory_estimate(uint32_t ctx) {
+static ds4_context_memory qwen_context_memory_estimate(uint32_t ctx) {
     ds4_context_memory m = {0};
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const uint64_t hd = DS4_N_KDA_HEAD_DIM;
     const uint64_t gdn_state = (uint64_t)DS4_N_KDA_V_HEAD * hd * hd +
-                               (uint64_t)(DS4_N_KDA_CONV - 1u) * qwen35_conv_dim();
+                               (uint64_t)(DS4_N_KDA_CONV - 1u) * qwen_conv_dim();
     for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
-        if (ds4_qwen35_layer_is_gdn(il)) {
+        if (ds4_qwen_layer_is_gdn(il)) {
             m.compressed_bytes += gdn_state * sizeof(float);
         } else {
             m.raw_bytes += 2ull * ctx * kv_dim * sizeof(float);
@@ -15346,7 +15359,7 @@ static ds4_context_memory qwen35_context_memory_estimate(uint32_t ctx) {
     return m;
 }
 
-#ifdef DS4_QWEN35_GPU
+#ifdef DS4_QWEN_GPU
 /* =========================================================================
  * Qwen3.5 CUDA Graph.
  * =========================================================================
@@ -15355,7 +15368,7 @@ static ds4_context_memory qwen35_context_memory_estimate(uint32_t ctx) {
  * cache, plus activation scratch for up to max_rows tokens.  Prefill and
  * decode share one forward routine that feeds tokens in max_rows chunks on
  * the decode stream; weights stay in the mmap'd GGUF and are resolved per
- * call.  The kernels live in ds4_qwen35_gpu.cuh and mirror the CPU
+ * call.  The kernels live in ds4_qwen_gpu.cuh and mirror the CPU
  * reference above, which is what the graph is validated against.
  */
 
@@ -15381,9 +15394,9 @@ typedef struct {
     ds4_gpu_tensor *att;         /* GDN or attention output before the out proj */
     ds4_gpu_tensor *att_part;    /* decode attention split partials */
     ds4_gpu_tensor *logits;      /* [n_vocab] */
-} ds4_qwen35_gpu_graph;
+} ds4_qwen_gpu_graph;
 
-static void qwen35_graph_free(ds4_qwen35_gpu_graph *g) {
+static void qwen_graph_free(ds4_qwen_gpu_graph *g) {
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         if (g->conv_state[il]) ds4_gpu_tensor_free(g->conv_state[il]);
         if (g->ssm_state[il]) ds4_gpu_tensor_free(g->ssm_state[il]);
@@ -15399,8 +15412,8 @@ static void qwen35_graph_free(ds4_qwen35_gpu_graph *g) {
 }
 
 /* Zero the recurrent state; K/V rows past n_tokens are never read. */
-static bool qwen35_graph_reset(ds4_qwen35_gpu_graph *g) {
-    const uint64_t conv_elems = (uint64_t)(DS4_N_KDA_CONV - 1u) * qwen35_conv_dim();
+static bool qwen_graph_reset(ds4_qwen_gpu_graph *g) {
+    const uint64_t conv_elems = (uint64_t)(DS4_N_KDA_CONV - 1u) * qwen_conv_dim();
     const uint64_t state_elems = (uint64_t)DS4_N_KDA_V_HEAD * DS4_N_KDA_HEAD_DIM * DS4_N_KDA_HEAD_DIM;
     bool ok = true;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -15411,55 +15424,55 @@ static bool qwen35_graph_reset(ds4_qwen35_gpu_graph *g) {
     return ok;
 }
 
-static ds4_gpu_tensor *qwen35_graph_tensor(uint64_t elems, bool *ok) {
+static ds4_gpu_tensor *qwen_graph_tensor(uint64_t elems, bool *ok) {
     ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(elems * sizeof(float));
     if (!t) *ok = false;
     return t;
 }
 
-static bool qwen35_graph_alloc(ds4_qwen35_gpu_graph *g, uint32_t ctx, uint32_t max_rows) {
+static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_rows) {
     memset(g, 0, sizeof(*g));
     g->ctx = ctx;
     g->max_rows = max_rows;
     const uint64_t hd = DS4_N_KDA_HEAD_DIM;
-    const uint64_t conv_dim = qwen35_conv_dim();
+    const uint64_t conv_dim = qwen_conv_dim();
     const uint64_t v_dim = (uint64_t)DS4_N_KDA_V_HEAD * hd;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const uint64_t attn_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t rows = max_rows;
     bool ok = true;
     for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
-        if (ds4_qwen35_layer_is_gdn(il)) {
-            g->conv_state[il] = qwen35_graph_tensor((DS4_N_KDA_CONV - 1u) * conv_dim, &ok);
-            g->ssm_state[il] = qwen35_graph_tensor(v_dim * hd, &ok);
+        if (ds4_qwen_layer_is_gdn(il)) {
+            g->conv_state[il] = qwen_graph_tensor((DS4_N_KDA_CONV - 1u) * conv_dim, &ok);
+            g->ssm_state[il] = qwen_graph_tensor(v_dim * hd, &ok);
         } else {
-            g->k_cache[il] = qwen35_graph_tensor((uint64_t)ctx * kv_dim, &ok);
-            g->v_cache[il] = qwen35_graph_tensor((uint64_t)ctx * kv_dim, &ok);
+            g->k_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim, &ok);
+            g->v_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim, &ok);
         }
     }
-    g->tokens = qwen35_graph_tensor(rows, &ok);
-    g->x = qwen35_graph_tensor(rows * DS4_N_EMBD, &ok);
-    g->h = qwen35_graph_tensor(rows * DS4_N_EMBD, &ok);
-    g->y = qwen35_graph_tensor(rows * DS4_N_EMBD, &ok);
-    g->proj = qwen35_graph_tensor(rows * qwen35_max_u64(conv_dim, 2u * attn_dim), &ok);
-    g->mixed = qwen35_graph_tensor(rows * qwen35_max_u64(conv_dim, DS4_N_FF_DENSE), &ok);
-    g->z = qwen35_graph_tensor(rows * qwen35_max_u64(v_dim, DS4_N_FF_DENSE), &ok);
-    g->alpha = qwen35_graph_tensor(rows * DS4_N_KDA_V_HEAD, &ok);
-    g->beta = qwen35_graph_tensor(rows * DS4_N_KDA_V_HEAD, &ok);
-    g->k = qwen35_graph_tensor(rows * kv_dim, &ok);
-    g->v = qwen35_graph_tensor(rows * kv_dim, &ok);
-    g->att = qwen35_graph_tensor(rows * qwen35_max_u64(v_dim, attn_dim), &ok);
+    g->tokens = qwen_graph_tensor(rows, &ok);
+    g->x = qwen_graph_tensor(rows * DS4_N_EMBD, &ok);
+    g->h = qwen_graph_tensor(rows * DS4_N_EMBD, &ok);
+    g->y = qwen_graph_tensor(rows * DS4_N_EMBD, &ok);
+    g->proj = qwen_graph_tensor(rows * qwen_max_u64(conv_dim, 2u * attn_dim), &ok);
+    g->mixed = qwen_graph_tensor(rows * qwen_max_u64(conv_dim, DS4_N_FF_DENSE), &ok);
+    g->z = qwen_graph_tensor(rows * qwen_max_u64(v_dim, DS4_N_FF_DENSE), &ok);
+    g->alpha = qwen_graph_tensor(rows * DS4_N_KDA_V_HEAD, &ok);
+    g->beta = qwen_graph_tensor(rows * DS4_N_KDA_V_HEAD, &ok);
+    g->k = qwen_graph_tensor(rows * kv_dim, &ok);
+    g->v = qwen_graph_tensor(rows * kv_dim, &ok);
+    g->att = qwen_graph_tensor(rows * qwen_max_u64(v_dim, attn_dim), &ok);
     /* up to 8 decode rows x heads x 64 key splits x (values, max, sum) */
-    g->att_part = qwen35_graph_tensor(8ull * DS4_N_HEAD * 64ull * (DS4_N_HEAD_DIM + 2u), &ok);
-    g->logits = qwen35_graph_tensor(DS4_N_VOCAB, &ok);
-    if (ok) ok = qwen35_graph_reset(g);
-    if (!ok) qwen35_graph_free(g);
+    g->att_part = qwen_graph_tensor(8ull * DS4_N_HEAD * 64ull * (DS4_N_HEAD_DIM + 2u), &ok);
+    g->logits = qwen_graph_tensor(DS4_N_VOCAB, &ok);
+    if (ok) ok = qwen_graph_reset(g);
+    if (!ok) qwen_graph_free(g);
     return ok;
 }
 
 /* out[n_tok][out_dim] = x[n_tok][in_dim] W^T for any linear type the loader
  * accepts; the per-tensor scale is folded in afterwards. */
-static bool qwen35_graph_matmul(
+static bool qwen_graph_matmul(
         ds4_gpu_tensor   *out,
         const ds4_model  *m,
         const ds4_tensor *w,
@@ -15491,8 +15504,8 @@ static bool qwen35_graph_matmul(
     return ok;
 }
 
-static bool qwen35_graph_rms_norm(
-        ds4_qwen35_gpu_graph *g,
+static bool qwen_graph_rms_norm(
+        ds4_qwen_gpu_graph *g,
         const ds4_model      *m,
         const ds4_tensor     *w,
         uint32_t              n) {
@@ -15500,49 +15513,49 @@ static bool qwen35_graph_rms_norm(
                                                DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
 }
 
-static bool qwen35_graph_layer(
-        ds4_qwen35_gpu_graph    *g,
+static bool qwen_graph_layer(
+        ds4_qwen_gpu_graph    *g,
         const ds4_model         *m,
         const ds4_layer_weights *l,
         uint32_t                 il,
         uint32_t                 n,
         uint32_t                 pos0) {
-    bool ok = qwen35_graph_rms_norm(g, m, l->attn_norm, n);
-    if (ds4_qwen35_layer_is_gdn(il)) {
-        if (ok) ok = qwen35_graph_matmul(g->proj, m, l->attn_qkv, g->h, n);
-        if (ok) ok = qwen35_graph_matmul(g->z, m, l->attn_gate, g->h, n);
-        if (ok) ok = qwen35_graph_matmul(g->alpha, m, l->ssm_alpha, g->h, n);
-        if (ok) ok = qwen35_graph_matmul(g->beta, m, l->ssm_beta, g->h, n);
+    bool ok = qwen_graph_rms_norm(g, m, l->attn_norm, n);
+    if (ds4_qwen_layer_is_gdn(il)) {
+        if (ok) ok = qwen_graph_matmul(g->proj, m, l->attn_qkv, g->h, n);
+        if (ok) ok = qwen_graph_matmul(g->z, m, l->attn_gate, g->h, n);
+        if (ok) ok = qwen_graph_matmul(g->alpha, m, l->ssm_alpha, g->h, n);
+        if (ok) ok = qwen_graph_matmul(g->beta, m, l->ssm_beta, g->h, n);
         if (ok) ok = ds4_gpu_qwen35_gdn(g->att, g->mixed, g->conv_state[il], g->ssm_state[il],
                                         g->proj, g->z, g->alpha, g->beta, m->map, m->size,
                                         l->ssm_conv1d->abs_offset, l->ssm_a->abs_offset,
                                         l->ssm_dt->abs_offset, l->ssm_norm->abs_offset,
                                         DS4_N_KDA_HEAD, DS4_N_KDA_V_HEAD, DS4_N_KDA_CONV,
                                         n, DS4_RMS_EPS) != 0;
-        if (ok) ok = qwen35_graph_matmul(g->y, m, l->ssm_out, g->att, n);
+        if (ok) ok = qwen_graph_matmul(g->y, m, l->ssm_out, g->att, n);
     } else {
-        if (ok) ok = qwen35_graph_matmul(g->proj, m, l->attn_q, g->h, n);
-        if (ok) ok = qwen35_graph_matmul(g->k, m, l->attn_k, g->h, n);
-        if (ok) ok = qwen35_graph_matmul(g->v, m, l->attn_v, g->h, n);
+        if (ok) ok = qwen_graph_matmul(g->proj, m, l->attn_q, g->h, n);
+        if (ok) ok = qwen_graph_matmul(g->k, m, l->attn_k, g->h, n);
+        if (ok) ok = qwen_graph_matmul(g->v, m, l->attn_v, g->h, n);
         if (ok) ok = ds4_gpu_qwen35_attention(g->att, g->att_part, g->proj, g->k_cache[il], g->v_cache[il],
                                               g->k, g->v, m->map, m->size,
                                               l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                               DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
                                               g->ctx, pos0, n, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) != 0;
-        if (ok) ok = qwen35_graph_matmul(g->y, m, l->attn_output, g->att, n);
+        if (ok) ok = qwen_graph_matmul(g->y, m, l->attn_output, g->att, n);
     }
     if (ok) ok = ds4_gpu_add_tensor(g->x, g->x, g->y, n * DS4_N_EMBD) != 0;
-    if (ok) ok = qwen35_graph_rms_norm(g, m, l->post_attention_norm, n);
-    if (ok) ok = qwen35_graph_matmul(g->mixed, m, l->ffn_gate, g->h, n);
-    if (ok) ok = qwen35_graph_matmul(g->z, m, l->ffn_up, g->h, n);
+    if (ok) ok = qwen_graph_rms_norm(g, m, l->post_attention_norm, n);
+    if (ok) ok = qwen_graph_matmul(g->mixed, m, l->ffn_gate, g->h, n);
+    if (ok) ok = qwen_graph_matmul(g->z, m, l->ffn_up, g->h, n);
     if (ok) ok = ds4_gpu_swiglu_tensor(g->mixed, g->mixed, g->z, n * DS4_N_FF_DENSE, 0.0f, 1.0f) != 0;
-    if (ok) ok = qwen35_graph_matmul(g->y, m, l->ffn_down, g->mixed, n);
+    if (ok) ok = qwen_graph_matmul(g->y, m, l->ffn_down, g->mixed, n);
     if (ok) ok = ds4_gpu_add_tensor(g->x, g->x, g->y, n * DS4_N_EMBD) != 0;
     return ok;
 }
 
-static bool qwen35_graph_embed(
-        ds4_qwen35_gpu_graph *g,
+static bool qwen_graph_embed(
+        ds4_qwen_gpu_graph *g,
         const ds4_model      *m,
         const ds4_weights    *w,
         uint32_t              n) {
@@ -15557,8 +15570,8 @@ static bool qwen35_graph_embed(
 
 /* Fold n tokens into the state, in max_rows chunks.  logits_out, when set,
  * receives the distribution after the last token. */
-static bool qwen35_graph_forward(
-        ds4_qwen35_gpu_graph *g,
+static bool qwen_graph_forward(
+        ds4_qwen_gpu_graph *g,
         const ds4_model      *m,
         const ds4_weights    *w,
         const int            *tokens,
@@ -15572,9 +15585,9 @@ static bool qwen35_graph_forward(
         const uint32_t rows = n - done < g->max_rows ? n - done : g->max_rows;
         const uint32_t pos0 = g->n_tokens;
         ok = ds4_gpu_tensor_write(g->tokens, 0, tokens + done, (uint64_t)rows * sizeof(int32_t)) != 0;
-        if (ok) ok = qwen35_graph_embed(g, m, w, rows);
+        if (ok) ok = qwen_graph_embed(g, m, w, rows);
         for (uint32_t il = 0; ok && il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
-            ok = qwen35_graph_layer(g, m, &w->layer[il], il, rows, pos0);
+            ok = qwen_graph_layer(g, m, &w->layer[il], il, rows, pos0);
         }
         g->n_tokens += rows;
         done += rows;
@@ -15587,7 +15600,7 @@ static bool qwen35_graph_forward(
         ok = last && h &&
              ds4_gpu_rms_norm_weight_tensor(h, last, m->map, m->size, w->output_norm->abs_offset,
                                             DS4_N_EMBD, DS4_RMS_EPS) != 0 &&
-             qwen35_graph_matmul(g->logits, m, w->output, h, 1);
+             qwen_graph_matmul(g->logits, m, w->output, h, 1);
         if (last) ds4_gpu_tensor_free(last);
         if (h) ds4_gpu_tensor_free(h);
     }
@@ -15598,7 +15611,7 @@ static bool qwen35_graph_forward(
     return ok;
 }
 
-#endif /* DS4_QWEN35_GPU */
+#endif /* DS4_QWEN_GPU */
 
 /* CPU prefill in layer-major order.  All prompt tokens pass through layer 0,
  * then layer 1, etc., which exposes batch matmul opportunities. */
@@ -38926,7 +38939,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         bool        ssd_streaming) {
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
-    if (ds4_model_is_qwen35()) return qwen35_context_memory_estimate(ctx);
+    if (ds4_model_is_qwen()) return qwen_context_memory_estimate(ctx);
 
     if (ds4_backend_uses_graph(backend)) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -40159,7 +40172,7 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         bpe_tokenize_text_llama3_style(vocab, text, out, 3);
         return;
     }
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
         bpe_tokenize_text_llama3_style(vocab, text, out, 1);
         return;
     }
@@ -40285,7 +40298,7 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
         /* ChatML: no BOS, <|im_end|> ends every turn and is the EOS. */
         vocab->bos_id = -1;
         if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
@@ -40374,7 +40387,7 @@ static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *tex
 /* ChatML as the Qwen3.5 template renders it: "<|im_start|>role\ncontent<|im_end|>\n".
  * Assistant content may carry <think> markers, so it goes through the
  * rendered-chat tokenizer; user and system text is plain. */
-static void qwen35_chat_push_message(const ds4_vocab *vocab, const char *role,
+static void qwen_chat_push_message(const ds4_vocab *vocab, const char *role,
                                      const char *content, token_vec *out) {
     token_vec_push(out, vocab->im_start_id);
     bpe_tokenize_text(vocab, role, out);
@@ -40390,7 +40403,7 @@ static void qwen35_chat_push_message(const ds4_vocab *vocab, const char *role,
 
 /* The template opens the answer with "<think>\n" when thinking is enabled and
  * with an empty "<think>\n\n</think>\n\n" block otherwise. */
-static void qwen35_chat_push_assistant_prefix(const ds4_vocab *vocab,
+static void qwen_chat_push_assistant_prefix(const ds4_vocab *vocab,
                                               ds4_think_mode   think_mode,
                                               token_vec       *out) {
     token_vec_push(out, vocab->im_start_id);
@@ -40441,10 +40454,10 @@ static void encode_chat_prompt(
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
-        if (system && system[0]) qwen35_chat_push_message(vocab, "system", system, out);
-        qwen35_chat_push_message(vocab, "user", prompt, out);
-        qwen35_chat_push_assistant_prefix(vocab, think_mode, out);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        if (system && system[0]) qwen_chat_push_message(vocab, "system", system, out);
+        qwen_chat_push_message(vocab, "user", prompt, out);
+        qwen_chat_push_assistant_prefix(vocab, think_mode, out);
         return;
     }
     const bool need_think_start =
@@ -40614,11 +40627,11 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
         if (!strcmp(role, "system") || !strcmp(role, "developer")) {
-            qwen35_chat_push_message(vocab, "system", content, tokens);
+            qwen_chat_push_message(vocab, "system", content, tokens);
         } else if (!strcmp(role, "assistant")) {
-            qwen35_chat_push_message(vocab, "assistant", content, tokens);
+            qwen_chat_push_message(vocab, "assistant", content, tokens);
         } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
             /* Tool output is a user turn wrapped in <tool_response> */
             token_vec_push(tokens, vocab->im_start_id);
@@ -40629,7 +40642,7 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
             token_vec_push(tokens, vocab->im_end_id);
             bpe_tokenize_text(vocab, "\n", tokens);
         } else {
-            qwen35_chat_push_message(vocab, "user", content, tokens);
+            qwen_chat_push_message(vocab, "user", content, tokens);
         }
         return;
     }
@@ -40679,8 +40692,8 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35) {
-        qwen35_chat_push_assistant_prefix(&e->vocab, think_mode, tokens);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN) {
+        qwen_chat_push_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
     }
     token_vec_push(tokens, e->vocab.assistant_id);
@@ -54301,7 +54314,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     (void)ssd_streaming;
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
-    if (ds4_model_is_qwen35()) return qwen35_context_memory_estimate(ctx);
+    if (ds4_model_is_qwen()) return qwen_context_memory_estimate(ctx);
 
     m.raw_cap = ds4_default_raw_cap(ctx);
     m.raw_bytes = (uint64_t)DS4_N_LAYER *
@@ -55010,9 +55023,9 @@ struct ds4_session {
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
-    ds4_qwen35_state qwen_state;
-#ifdef DS4_QWEN35_GPU
-    ds4_qwen35_gpu_graph qwen_graph;
+    ds4_qwen_state qwen_state;
+#ifdef DS4_QWEN_GPU
+    ds4_qwen_gpu_graph qwen_graph;
 #endif
     token_vec checkpoint;
     ds4_vision_identity *checkpoint_images;
@@ -56018,8 +56031,8 @@ static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
 }
 
 static void session_cpu_reset_cache(ds4_session *s) {
-    if (ds4_model_is_qwen35()) {
-        qwen35_state_reset(&s->qwen_state);
+    if (ds4_model_is_qwen()) {
+        qwen_state_reset(&s->qwen_state);
         return;
     }
     kv_cache_free(&s->cpu_cache);
@@ -57024,7 +57037,7 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
-    if (ds4_model_is_qwen35()) return 0;   /* no disk KV format yet */
+    if (ds4_model_is_qwen()) return 0;   /* no disk KV format yet */
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -64718,9 +64731,9 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
     return ds4_model_is_glm53();
 }
 
-bool ds4_engine_is_qwen35(ds4_engine *e) {
+bool ds4_engine_is_qwen(ds4_engine *e) {
     (void)e;
-    return ds4_model_is_qwen35();
+    return ds4_model_is_qwen();
 }
 
 /* Decode gate firing schedule for the TP transport (see ds4_tp_identity).
@@ -65487,8 +65500,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
                                                      e->prefill_chunk);
-        if (ds4_model_is_qwen35()) {
-            qwen35_state_init(&s->qwen_state, (uint32_t)ctx_size);
+        if (ds4_model_is_qwen()) {
+            qwen_state_init(&s->qwen_state, (uint32_t)ctx_size);
         } else {
             kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
             cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
@@ -65510,11 +65523,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
-    if (ds4_model_is_qwen35()) {
-#ifdef DS4_QWEN35_GPU
+    if (ds4_model_is_qwen()) {
+#ifdef DS4_QWEN_GPU
         uint32_t rows = e->prefill_chunk ? e->prefill_chunk : 512u;
         if (rows > (uint32_t)ctx_size) rows = (uint32_t)ctx_size;
-        if (!qwen35_graph_alloc(&s->qwen_graph, (uint32_t)ctx_size, rows)) {
+        if (!qwen_graph_alloc(&s->qwen_graph, (uint32_t)ctx_size, rows)) {
             fprintf(stderr, "ds4: failed to allocate the Qwen3.5 graph\n");
             free(s);
             return 1;
@@ -65839,8 +65852,8 @@ void ds4_session_free(ds4_session *s) {
 #endif
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
-        if (ds4_model_is_qwen35()) {
-            qwen35_state_free(&s->qwen_state);
+        if (ds4_model_is_qwen()) {
+            qwen_state_free(&s->qwen_state);
         } else {
             kv_cache_free(&s->cpu_cache);
             cpu_decode_scratch_free(&s->cpu_scratch);
@@ -65848,9 +65861,9 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
-#ifdef DS4_QWEN35_GPU
-        if (ds4_model_is_qwen35()) {
-            qwen35_graph_free(&s->qwen_graph);
+#ifdef DS4_QWEN_GPU
+        if (ds4_model_is_qwen()) {
+            qwen_graph_free(&s->qwen_graph);
         } else
 #endif
         if (ds4_session_is_glm(s)) {
@@ -66016,12 +66029,12 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
     if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
     return 1;
 #else
-#ifdef DS4_QWEN35_GPU
-    if (ds4_model_is_qwen35()) {
+#ifdef DS4_QWEN_GPU
+    if (ds4_model_is_qwen()) {
         s->checkpoint.len = 0;
         s->checkpoint_valid = false;
         s->mtp_draft_valid = false;
-        return qwen35_graph_reset(&s->qwen_graph) ? 0 : 1;
+        return qwen_graph_reset(&s->qwen_graph) ? 0 : 1;
     }
 #endif
     if (ds4_session_is_glm(s)) {
@@ -67188,12 +67201,12 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
  * graph sequence and the per-layer gates pair up.  The worker acks a sync
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
-#ifdef DS4_QWEN35_GPU
+#ifdef DS4_QWEN_GPU
 /* Session glue: extend a live prefix when the checkpoint matches the state
  * folded into the graph, otherwise start over. */
-static int qwen35_session_sync_graph(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+static int qwen_session_sync_graph(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     ds4_engine *e = s->engine;
-    ds4_qwen35_gpu_graph *g = &s->qwen_graph;
+    ds4_qwen_gpu_graph *g = &s->qwen_graph;
     if (prompt->len > s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds the session context");
         return 1;
@@ -67205,16 +67218,16 @@ static int qwen35_session_sync_graph(ds4_session *s, const ds4_tokens *prompt, c
         ds4_tokens_starts_with(prompt, &s->checkpoint)) {
         start = s->checkpoint.len;
     } else {
-        if (!qwen35_graph_reset(g)) {
+        if (!qwen_graph_reset(g)) {
             snprintf(err, errlen, "Qwen3.5 graph reset failed");
             return 1;
         }
         s->checkpoint.len = 0;
     }
-    /* DS4_QWEN35_DUMP_LOGITS=FILE: one normal chunk, then single tokens, and
+    /* DS4_QWEN_DUMP_LOGITS=FILE: one normal chunk, then single tokens, and
      * the logits after every step appended as f32 rows.  The CPU reference
      * dumps every position, so the two line up from the first chunk's end. */
-    const char *dump_path = getenv("DS4_QWEN35_DUMP_LOGITS");
+    const char *dump_path = getenv("DS4_QWEN_DUMP_LOGITS");
     FILE *dump = dump_path && dump_path[0] ? fopen(dump_path, "ab") : NULL;
     bool first_chunk = true;
     for (int i = start; i < prompt->len;) {
@@ -67229,7 +67242,7 @@ static int qwen35_session_sync_graph(ds4_session *s, const ds4_tokens *prompt, c
         if (dump && !first_chunk) rows = 1;
         first_chunk = false;
         const bool last = i + (int)rows == prompt->len;
-        if (!qwen35_graph_forward(g, &e->model, &e->weights, prompt->v + i, rows,
+        if (!qwen_graph_forward(g, &e->model, &e->weights, prompt->v + i, rows,
                                   dump || last ? s->logits : NULL)) {
             if (dump) fclose(dump);
             snprintf(err, errlen, "Qwen3.5 graph prefill failed");
@@ -67248,9 +67261,9 @@ static int qwen35_session_sync_graph(ds4_session *s, const ds4_tokens *prompt, c
     return 0;
 }
 
-static int qwen35_session_eval_graph(ds4_session *s, int token, char *err, size_t errlen) {
+static int qwen_session_eval_graph(ds4_session *s, int token, char *err, size_t errlen) {
     ds4_engine *e = s->engine;
-    if (!qwen35_graph_forward(&s->qwen_graph, &e->model, &e->weights, &token, 1, s->logits)) {
+    if (!qwen_graph_forward(&s->qwen_graph, &e->model, &e->weights, &token, 1, s->logits)) {
         snprintf(err, errlen, "Qwen3.5 graph decode failed");
         return 1;
     }
@@ -67259,7 +67272,7 @@ static int qwen35_session_eval_graph(ds4_session *s, int token, char *err, size_
     s->mtp_draft_valid = false;
     return 0;
 }
-#endif /* DS4_QWEN35_GPU */
+#endif /* DS4_QWEN_GPU */
 
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (s && !ds4_session_vision_prefix_matches(
@@ -67436,7 +67449,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
-        if (ds4_model_is_qwen35()) {
+        if (ds4_model_is_qwen()) {
             /* Extend a live prefix or start over; logits only for the last token. */
             int start = 0;
             if (s->checkpoint_valid &&
@@ -67445,12 +67458,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 ds4_tokens_starts_with(prompt, &s->checkpoint)) {
                 start = s->checkpoint.len;
             } else {
-                qwen35_state_reset(&s->qwen_state);
+                qwen_state_reset(&s->qwen_state);
                 s->checkpoint.len = 0;
             }
-            /* DS4_QWEN35_DUMP_LOGITS=FILE appends every prompt position's
+            /* DS4_QWEN_DUMP_LOGITS=FILE appends every prompt position's
              * logits (f32 rows) for teacher-forced comparison with llama.cpp. */
-            const char *dump_path = getenv("DS4_QWEN35_DUMP_LOGITS");
+            const char *dump_path = getenv("DS4_QWEN_DUMP_LOGITS");
             FILE *dump = dump_path && dump_path[0] ? fopen(dump_path, "ab") : NULL;
             for (int i = start; i < prompt->len; i++) {
                 if (ds4_session_cancelled(s)) {
@@ -67460,7 +67473,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     s->mtp_draft_valid = false;
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
-                qwen35_forward_token(dump || i + 1 == prompt->len ? s->logits : NULL,
+                qwen_forward_token(dump || i + 1 == prompt->len ? s->logits : NULL,
                                      &e->model, &e->weights, &s->qwen_state,
                                      prompt->v[i], (uint32_t)i);
                 if (dump) fwrite(s->logits, sizeof(float), DS4_N_VOCAB, dump);
@@ -67532,8 +67545,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
     (void)backend_name; (void)e;
-#ifdef DS4_QWEN35_GPU
-    if (ds4_model_is_qwen35()) return qwen35_session_sync_graph(s, prompt, err, errlen);
+#ifdef DS4_QWEN_GPU
+    if (ds4_model_is_qwen()) return qwen_session_sync_graph(s, prompt, err, errlen);
 #endif
     if (ds4_session_is_glm(s)) {
         /* Debug: truncate the prompt so the dumped prefill logits line up
@@ -69319,8 +69332,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
-        if (ds4_model_is_qwen35()) {
-            qwen35_forward_token(s->logits, &e->model, &e->weights, &s->qwen_state,
+        if (ds4_model_is_qwen()) {
+            qwen_forward_token(s->logits, &e->model, &e->weights, &s->qwen_state,
                                  token, (uint32_t)s->checkpoint.len);
             token_vec_push(&s->checkpoint, token);
             s->checkpoint_valid = true;
@@ -69353,10 +69366,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
-#ifdef DS4_QWEN35_GPU
-    if (ds4_model_is_qwen35()) {
+#ifdef DS4_QWEN_GPU
+    if (ds4_model_is_qwen()) {
         (void)probe_mtp;
-        return qwen35_session_eval_graph(s, token, err, errlen);
+        return qwen_session_eval_graph(s, token, err, errlen);
     }
 #endif
     if (ds4_session_is_glm(s)) {

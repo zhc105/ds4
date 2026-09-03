@@ -257,7 +257,7 @@ make cpu                    # or: make cuda-spark
 tests/qwen35_smoke.sh gguf/Qwen3.5-2B-NVFP4.gguf gguf/Qwen3.5-2B-F16.gguf   # CPU logits vs llama.cpp
 ```
 
-`DS4_QWEN35_DUMP_LOGITS=FILE` appends teacher-forced logits on either backend
+`DS4_QWEN_DUMP_LOGITS=FILE` appends teacher-forced logits on either backend
 (every prompt position on the CPU; on the graph one normal prefill chunk, then
 single tokens), which is how the CUDA kernels are checked against the CPU
 reference.
