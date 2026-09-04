@@ -15383,6 +15383,8 @@ typedef struct {
     float *k;       /* attention: [ctx][n_head_kv * head_dim], RoPE applied */
     float *v;       /* attention: [ctx][n_head_kv * head_dim] */
     float *ple_conv;/* PLE layer: [(n_ple_conv - 1) * ngram][hc_dim] conv inputs, oldest first */
+    float *ikey;    /* QSA: [ctx / ratio][idx_dim] block keys: mean of the block's raw keys, normed, RoPE at the block's first position */
+    float *ikraw;   /* QSA: [ratio][idx_dim] raw keys of the block being filled */
 } ds4_qwen_layer_state;
 
 typedef struct {
@@ -15415,6 +15417,9 @@ typedef struct {
     float *eg;      /* MoE: [n_ff_exp] expert gate, then the SwiGLU activation */
     float *eu;      /* MoE: [n_ff_exp] expert up */
     float *ed;      /* MoE: [n_embd] one expert's output */
+    float *iq;      /* QSA: [n_idx_head][idx_dim] indexer query */
+    float *bscore;  /* QSA: [ctx / ratio] block scores */
+    uint32_t *sel;  /* attention: the cells this token attends to */
 } ds4_qwen_state;
 
 static uint64_t qwen_conv_dim(void) {
@@ -15452,6 +15457,11 @@ static void qwen_state_init(ds4_qwen_state *st, uint32_t ctx) {
         } else {
             l->k = xmalloc_zeroed((uint64_t)ctx * kv_dim, sizeof(float));
             l->v = xmalloc_zeroed((uint64_t)ctx * kv_dim, sizeof(float));
+            if (ds4_qwen_layer_is_qsa(il)) {
+                const uint32_t r = g_ds4_compress_ratios[il];
+                l->ikey = xmalloc_zeroed((uint64_t)(ctx / r + 1u) * DS4_N_INDEXER_HEAD_DIM, sizeof(float));
+                l->ikraw = xmalloc_zeroed((uint64_t)r * DS4_N_INDEXER_HEAD_DIM, sizeof(float));
+            }
         }
         if (ds4_qwen_layer_has_ple(il)) {
             l->ple_conv = xmalloc_zeroed(qwen_ple_hist_rows() * hc_dim, sizeof(float));
@@ -15467,6 +15477,11 @@ static void qwen_state_init(ds4_qwen_state *st, uint32_t ctx) {
     st->kv = xmalloc(2u * kv_dim * sizeof(float));
     st->att = xmalloc(qwen_max_u64(v_dim, attn_dim) * sizeof(float));
     st->scores = xmalloc((uint64_t)ctx * sizeof(float));
+    st->sel = xmalloc((uint64_t)ctx * sizeof(uint32_t));
+    if (DS4_N_INDEXER_HEAD != 0) {
+        st->iq = xmalloc((uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+        st->bscore = xmalloc((uint64_t)(ctx + 1u) * sizeof(float));
+    }
     if (ds4_qwen_has_hc()) {
         st->xn = xmalloc(hc_dim * sizeof(float));
         st->lo = xmalloc(DS4_N_HC_LOW * sizeof(float));
@@ -15500,6 +15515,11 @@ static void qwen_state_reset(ds4_qwen_state *st) {
         if (l->k) memset(l->k, 0, (uint64_t)st->ctx * kv_dim * sizeof(float));
         if (l->v) memset(l->v, 0, (uint64_t)st->ctx * kv_dim * sizeof(float));
         if (l->ple_conv) memset(l->ple_conv, 0, qwen_ple_hist_rows() * hc_dim * sizeof(float));
+        if (l->ikey) {
+            const uint32_t r = g_ds4_compress_ratios[il];
+            memset(l->ikey, 0, (uint64_t)(st->ctx / r + 1u) * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+            memset(l->ikraw, 0, (uint64_t)r * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+        }
     }
     /* before the sequence starts every n-gram predecessor reads as the reset token */
     for (uint32_t i = 0; i < DS4_NGRAM_MAX_MULT; i++) st->ple_prev[i] = DS4_PLE_RESET_TOKEN;
@@ -15513,7 +15533,12 @@ static void qwen_state_free(ds4_qwen_state *st) {
         free(st->layer[il].k);
         free(st->layer[il].v);
         free(st->layer[il].ple_conv);
+        free(st->layer[il].ikey);
+        free(st->layer[il].ikraw);
     }
+    free(st->iq);
+    free(st->bscore);
+    free(st->sel);
     free(st->x);
     free(st->h);
     free(st->y);
@@ -15661,9 +15686,106 @@ static void qwen_rope_inplace(float *head, uint32_t pos) {
     }
 }
 
-/* Gated GQA attention for one token at position pos.  attn_q yields per head
- * [query | gate]; query and key heads are RMS-normalised before RoPE and the
- * attention output is multiplied by sigmoid(gate) before the output proj. */
+/* Which cells the token at pos attends to, written to st->sel.  Dense layers
+ * (and DS4_QSA_DENSE=1, the diagnostic that ignores the indexer) attend to
+ * every cell.  QSA layers keep an indexer beside the K/V cache: each
+ * completed block of `ratio` cells gets one key, the mean of the block's raw
+ * indexer keys, RMS-normalised and rotated at the block's first position.
+ * The token's indexer query (n_idx_head heads, normalised and rotated at pos)
+ * scores every completed block by the sum over heads of relu(q_h . k_b), and
+ * the top budget/ratio blocks are expanded to their cells; the incomplete
+ * tail block is always attended.  Ties keep the older block.  Within the
+ * budget this is exactly dense attention, matching llama.cpp and vLLM. */
+static uint32_t qwen_attention_cells(
+        ds4_qwen_state          *st,
+        const ds4_model         *m,
+        const ds4_layer_weights *l,
+        ds4_qwen_layer_state    *ls,
+        uint32_t                 il,
+        const float             *x,
+        uint32_t                 pos) {
+    static int dense = -1;
+    if (dense < 0) dense = getenv("DS4_QSA_DENSE") != NULL;
+    uint32_t *sel = st->sel;
+    if (!ds4_qwen_layer_is_qsa(il)) {
+        for (uint32_t t = 0; t <= pos; t++) sel[t] = t;
+        return pos + 1u;
+    }
+
+    const uint32_t r = g_ds4_compress_ratios[il];
+    const uint32_t d = DS4_N_INDEXER_HEAD_DIM;
+    const uint32_t n_head = DS4_N_INDEXER_HEAD;
+    const float eps = DS4_RMS_EPS;
+
+    /* raw key into the block ring; on the block's last cell fold the ring
+     * into that block's cached key */
+    matvec_any(ls->ikraw + (uint64_t)(pos % r) * d, m, l->indexer_k, x);
+    if (pos % r == r - 1u) {
+        float *kb = ls->ikey + (uint64_t)(pos / r) * d;
+        for (uint32_t i = 0; i < d; i++) {
+            float acc = 0.0f;
+            for (uint32_t j = 0; j < r; j++) acc += ls->ikraw[(uint64_t)j * d + i];
+            kb[i] = acc / (float)r;
+        }
+        rms_norm_weight(kb, kb, tensor_data(m, l->indexer_k_norm), d, eps);
+        qwen_rope_inplace(kb, pos + 1u - r);
+    }
+
+    const uint32_t n_blocks = (pos + 1u) / r;             /* completed blocks the token can see */
+    const uint32_t budget = DS4_N_INDEXER_TOP_K / r;
+    if (dense || n_blocks <= budget) {
+        for (uint32_t t = 0; t <= pos; t++) sel[t] = t;
+        return pos + 1u;
+    }
+
+    float *q = st->iq;
+    matvec_any(q, m, l->indexer_q, x);
+    const float *q_norm = tensor_data(m, l->indexer_q_norm);
+    for (uint32_t h = 0; h < n_head; h++) {
+        float *qh = q + (uint64_t)h * d;
+        rms_norm_weight(qh, qh, q_norm, d, eps);
+        qwen_rope_inplace(qh, pos);
+    }
+    float *score = st->bscore;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const float *kb = ls->ikey + (uint64_t)b * d;
+        float s = 0.0f;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = q + (uint64_t)h * d;
+            float dot = 0.0f;
+            for (uint32_t i = 0; i < d; i++) dot += qh[i] * kb[i];
+            if (dot > 0.0f) s += dot;
+        }
+        score[b] = s;
+    }
+    /* top `budget` blocks by repeated argmax (budget is small), then the cells
+     * in position order so the attention loop walks the cache forward */
+    uint32_t n_sel = 0;
+    for (uint32_t k = 0; k < budget; k++) {
+        uint32_t best = 0;
+        for (uint32_t b = 1; b < n_blocks; b++) if (score[b] > score[best]) best = b;
+        score[best] = -INFINITY;
+        sel[n_sel++] = best;
+    }
+    for (uint32_t i = 1; i < n_sel; i++) {          /* insertion sort: budget entries */
+        const uint32_t v = sel[i];
+        uint32_t j = i;
+        while (j > 0 && sel[j - 1] > v) { sel[j] = sel[j - 1]; j--; }
+        sel[j] = v;
+    }
+    for (uint32_t i = n_sel; i-- > 0;) {            /* expand blocks in place, back to front */
+        const uint32_t b = sel[i];
+        for (uint32_t j = 0; j < r; j++) sel[i * r + j] = b * r + j;
+    }
+    n_sel *= r;
+    for (uint32_t t = n_blocks * r; t <= pos; t++) sel[n_sel++] = t;   /* the incomplete tail */
+    return n_sel;
+}
+
+/* Gated GQA attention for one token at position pos over the n_sel cells in
+ * sel.  attn_q yields per head [query | gate]; query and key heads are
+ * RMS-normalised before RoPE and the attention output is multiplied by
+ * sigmoid(gate) before the output proj. */
 static void qwen_attention_forward(
         float                   *out,
         const ds4_model         *m,
@@ -15671,7 +15793,9 @@ static void qwen_attention_forward(
         ds4_qwen_layer_state  *ls,
         ds4_qwen_state        *st,
         const float             *x,
-        uint32_t                 pos) {
+        uint32_t                 pos,
+        const uint32_t          *sel,
+        uint32_t                 n_sel) {
     const uint32_t n_head = DS4_N_HEAD;
     const uint32_t n_kv = DS4_N_HEAD_KV;
     const uint32_t hd = DS4_N_HEAD_DIM;
@@ -15710,24 +15834,24 @@ static void qwen_attention_forward(
         const float *gate = qh + hd;
         const uint64_t kvo = (uint64_t)(h / group) * hd;
         float max = -INFINITY;
-        for (uint32_t t = 0; t <= pos; t++) {
-            const float *kt = ls->k + (uint64_t)t * kv_dim + kvo;
+        for (uint32_t s = 0; s < n_sel; s++) {
+            const float *kt = ls->k + (uint64_t)sel[s] * kv_dim + kvo;
             float dot = 0.0f;
             for (uint32_t i = 0; i < hd; i++) dot += qh[i] * kt[i];
-            scores[t] = dot * scale;
-            if (scores[t] > max) max = scores[t];
+            scores[s] = dot * scale;
+            if (scores[s] > max) max = scores[s];
         }
         float sum = 0.0f;
-        for (uint32_t t = 0; t <= pos; t++) {
-            scores[t] = expf(scores[t] - max);
-            sum += scores[t];
+        for (uint32_t s = 0; s < n_sel; s++) {
+            scores[s] = expf(scores[s] - max);
+            sum += scores[s];
         }
         const float inv = 1.0f / sum;
         float *oh = att + (uint64_t)h * hd;
         memset(oh, 0, hd * sizeof(float));
-        for (uint32_t t = 0; t <= pos; t++) {
-            const float p = scores[t] * inv;
-            const float *vt = ls->v + (uint64_t)t * kv_dim + kvo;
+        for (uint32_t s = 0; s < n_sel; s++) {
+            const float p = scores[s] * inv;
+            const float *vt = ls->v + (uint64_t)sel[s] * kv_dim + kvo;
             for (uint32_t i = 0; i < hd; i++) oh[i] += p * vt[i];
         }
         for (uint32_t i = 0; i < hd; i++) oh[i] *= sigmoid_stable(gate[i]);
@@ -16007,7 +16131,8 @@ static void qwen_forward_token(
         if (ds4_qwen_layer_is_gdn(il)) {
             qwen_gdn_forward(y, m, l, ls, st, h);
         } else {
-            qwen_attention_forward(y, m, l, ls, st, h, pos);
+            const uint32_t n_sel = qwen_attention_cells(st, m, l, ls, il, h, pos);
+            qwen_attention_forward(y, m, l, ls, st, h, pos, st->sel, n_sel);
         }
         qwen_sublayer_out(st, y);
         qwen_sublayer_in(st, m, l->post_attention_norm, &l->hc_mix_ffn);
