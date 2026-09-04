@@ -3127,7 +3127,10 @@ int ds4_gpu_qwen35_matmul(
         uint32_t              in_dim,
         uint32_t              out_dim,
         const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *x_hi,
+        const ds4_gpu_tensor *x_lo,
         uint32_t              n_tok);
+int ds4_gpu_qwen35_split(ds4_gpu_tensor *hi, ds4_gpu_tensor *lo, const ds4_gpu_tensor *x, uint64_t n);
 int ds4_gpu_qwen35_gdn(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mixed,

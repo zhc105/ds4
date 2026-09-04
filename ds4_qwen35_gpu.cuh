@@ -26,6 +26,15 @@ __device__ __forceinline__ float qwen35_cuda_e2m1(uint32_t nib) {
     return __uint_as_float(bits);
 }
 
+/* The same E2M1 nibble as bf16 bits: the value is exact in bf16, so the
+ * f32 pattern above shifted right by 16. */
+__device__ __forceinline__ uint32_t qwen35_e2m1_bf16_bits(uint32_t nib) {
+    const uint32_t e = (nib >> 1u) & 3u;
+    const uint32_t m = nib & 1u;
+    const uint32_t bits = e ? (((126u + e) << 7) | (m << 6)) : (m ? 0x3F00u : 0u);
+    return bits | ((nib & 8u) << 12);
+}
+
 __device__ __forceinline__ float qwen35_cuda_ue4m3(uint8_t bits) {
     bits &= 0x7fu;
     if (bits == 0x7fu) return 0.0f;
@@ -188,30 +197,35 @@ __device__ static void qwen35_gemm_tile(
  * activation row xr[r] (NULL reads as zero) and writes output row orow[r]
  * (negative rows are dropped), which is how the dense GEMM and the grouped
  * expert GEMM share it.  Shared memory is dynamic: QWEN35_MMA_SMEM bytes. */
-#define QWEN35_MMA_ROWS 64u                                 /* activation rows per tile */
+#define QWEN35_MMA_ROWS 32u                                 /* activation rows per tile */
+#define QWEN35_MMA_RF (QWEN35_MMA_ROWS / 32u)               /* row fragments per warp */
+#define QWEN35_MMA_A_PER_THREAD (QWEN35_MMA_ROWS / 16u)     /* float4 of activations per thread per step */
 #define QWEN35_MMA_COLS 128u                                /* output columns per tile */
 #define QWEN35_MMA_LD 72u                                   /* bf16 tile row stride, 144 bytes */
 #define QWEN35_MMA_A_BYTES (QWEN35_MMA_ROWS * QWEN35_MMA_LD * 2u)
 #define QWEN35_MMA_B_BYTES (QWEN35_MMA_COLS * QWEN35_MMA_LD * 2u)
-#define QWEN35_MMA_STAGE_LD 20u                             /* per-warp 16x16 f32 staging */
-#define QWEN35_MMA_SMEM (2u * QWEN35_MMA_A_BYTES + QWEN35_MMA_B_BYTES + 8u * 16u * QWEN35_MMA_STAGE_LD * 4u)
+#define QWEN35_MMA_STAGE_LD 20u                             /* per-warp 16x16 f32 staging, reuses the operand tiles */
+#define QWEN35_MMA_SMEM (2u * QWEN35_MMA_A_BYTES + QWEN35_MMA_B_BYTES)
 
-/* One thread's share of a K step, fetched from global memory one step ahead
- * so the loads overlap the tensor-core work of the previous step: four
- * float4 of activations, and either two NVFP4 sub-blocks or four uint4 of
- * BF16 weights. */
+/* One thread's share of the operands, fetched from global memory ahead of
+ * use so the loads overlap the tensor-core work: the activations one K step
+ * ahead (QWEN35_MMA_A_PER_THREAD float4), BF16 weights one step ahead (four
+ * uint4), and NVFP4 weights one group of four super-blocks ahead.  A
+ * column's super-blocks are contiguous 36-byte records, so per group each of
+ * the column's two threads reads its two records as one 72-byte run instead
+ * of four scattered 16-byte pieces, and dequantises one record per step. */
+#define QWEN35_MMA_GROUP 4u
 typedef struct {
-    float4 a[4];
-    uint32_t q[4];
+    float4 a[QWEN35_MMA_A_PER_THREAD];
+    uint32_t q[18];                                          /* two raw NVFP4 super-blocks */
     uint4 wb[4];
-    float d[2];
 } qwen35_mma_fetch;
 
 __device__ __forceinline__ void qwen35_mma_fetch_step(
         qwen35_mma_fetch *f, const float *const *xr, const uint8_t *w, uint32_t wtype,
         uint32_t in_dim, uint32_t n_super, uint32_t col0, uint32_t out_dim, uint32_t b) {
     const uint32_t tid = threadIdx.x;
-    for (uint32_t i = 0; i < 4u; i++) {
+    for (uint32_t i = 0; i < QWEN35_MMA_A_PER_THREAD; i++) {
         const uint32_t idx = tid + i * 256u;
         const float *src = xr[idx >> 4u];
         f->a[i] = src ? *(const float4 *)(src + (uint64_t)b * 64u + (idx & 15u) * 4u)
@@ -219,58 +233,77 @@ __device__ __forceinline__ void qwen35_mma_fetch_step(
     }
     const uint32_t col = col0 + (tid >> 1u);
     const uint32_t half = tid & 1u;
-    if (col >= out_dim) {
-        for (uint32_t j = 0; j < 4u; j++) f->wb[j] = make_uint4(0u, 0u, 0u, 0u);
-        f->d[0] = f->d[1] = 0.0f;
-    } else if (wtype == QWEN35_W_NVFP4) {
-        const uint8_t *blk = w + ((uint64_t)col * n_super + b) * 36u;
-        for (uint32_t s = 0; s < 2u; s++) {
-            const uint32_t *qs = (const uint32_t *)(blk + 4u + (half * 2u + s) * 8u);
-            f->d[s] = qwen35_cuda_ue4m3(blk[half * 2u + s]);
-            f->q[2u * s] = qs[0];
-            f->q[2u * s + 1u] = qs[1];
+    if (wtype == QWEN35_W_NVFP4) {
+        if (b % QWEN35_MMA_GROUP != 0u) return;
+        const uint32_t first = b + half * 2u;
+        if (col < out_dim && first < n_super) {
+            const uint32_t *src = (const uint32_t *)(w + ((uint64_t)col * n_super + first) * 36u);
+            const uint32_t n = first + 1u < n_super ? 18u : 9u;
+            for (uint32_t j = 0; j < 18u; j++) f->q[j] = j < n ? src[j] : 0u;
         }
+    } else if (col >= out_dim) {
+        for (uint32_t j = 0; j < 4u; j++) f->wb[j] = make_uint4(0u, 0u, 0u, 0u);
     } else {
         const uint4 *src = (const uint4 *)((const uint16_t *)w + (uint64_t)col * in_dim + (uint64_t)b * 64u + half * 32u);
         for (uint32_t j = 0; j < 4u; j++) f->wb[j] = src[j];
     }
 }
 
-/* Convert the fetched step into the shared bf16 tiles: activations as hi
- * and lo halves, weights dequantised (NVFP4) or copied (BF16). */
+/* Convert the fetched operands of step b into the shared bf16 tiles:
+ * activations as hi and lo halves, weights dequantised (NVFP4: the thread
+ * holding this step's record writes the column's whole 64 values) or
+ * copied (BF16). */
 __device__ __forceinline__ void qwen35_mma_store_step(
         const qwen35_mma_fetch *f, __nv_bfloat16 (*as)[QWEN35_MMA_ROWS][QWEN35_MMA_LD],
-        __nv_bfloat16 (*bs)[QWEN35_MMA_LD], uint32_t wtype, bool have_col) {
+        __nv_bfloat16 (*bs)[QWEN35_MMA_LD], uint32_t wtype, bool have_col, uint32_t b) {
     const uint32_t tid = threadIdx.x;
-    for (uint32_t i = 0; i < 4u; i++) {
+    for (uint32_t i = 0; i < QWEN35_MMA_A_PER_THREAD; i++) {
         const uint32_t idx = tid + i * 256u;
         const uint32_t r = idx >> 4u;
         const uint32_t k0 = (idx & 15u) * 4u;
         const float4 v = f->a[i];
-        const __nv_bfloat162 hi0 = __floats2bfloat162_rn(v.x, v.y);
-        const __nv_bfloat162 hi1 = __floats2bfloat162_rn(v.z, v.w);
-        *(__nv_bfloat162 *)&as[0][r][k0] = hi0;
-        *(__nv_bfloat162 *)&as[0][r][k0 + 2u] = hi1;
-        *(__nv_bfloat162 *)&as[1][r][k0] = __floats2bfloat162_rn(v.x - __low2float(hi0), v.y - __high2float(hi0));
-        *(__nv_bfloat162 *)&as[1][r][k0 + 2u] = __floats2bfloat162_rn(v.z - __low2float(hi1), v.w - __high2float(hi1));
+        /* hi is the truncated f32 (an integer mask, no conversion), lo the
+         * exact remainder rounded once: still 16 significant bits together */
+        const uint32_t xb = __float_as_uint(v.x), yb = __float_as_uint(v.y);
+        const uint32_t zb = __float_as_uint(v.z), wb = __float_as_uint(v.w);
+        const uint32_t hi0 = __byte_perm(xb, yb, 0x7632), hi1 = __byte_perm(zb, wb, 0x7632);
+        __nv_bfloat162 lo[2];
+        lo[0] = __floats2bfloat162_rn(v.x - __uint_as_float(xb & 0xffff0000u), v.y - __uint_as_float(yb & 0xffff0000u));
+        lo[1] = __floats2bfloat162_rn(v.z - __uint_as_float(zb & 0xffff0000u), v.w - __uint_as_float(wb & 0xffff0000u));
+        *(uint2 *)&as[0][r][k0] = make_uint2(hi0, hi1);
+        *(uint2 *)&as[1][r][k0] = *(const uint2 *)lo;
     }
     const uint32_t cidx = tid >> 1u;
     const uint32_t half = tid & 1u;
-    if (wtype == QWEN35_W_NVFP4 && have_col) {
-        for (uint32_t s = 0; s < 2u; s++) {
-            const float d = f->d[s];
-            const uint32_t lo = f->q[2u * s], hi = f->q[2u * s + 1u];
-            __nv_bfloat16 *dst = &bs[cidx][(half * 2u + s) * 16u];
-            for (uint32_t j = 0; j < 4u; j++) {
-                const uint32_t byte_lo = (lo >> (8u * j)) & 0xffu;
-                const uint32_t byte_hi = (hi >> (8u * j)) & 0xffu;
-                /* element j from byte_lo's low nibble, j+8 from its high nibble,
-                 * j+4 and j+12 from byte_hi: the matvec's layout */
-                dst[j] = __float2bfloat16(qwen35_cuda_e2m1(byte_lo & 15u) * d);
-                dst[j + 8u] = __float2bfloat16(qwen35_cuda_e2m1(byte_lo >> 4u) * d);
-                dst[j + 4u] = __float2bfloat16(qwen35_cuda_e2m1(byte_hi & 15u) * d);
-                dst[j + 12u] = __float2bfloat16(qwen35_cuda_e2m1(byte_hi >> 4u) * d);
+    if (wtype == QWEN35_W_NVFP4) {
+        if (((b % QWEN35_MMA_GROUP) >> 1u) != half) return;   /* the other thread holds this record */
+        const uint32_t *rec = f->q + (b & 1u) * 9u;
+        const uint32_t scales = have_col ? rec[0] : 0u;
+        for (uint32_t s = 0; s < 4u; s++) {
+            /* the block scale as a bf16 pair (UE4M3 is exact in bf16), so the
+             * E2M1 x scale products, which have five significant bits, come
+             * out exact from a packed bf16 multiply: no float conversions */
+            const float d = qwen35_cuda_ue4m3((uint8_t)(scales >> (8u * s)));
+            const __nv_bfloat162 d2 = __floats2bfloat162_rn(d, d);
+            const uint32_t lo = rec[1u + 2u * s], hi = rec[2u + 2u * s];
+            uint32_t v[8];                                   /* 16 bf16 in element order */
+            for (uint32_t j = 0; j < 4u; j += 2u) {
+                const uint32_t lo0 = (lo >> (8u * j)) & 0xffu, lo1 = (lo >> (8u * j + 8u)) & 0xffu;
+                const uint32_t hi0 = (hi >> (8u * j)) & 0xffu, hi1 = (hi >> (8u * j + 8u)) & 0xffu;
+                /* element j from byte j's low nibble, j+8 from its high nibble
+                 * (the lo word), j+4 and j+12 likewise from the hi word */
+                v[j / 2u] = qwen35_e2m1_bf16_bits(lo0 & 15u) | (qwen35_e2m1_bf16_bits(lo1 & 15u) << 16);
+                v[j / 2u + 4u] = qwen35_e2m1_bf16_bits(lo0 >> 4u) | (qwen35_e2m1_bf16_bits(lo1 >> 4u) << 16);
+                v[j / 2u + 2u] = qwen35_e2m1_bf16_bits(hi0 & 15u) | (qwen35_e2m1_bf16_bits(hi1 & 15u) << 16);
+                v[j / 2u + 6u] = qwen35_e2m1_bf16_bits(hi0 >> 4u) | (qwen35_e2m1_bf16_bits(hi1 >> 4u) << 16);
             }
+            for (uint32_t i = 0; i < 8u; i++) {
+                const __nv_bfloat162 p = __hmul2(*(const __nv_bfloat162 *)&v[i], d2);
+                v[i] = *(const uint32_t *)&p;
+            }
+            uint4 *dst = (uint4 *)&bs[cidx][s * 16u];
+            dst[0] = make_uint4(v[0], v[1], v[2], v[3]);
+            dst[1] = make_uint4(v[4], v[5], v[6], v[7]);
         }
     } else {
         uint4 *dst = (uint4 *)&bs[cidx][half * 32u];
@@ -278,38 +311,38 @@ __device__ __forceinline__ void qwen35_mma_store_step(
     }
 }
 
-/* Warp w owns rows 32*(w/4)..+31 and columns 32*(w%4)..+31 of the 64x128
- * tile: four accumulators. */
+/* Warp w owns rows (ROWS/2)*(w/4).. and columns 32*(w%4)..+31 of the
+ * ROWS x 128 tile: two accumulators per row fragment. */
 __device__ static void qwen35_mma_tile(
         float *out, uint32_t out_dim, float scale, const int32_t *orow, const float *const *xr,
         const uint8_t *w, uint32_t wtype, uint32_t in_dim, uint32_t col0, unsigned char *smem) {
     namespace wmma = nvcuda::wmma;
     __nv_bfloat16 (*as)[QWEN35_MMA_ROWS][QWEN35_MMA_LD] = (__nv_bfloat16 (*)[QWEN35_MMA_ROWS][QWEN35_MMA_LD])smem;
     __nv_bfloat16 (*bs)[QWEN35_MMA_LD] = (__nv_bfloat16 (*)[QWEN35_MMA_LD])(smem + 2u * QWEN35_MMA_A_BYTES);
-    float (*stage)[16][QWEN35_MMA_STAGE_LD] = (float (*)[16][QWEN35_MMA_STAGE_LD])(smem + 2u * QWEN35_MMA_A_BYTES + QWEN35_MMA_B_BYTES);
+    float (*stage)[16][QWEN35_MMA_STAGE_LD] = (float (*)[16][QWEN35_MMA_STAGE_LD])smem;   /* the operand tiles, once the K loop is done */
     const uint32_t tid = threadIdx.x;
     const uint32_t warp = tid >> 5u;
     const uint32_t lane = tid & 31u;
-    const uint32_t wr = (warp >> 2u) * 32u;                 /* warp's first tile row */
+    const uint32_t wr = (warp >> 2u) * (QWEN35_MMA_ROWS / 2u);   /* warp's first tile row */
     const uint32_t wc = (warp & 3u) * 32u;                  /* warp's first tile column */
     const uint32_t n_super = in_dim / 64u;
     const bool have_col = col0 + (tid >> 1u) < out_dim;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[2][2];
-    for (uint32_t i = 0; i < 2u; i++) {
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[QWEN35_MMA_RF][2];
+    for (uint32_t i = 0; i < QWEN35_MMA_RF; i++) {
         wmma::fill_fragment(c[i][0], 0.0f);
         wmma::fill_fragment(c[i][1], 0.0f);
     }
     qwen35_mma_fetch f;
     qwen35_mma_fetch_step(&f, xr, w, wtype, in_dim, n_super, col0, out_dim, 0u);
     for (uint32_t b = 0; b < n_super; b++) {
-        qwen35_mma_store_step(&f, as, bs, wtype, have_col);
+        qwen35_mma_store_step(&f, as, bs, wtype, have_col, b);
         __syncthreads();
         if (b + 1u < n_super) qwen35_mma_fetch_step(&f, xr, w, wtype, in_dim, n_super, col0, out_dim, b + 1u);
         for (uint32_t kk = 0; kk < 64u; kk += 16u) {
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf[2];
             wmma::load_matrix_sync(bf[0], &bs[wc][kk], QWEN35_MMA_LD);
             wmma::load_matrix_sync(bf[1], &bs[wc + 16u][kk], QWEN35_MMA_LD);
-            for (uint32_t i = 0; i < 2u; i++) {
+            for (uint32_t i = 0; i < QWEN35_MMA_RF; i++) {
                 wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_hi, a_lo;
                 wmma::load_matrix_sync(a_hi, &as[0][wr + i * 16u][kk], QWEN35_MMA_LD);
                 wmma::load_matrix_sync(a_lo, &as[1][wr + i * 16u][kk], QWEN35_MMA_LD);
@@ -323,7 +356,7 @@ __device__ static void qwen35_mma_tile(
     }
     /* epilogue: each warp stages its fragments one at a time and scatters
      * them to the output rows */
-    for (uint32_t i = 0; i < 2u; i++) {
+    for (uint32_t i = 0; i < QWEN35_MMA_RF; i++) {
         for (uint32_t t = 0; t < 2u; t++) {
             wmma::store_matrix_sync(&stage[warp][0][0], c[i][t], QWEN35_MMA_STAGE_LD, wmma::mem_row_major);
             __syncwarp();
@@ -403,14 +436,18 @@ __global__ static void qwen35_split_bf16_kernel(__nv_bfloat16 *hi, __nv_bfloat16
  * deterministic here (no atomics) and pipelines the tiles far better than
  * the hand-written kernel, which stays for NVFP4 weights. */
 static int qwen35_cublas_bf16(
-        float *out, const uint16_t *w, const float *x,
+        float *out, const uint16_t *w, const float *x, const __nv_bfloat16 *x_hi, const __nv_bfloat16 *x_lo,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_rows, float scale, int tier, cudaStream_t stream) {
     const uint64_t n = (uint64_t)n_rows * in_dim;
-    __nv_bfloat16 *hi = (__nv_bfloat16 *)cuda_tmp_alloc_on(tier, 2u * n * sizeof(__nv_bfloat16), "Qwen split-bf16 activations");
-    if (!hi) return 0;
-    __nv_bfloat16 *lo = hi + n;
-    qwen35_split_bf16_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(hi, lo, x, n);
-    if (!cuda_ok(cudaGetLastError(), "Qwen split-bf16 launch")) return 0;
+    const __nv_bfloat16 *hi = x_hi, *lo = x_lo;
+    if (!hi) {
+        __nv_bfloat16 *buf = (__nv_bfloat16 *)cuda_tmp_alloc_on(tier, 2u * n * sizeof(__nv_bfloat16), "Qwen split-bf16 activations");
+        if (!buf) return 0;
+        qwen35_split_bf16_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(buf, buf + n, x, n);
+        if (!cuda_ok(cudaGetLastError(), "Qwen split-bf16 launch")) return 0;
+        hi = buf;
+        lo = buf + n;
+    }
     const float beta0 = 0.0f, beta1 = 1.0f;
     cublasHandle_t handle = cuda_cublas_for_tier(tier);
     cublasStatus_t st = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_rows, (int)in_dim,
@@ -422,6 +459,17 @@ static int qwen35_cublas_bf16(
                           &beta1, out, CUDA_R_32F, (int)out_dim, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     }
     return cublas_ok(st, "Qwen BF16 GEMM");
+}
+
+/* Split an activation buffer once for the matmuls that share it. */
+extern "C" int ds4_gpu_qwen35_split(ds4_gpu_tensor *hi, ds4_gpu_tensor *lo, const ds4_gpu_tensor *x, uint64_t n) {
+    if (n == 0u || !hi || !lo || !x || hi->bytes < n * sizeof(__nv_bfloat16) || lo->bytes < n * sizeof(__nv_bfloat16) ||
+        x->bytes < n * sizeof(float)) {
+        return 0;
+    }
+    qwen35_split_bf16_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+        (__nv_bfloat16 *)hi->ptr, (__nv_bfloat16 *)lo->ptr, (const float *)x->ptr, n);
+    return cuda_ok(cudaGetLastError(), "Qwen split-bf16 launch");
 }
 
 /* Opt a tensor-core kernel into its dynamic shared memory once. */
@@ -451,9 +499,9 @@ static uint64_t qwen35_weight_bytes(uint32_t wtype, uint32_t in_dim, uint32_t ou
 
 /* out[n_tok][out_dim] = x[n_tok][in_dim] W^T times the global scale, for a
  * weight of any storage type the loader accepts.  Decode-sized batches use
- * one warp or block per output column; larger ones the shared-memory GEMM.
- * Both keep the activations in f32, which is what makes the graph match the
- * CPU reference to rounding. */
+ * one warp or block per output column on f32 activations; larger ones the
+ * tensor-core GEMMs on split-bf16 activations (x_hi/x_lo when the caller
+ * split x already, else split here), exact to f32 rounding either way. */
 extern "C" int ds4_gpu_qwen35_matmul(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -464,13 +512,16 @@ extern "C" int ds4_gpu_qwen35_matmul(
         uint32_t              in_dim,
         uint32_t              out_dim,
         const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *x_hi,
+        const ds4_gpu_tensor *x_lo,
         uint32_t              n_tok) {
     const uint64_t weight_bytes = qwen35_weight_bytes(wtype, in_dim, out_dim);
     if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u || n_tok == 0u ||
         in_dim % 64u != 0u || weight_bytes == 0u || weight_offset > model_size ||
         weight_bytes > model_size - weight_offset ||
         x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
-        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float)) {
+        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float) ||
+        (x_hi && (!x_lo || x_hi->bytes < (uint64_t)n_tok * in_dim * 2u || x_lo->bytes < (uint64_t)n_tok * in_dim * 2u))) {
         return 0;
     }
     const char *w = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes,
@@ -486,8 +537,10 @@ extern "C" int ds4_gpu_qwen35_matmul(
             return cuda_ok(cudaGetLastError(), "Qwen f32 GEMM launch");
         }
         if (wtype == QWEN35_W_BF16 && g_cublas_ready) {
-            return qwen35_cublas_bf16(o, (const uint16_t *)w, xp, in_dim, out_dim, n_tok, scale,
-                                      ds4_tensor_device_idx(out), stream);
+            return qwen35_cublas_bf16(o, (const uint16_t *)w, xp,
+                                      x_hi ? (const __nv_bfloat16 *)x_hi->ptr : NULL,
+                                      x_hi ? (const __nv_bfloat16 *)x_lo->ptr : NULL,
+                                      in_dim, out_dim, n_tok, scale, ds4_tensor_device_idx(out), stream);
         }
         static bool ready = false;
         if (!qwen35_mma_smem_ready((const void *)qwen35_gemm_mma_kernel, &ready)) return 0;
