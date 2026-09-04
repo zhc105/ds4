@@ -3113,19 +3113,21 @@ int ds4_gpu_glm53_scatter_image_hc(
         uint32_t              n_hc);
 
 /* GLM-5.3 Kimi Delta Attention. Recurrent and convolution state stay FP32. */
-/* Qwen3.5 (CUDA only): NVFP4 matmul, Gated DeltaNet, gated GQA attention.
- * See ds4_qwen35_gpu.cuh for the buffer layouts. */
-int ds4_gpu_qwen35_matmul_nvfp4(
+/* Qwen family (CUDA only): f32-activation matmul over NVFP4/BF16/F32
+ * weights (wtype is the GGUF type id), Gated DeltaNet, gated GQA attention,
+ * and the Flash-Next hyper-connection, MoE and PLE pieces.  See
+ * ds4_qwen35_gpu.cuh for the buffer layouts. */
+int ds4_gpu_qwen35_matmul(
         ds4_gpu_tensor       *out,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              weight_offset,
+        uint32_t              wtype,
         float                 scale,
         uint32_t              in_dim,
         uint32_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_tok);
-int ds4_gpu_qwen35_scale(ds4_gpu_tensor *x, uint64_t n, float scale);
 int ds4_gpu_qwen35_gdn(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mixed,
@@ -3145,6 +3147,7 @@ int ds4_gpu_qwen35_gdn(
         uint32_t              n_v,
         uint32_t              n_conv,
         uint32_t              n_tokens,
+        int                   sigmoid_gate,
         float                 eps);
 int ds4_gpu_qwen35_attention(
         ds4_gpu_tensor       *att,
@@ -3167,6 +3170,93 @@ int ds4_gpu_qwen35_attention(
         uint32_t              n_tokens,
         float                 freq_base,
         float                 eps);
+int ds4_gpu_qwen4exp_stream_norm(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gamma_offset,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows,
+        float                 eps);
+int ds4_gpu_qwen4exp_hc_low(ds4_gpu_tensor *lo, uint32_t n_low, uint32_t n_hc, uint32_t rows);
+int ds4_gpu_qwen4exp_hc_mix(
+        ds4_gpu_tensor       *mixed,
+        const ds4_gpu_tensor *xn,
+        const ds4_gpu_tensor *gate,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows);
+int ds4_gpu_qwen4exp_hc_combine(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *y,
+        const ds4_gpu_tensor *inject,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows);
+int ds4_gpu_qwen4exp_replicate(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *h,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows);
+int ds4_gpu_qwen4exp_router(
+        ds4_gpu_tensor       *sel,
+        ds4_gpu_tensor       *selw,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_expert,
+        uint32_t              n_used,
+        uint32_t              rows);
+int ds4_gpu_qwen4exp_expert_matvec(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              scales_offset,
+        const ds4_gpu_tensor *sel,
+        const ds4_gpu_tensor *x,
+        int                   x_per_slot,
+        uint32_t              n_expert,
+        uint32_t              n_used,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              rows);
+int ds4_gpu_qwen4exp_moe_combine(
+        ds4_gpu_tensor       *y,
+        const ds4_gpu_tensor *ed,
+        const ds4_gpu_tensor *selw,
+        const ds4_gpu_tensor *sg,
+        uint32_t              n_embd,
+        uint32_t              n_used,
+        uint32_t              rows);
+int ds4_gpu_qwen4exp_ple_gate(
+        ds4_gpu_tensor       *gated,
+        ds4_gpu_tensor       *pnorm,
+        const ds4_gpu_tensor *pkey,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *pval,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              key_norm_offset,
+        uint64_t              query_norm_offset,
+        uint64_t              conv_norm_offset,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows,
+        float                 eps);
+int ds4_gpu_qwen4exp_ple_conv(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *gated,
+        const ds4_gpu_tensor *pnorm,
+        ds4_gpu_tensor       *hist,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              taps_offset,
+        uint32_t              hc_dim,
+        uint32_t              kern,
+        uint32_t              dil,
+        uint32_t              rows);
 
 int ds4_gpu_glm53_kda_decode(
         ds4_gpu_tensor       *out,

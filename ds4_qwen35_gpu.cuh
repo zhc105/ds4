@@ -70,17 +70,8 @@ __device__ __forceinline__ float qwen35_cuda_block_sum(float v, float *scratch32
  * sub-block, so a warp sweeps eight consecutive super-blocks (288 bytes) per
  * iteration and the loads coalesce into whole sectors; the scale bytes ride
  * in the same sectors. */
-__global__ static void qwen35_nvfp4_matvec_kernel(
-        float *out, const uint8_t *w, const float *x,
-        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, float scale) {
-    const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t col = blockIdx.x * 8u + warp;
-    const uint32_t row = blockIdx.y;
-    if (col >= out_dim || row >= n_tok) return;
-    const uint32_t n_super = in_dim / 64u;
-    const uint8_t *wrow = w + (uint64_t)col * n_super * 36u;
-    const float *xrow = x + (uint64_t)row * in_dim;
+__device__ __forceinline__ float qwen35_nvfp4_warp_dot(
+        const uint8_t *wrow, const float *xrow, uint32_t n_super, uint32_t lane) {
     const uint32_t sub = lane & 3u;          /* sub-block within the super-block */
     float sum = 0.0f;
     for (uint32_t b = lane >> 2u; b < n_super; b += 8u) {
@@ -104,14 +95,33 @@ __global__ static void qwen35_nvfp4_matvec_kernel(
         }
         sum = fmaf(qwen35_cuda_ue4m3(blk[sub]), acc, sum);
     }
-    sum = warp_sum_f32(sum);
+    return warp_sum_f32(sum);
+}
+
+__global__ static void qwen35_nvfp4_matvec_kernel(
+        float *out, const uint8_t *w, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, float scale) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = blockIdx.x * 8u + warp;
+    const uint32_t row = blockIdx.y;
+    if (col >= out_dim || row >= n_tok) return;
+    const uint32_t n_super = in_dim / 64u;
+    const float sum = qwen35_nvfp4_warp_dot(w + (uint64_t)col * n_super * 36u,
+                                            x + (uint64_t)row * in_dim, n_super, lane);
     if (lane == 0u) out[(uint64_t)row * out_dim + col] = sum * scale;
 }
 
-/* Prefill: 64x64 output tile per 256-thread block, weights dequantised to
- * shared memory one super-block column at a time. */
-__global__ static void qwen35_nvfp4_gemm_kernel(
-        float *out, const uint8_t *w, const float *x,
+/* Weight storage types the Qwen graph feeds to the matmuls, as GGUF type ids
+ * so ds4.c passes the tensor type straight through. */
+enum { QWEN35_W_F32 = 0, QWEN35_W_BF16 = 30, QWEN35_W_NVFP4 = 40 };
+
+/* Prefill: 64x64 output tile per 256-thread block, weights of any storage
+ * type dequantised to shared memory 64 input columns at a time.  Plain f32
+ * FMA on f32 activations: this is the correctness path the CPU reference is
+ * compared against, not the tensor-core path. */
+__global__ static void qwen35_gemm_kernel(
+        float *out, const uint8_t *w, uint32_t wtype, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, float scale) {
     __shared__ float ws[64][65];
     __shared__ float xs[64][65];
@@ -127,7 +137,9 @@ __global__ static void qwen35_nvfp4_gemm_kernel(
             const uint32_t c = tid >> 2u;
             const uint32_t s = tid & 3u;
             const uint32_t col = col0 + c;
-            if (col < out_dim) {
+            if (col >= out_dim) {
+                for (uint32_t j = 0; j < 16u; j++) ws[c][s * 16u + j] = 0.0f;
+            } else if (wtype == QWEN35_W_NVFP4) {
                 const uint8_t *blk = w + ((uint64_t)col * n_super + b) * 36u;
                 const float d = qwen35_cuda_ue4m3(blk[s]);
                 const uint8_t *qs = blk + 4u + s * 8u;
@@ -135,8 +147,12 @@ __global__ static void qwen35_nvfp4_gemm_kernel(
                     ws[c][s * 16u + j] = qwen35_cuda_e2m1(qs[j] & 15u) * d;
                     ws[c][s * 16u + j + 8u] = qwen35_cuda_e2m1(qs[j] >> 4u) * d;
                 }
+            } else if (wtype == QWEN35_W_BF16) {
+                const uint16_t *src = (const uint16_t *)w + (uint64_t)col * in_dim + (uint64_t)b * 64u + s * 16u;
+                for (uint32_t j = 0; j < 16u; j++) ws[c][s * 16u + j] = __uint_as_float((uint32_t)src[j] << 16);
             } else {
-                for (uint32_t j = 0; j < 16u; j++) ws[c][s * 16u + j] = 0.0f;
+                const float *src = (const float *)w + (uint64_t)col * in_dim + (uint64_t)b * 64u + s * 16u;
+                for (uint32_t j = 0; j < 16u; j++) ws[c][s * 16u + j] = src[j];
             }
         }
         {
@@ -169,54 +185,74 @@ __global__ static void qwen35_nvfp4_gemm_kernel(
     }
 }
 
-extern "C" int ds4_gpu_qwen35_matmul_nvfp4(
-        ds4_gpu_tensor       *out,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        float                 scale,
-        uint32_t              in_dim,
-        uint32_t              out_dim,
-        const ds4_gpu_tensor *x,
-        uint32_t              n_tok) {
-    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u || n_tok == 0u ||
-        in_dim % 64u != 0u || weight_offset > model_size) {
-        return 0;
-    }
-    const uint64_t weight_bytes = (uint64_t)out_dim * (in_dim / 64u) * 36u;
-    if (weight_bytes > model_size - weight_offset ||
-        x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
-        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float)) {
-        return 0;
-    }
-    const char *w = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes,
-                                            ds4_tensor_device_idx(out), "Qwen3.5 NVFP4 weight");
-    if (!w) return 0;
-    if (n_tok <= 8u) {
-        const dim3 grid((out_dim + 7u) / 8u, n_tok, 1u);
-        qwen35_nvfp4_matvec_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
-            (float *)out->ptr, (const uint8_t *)w, (const float *)x->ptr,
-            in_dim, out_dim, n_tok, scale);
-    } else {
-        const dim3 grid((out_dim + 63u) / 64u, (n_tok + 63u) / 64u, 1u);
-        qwen35_nvfp4_gemm_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
-            (float *)out->ptr, (const uint8_t *)w, (const float *)x->ptr,
-            in_dim, out_dim, n_tok, scale);
-    }
-    return cuda_ok(cudaGetLastError(), "Qwen3.5 NVFP4 matmul launch");
-}
-
 __global__ static void qwen35_scale_kernel(float *x, uint64_t n, float scale) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= scale;
 }
 
-extern "C" int ds4_gpu_qwen35_scale(ds4_gpu_tensor *x, uint64_t n, float scale) {
-    if (!x || x->bytes < n * sizeof(float)) return 0;
-    if (n == 0u) return 1;
-    qwen35_scale_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
-        (float *)x->ptr, n, scale);
-    return cuda_ok(cudaGetLastError(), "Qwen3.5 scale launch");
+static uint64_t qwen35_weight_bytes(uint32_t wtype, uint32_t in_dim, uint32_t out_dim) {
+    switch (wtype) {
+    case QWEN35_W_NVFP4: return in_dim % 64u == 0u ? (uint64_t)out_dim * (in_dim / 64u) * 36u : 0u;
+    case QWEN35_W_BF16:  return (uint64_t)out_dim * in_dim * 2u;
+    case QWEN35_W_F32:   return (uint64_t)out_dim * in_dim * 4u;
+    default:             return 0u;
+    }
+}
+
+/* out[n_tok][out_dim] = x[n_tok][in_dim] W^T times the global scale, for a
+ * weight of any storage type the loader accepts.  Decode-sized batches use
+ * one warp or block per output column; larger ones the shared-memory GEMM.
+ * Both keep the activations in f32, which is what makes the graph match the
+ * CPU reference to rounding. */
+extern "C" int ds4_gpu_qwen35_matmul(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              wtype,
+        float                 scale,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tok) {
+    const uint64_t weight_bytes = qwen35_weight_bytes(wtype, in_dim, out_dim);
+    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u || n_tok == 0u ||
+        in_dim % 64u != 0u || weight_bytes == 0u || weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const char *w = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes,
+                                            ds4_tensor_device_idx(out), "Qwen weight");
+    if (!w) return 0;
+    cudaStream_t stream = cuda_decode_stream();
+    float *o = (float *)out->ptr;
+    const float *xp = (const float *)x->ptr;
+    if (n_tok > 8u) {
+        const dim3 grid((out_dim + 63u) / 64u, (n_tok + 63u) / 64u, 1u);
+        qwen35_gemm_kernel<<<grid, 256, 0, stream>>>(o, (const uint8_t *)w, wtype, xp,
+                                                     in_dim, out_dim, n_tok, scale);
+        return cuda_ok(cudaGetLastError(), "Qwen GEMM launch");
+    }
+    if (wtype == QWEN35_W_NVFP4) {
+        const dim3 grid((out_dim + 7u) / 8u, n_tok, 1u);
+        qwen35_nvfp4_matvec_kernel<<<grid, 256, 0, stream>>>(o, (const uint8_t *)w, xp,
+                                                             in_dim, out_dim, n_tok, scale);
+        return cuda_ok(cudaGetLastError(), "Qwen NVFP4 matvec launch");
+    }
+    if (wtype == QWEN35_W_BF16) {
+        const dim3 grid((out_dim + 7u) / 8u, n_tok, 1u);
+        glm53_matvec_bf16_f32_kernel<<<grid, 256, 0, stream>>>(o, (const uint16_t *)w, xp, in_dim, out_dim);
+    } else {
+        matmul_f32_kernel<<<dim3(out_dim, n_tok, 1u), 256, 0, stream>>>(o, (const float *)w, xp,
+                                                                        in_dim, out_dim, n_tok);
+    }
+    if (scale != 1.0f) {
+        const uint64_t n = (uint64_t)n_tok * out_dim;
+        qwen35_scale_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(o, n, scale);
+    }
+    return cuda_ok(cudaGetLastError(), "Qwen matvec launch");
 }
 
 /* ---- Gated DeltaNet ------------------------------------------------------ */
@@ -303,9 +339,11 @@ __global__ static void qwen35_gdn_recurrence_kernel(
     *sp = h;
 }
 
-/* RMSNormGated per head: normalise, scale, then multiply by SiLU(z). */
+/* RMSNormGated per head: normalise, scale, then multiply by the output gate,
+ * SiLU(z) for Qwen3.5 and sigmoid(z) for Flash-Next. */
 __global__ static void qwen35_gdn_norm_gate_kernel(
-        float *o, const float *z, const float *norm_w, uint32_t n_v, uint32_t n_tokens, float eps) {
+        float *o, const float *z, const float *norm_w, uint32_t n_v, uint32_t n_tokens,
+        uint32_t sigmoid_gate, float eps) {
     __shared__ float scratch[32];
     const uint32_t hd = QWEN35_CUDA_GDN_DIM;
     const uint32_t t = blockIdx.x;
@@ -316,7 +354,8 @@ __global__ static void qwen35_gdn_norm_gate_kernel(
     const float raw = o[idx];
     const float total = qwen35_cuda_block_sum(raw * raw, scratch);
     const float scale = rsqrtf(total / (float)hd + eps);
-    o[idx] = raw * scale * norm_w[tid] * qwen35_cuda_silu(z[idx]);
+    const float gate = sigmoid_gate ? qwen35_cuda_sigmoid(z[idx]) : qwen35_cuda_silu(z[idx]);
+    o[idx] = raw * scale * norm_w[tid] * gate;
 }
 
 extern "C" int ds4_gpu_qwen35_gdn(
@@ -338,6 +377,7 @@ extern "C" int ds4_gpu_qwen35_gdn(
         uint32_t              n_v,
         uint32_t              n_conv,
         uint32_t              n_tokens,
+        int                   sigmoid_gate,
         float                 eps) {
     const uint32_t hd = QWEN35_CUDA_GDN_DIM;
     if (!out || !mixed || !conv_state || !ssm_state || !qkv || !z || !alpha || !beta ||
@@ -380,7 +420,7 @@ extern "C" int ds4_gpu_qwen35_gdn(
         (const float *)alpha->ptr, (const float *)beta->ptr, a_neg, dt_bias,
         n_k, n_v, n_tokens, rsqrtf((float)hd));
     qwen35_gdn_norm_gate_kernel<<<dim3(n_tokens, n_v, 1u), hd, 0, stream>>>(
-        (float *)out->ptr, (const float *)z->ptr, norm_w, n_v, n_tokens, eps);
+        (float *)out->ptr, (const float *)z->ptr, norm_w, n_v, n_tokens, sigmoid_gate != 0, eps);
     return cuda_ok(cudaGetLastError(), "Qwen3.5 GDN launch");
 }
 
@@ -609,4 +649,443 @@ extern "C" int ds4_gpu_qwen35_attention(
             n_head, hd, n_tokens, n_splits);
     }
     return cuda_ok(cudaGetLastError(), "Qwen3.5 attention launch");
+}
+
+/* ---- Flash-Next ----------------------------------------------------------
+ * Hyper-connection residual streams, routed NVFP4 experts and the PLE n-gram
+ * injection, mirroring qwen_hc_mix / qwen_moe_forward / qwen_ple_forward in
+ * ds4.c.  Layouts:
+ *   x, xn, gate  [n_tok][n_hc][n_embd]   streams, normalised streams, stream gate
+ *   inject       [n_tok][n_hc]
+ *   sel / selw   [n_tok][n_used]         routed expert ids (int32) and weights
+ *   eg, eu, ed   [n_tok * n_used][...]   one row per (token, expert slot)
+ */
+
+#define QWEN4EXP_MAX_EXPERT 512u
+
+static bool qwen4exp_elems_fit(const ds4_gpu_tensor *t, uint64_t elems) {
+    return t && t->bytes >= elems * sizeof(float);
+}
+
+/* RMSNorm of every stream with its own slice of the [n_hc * n] gamma: block
+ * per (token, stream). */
+__global__ static void qwen4exp_stream_norm_kernel(
+        float *out, const float *x, const float *gamma, uint32_t n, uint32_t n_hc, uint32_t rows, float eps) {
+    __shared__ float scratch[32];
+    const uint32_t row = blockIdx.x;
+    if (row >= rows * n_hc) return;
+    const float *g = gamma + (uint64_t)(row % n_hc) * n;
+    const float *xr = x + (uint64_t)row * n;
+    float *o = out + (uint64_t)row * n;
+    float ss = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) ss = fmaf(xr[i], xr[i], ss);
+    ss = qwen35_cuda_block_sum(ss, scratch);
+    const float scale = rsqrtf(ss / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) o[i] = xr[i] * scale * g[i];
+}
+
+extern "C" int ds4_gpu_qwen4exp_stream_norm(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gamma_offset,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows,
+        float                 eps) {
+    const uint64_t elems = (uint64_t)rows * n_hc * n_embd;
+    if (!model_map || n_embd == 0u || n_hc == 0u || rows == 0u ||
+        !qwen4exp_elems_fit(out, elems) || !qwen4exp_elems_fit(x, elems)) {
+        return 0;
+    }
+    const float *gamma = glm53_cuda_weight_f32(model_map, model_size, gamma_offset,
+                                               (uint64_t)n_hc * n_embd, ds4_tensor_device_idx(out), "hc norm");
+    if (!gamma) return 0;
+    qwen4exp_stream_norm_kernel<<<rows * n_hc, 256, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const float *)x->ptr, gamma, n_embd, n_hc, rows, eps);
+    return cuda_ok(cudaGetLastError(), "Flash-Next stream norm launch");
+}
+
+/* The low-rank hc gate: lo = SiLU(lo / n_hc). */
+__global__ static void qwen4exp_hc_low_kernel(float *lo, uint64_t n, float n_hc) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) lo[i] = qwen35_cuda_silu(lo[i] / n_hc);
+}
+
+extern "C" int ds4_gpu_qwen4exp_hc_low(ds4_gpu_tensor *lo, uint32_t n_low, uint32_t n_hc, uint32_t rows) {
+    const uint64_t n = (uint64_t)rows * n_low;
+    if (n == 0u || n_hc == 0u || !qwen4exp_elems_fit(lo, n)) return 0;
+    qwen4exp_hc_low_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+        (float *)lo->ptr, n, (float)n_hc);
+    return cuda_ok(cudaGetLastError(), "Flash-Next hc gate launch");
+}
+
+/* mixed = mean over streams of xn * sigmoid(gate). */
+__global__ static void qwen4exp_hc_mix_kernel(
+        float *mixed, const float *xn, const float *gate, uint32_t n, uint32_t n_hc, uint32_t rows) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (uint64_t)rows * n) return;
+    const uint64_t t = i / n;
+    const uint64_t j = i - t * n;
+    float acc = 0.0f;
+    for (uint32_t c = 0; c < n_hc; c++) {
+        const uint64_t idx = (t * n_hc + c) * n + j;
+        acc = fmaf(xn[idx], qwen35_cuda_sigmoid(gate[idx]), acc);
+    }
+    mixed[i] = acc / (float)n_hc;
+}
+
+extern "C" int ds4_gpu_qwen4exp_hc_mix(
+        ds4_gpu_tensor       *mixed,
+        const ds4_gpu_tensor *xn,
+        const ds4_gpu_tensor *gate,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows) {
+    const uint64_t n = (uint64_t)rows * n_embd;
+    if (n == 0u || n_hc == 0u || !qwen4exp_elems_fit(mixed, n) ||
+        !qwen4exp_elems_fit(xn, n * n_hc) || !qwen4exp_elems_fit(gate, n * n_hc)) {
+        return 0;
+    }
+    qwen4exp_hc_mix_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+        (float *)mixed->ptr, (const float *)xn->ptr, (const float *)gate->ptr, n_embd, n_hc, rows);
+    return cuda_ok(cudaGetLastError(), "Flash-Next hc mix launch");
+}
+
+/* Every stream receives the sub-layer output weighted by 2*sigmoid(inject/n_hc). */
+__global__ static void qwen4exp_hc_combine_kernel(
+        float *x, const float *y, const float *inject, uint32_t n, uint32_t n_hc, uint32_t rows) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (uint64_t)rows * n_hc * n) return;
+    const uint64_t row = i / n;                /* token * n_hc + stream */
+    const uint64_t j = i - row * n;
+    const uint64_t t = row / n_hc;
+    const float w = 2.0f * qwen35_cuda_sigmoid(inject[row] / (float)n_hc);
+    x[i] = fmaf(y[t * n + j], w, x[i]);
+}
+
+extern "C" int ds4_gpu_qwen4exp_hc_combine(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *y,
+        const ds4_gpu_tensor *inject,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows) {
+    const uint64_t n = (uint64_t)rows * n_hc * n_embd;
+    if (n == 0u || !qwen4exp_elems_fit(x, n) || !qwen4exp_elems_fit(y, (uint64_t)rows * n_embd) ||
+        !qwen4exp_elems_fit(inject, (uint64_t)rows * n_hc)) {
+        return 0;
+    }
+    qwen4exp_hc_combine_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+        (float *)x->ptr, (const float *)y->ptr, (const float *)inject->ptr, n_embd, n_hc, rows);
+    return cuda_ok(cudaGetLastError(), "Flash-Next hc combine launch");
+}
+
+/* The wide residual starts as n_hc copies of the embedding. */
+__global__ static void qwen4exp_replicate_kernel(
+        float *x, const float *h, uint32_t n, uint32_t n_hc, uint32_t rows) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (uint64_t)rows * n_hc * n) return;
+    const uint64_t t = i / ((uint64_t)n_hc * n);
+    x[i] = h[t * n + i % n];
+}
+
+extern "C" int ds4_gpu_qwen4exp_replicate(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *h,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows) {
+    const uint64_t n = (uint64_t)rows * n_hc * n_embd;
+    if (n == 0u || !qwen4exp_elems_fit(x, n) || !qwen4exp_elems_fit(h, (uint64_t)rows * n_embd)) return 0;
+    qwen4exp_replicate_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+        (float *)x->ptr, (const float *)h->ptr, n_embd, n_hc, rows);
+    return cuda_ok(cudaGetLastError(), "Flash-Next replicate launch");
+}
+
+/* Softmax router and top-k: one block per token, one thread per expert.
+ * Repeated block argmax with ties to the lower expert id reproduces the CPU
+ * scan exactly, and the kept probabilities are renormalised to sum to one. */
+__global__ static void qwen4exp_router_kernel(
+        int32_t *sel, float *selw, const float *logits, uint32_t n_expert, uint32_t n_used) {
+    __shared__ float p[QWEN4EXP_MAX_EXPERT];
+    __shared__ float rv[QWEN4EXP_MAX_EXPERT];
+    __shared__ int32_t ri[QWEN4EXP_MAX_EXPERT];
+    const uint32_t t = blockIdx.x;
+    const uint32_t e = threadIdx.x;
+    const float v = e < n_expert ? logits[(uint64_t)t * n_expert + e] : -INFINITY;
+    rv[e] = v;
+    __syncthreads();
+    for (uint32_t s = QWEN4EXP_MAX_EXPERT / 2u; s > 0u; s >>= 1u) {
+        if (e < s) rv[e] = fmaxf(rv[e], rv[e + s]);
+        __syncthreads();
+    }
+    const float max = rv[0];
+    __syncthreads();
+    p[e] = e < n_expert ? expf(v - max) : -1.0f;
+    float sum = 0.0f;
+    for (uint32_t k = 0; k < n_used; k++) {
+        __syncthreads();
+        rv[e] = p[e];
+        ri[e] = (int32_t)e;
+        __syncthreads();
+        for (uint32_t s = QWEN4EXP_MAX_EXPERT / 2u; s > 0u; s >>= 1u) {
+            if (e < s && (rv[e + s] > rv[e] || (rv[e + s] == rv[e] && ri[e + s] < ri[e]))) {
+                rv[e] = rv[e + s];
+                ri[e] = ri[e + s];
+            }
+            __syncthreads();
+        }
+        const int32_t best = ri[0];
+        const float bestv = rv[0];
+        if (e == 0u) {
+            sel[(uint64_t)t * n_used + k] = best;
+            selw[(uint64_t)t * n_used + k] = bestv;
+        }
+        if ((int32_t)e == best) p[e] = -1.0f;
+        sum += bestv;
+    }
+    __syncthreads();
+    if (e < n_used) selw[(uint64_t)t * n_used + e] /= sum;
+}
+
+extern "C" int ds4_gpu_qwen4exp_router(
+        ds4_gpu_tensor       *sel,
+        ds4_gpu_tensor       *selw,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_expert,
+        uint32_t              n_used,
+        uint32_t              rows) {
+    if (rows == 0u || n_expert == 0u || n_expert > QWEN4EXP_MAX_EXPERT || n_used == 0u || n_used > n_expert ||
+        !qwen4exp_elems_fit(logits, (uint64_t)rows * n_expert) ||
+        !sel || sel->bytes < (uint64_t)rows * n_used * sizeof(int32_t) ||
+        !qwen4exp_elems_fit(selw, (uint64_t)rows * n_used)) {
+        return 0;
+    }
+    qwen4exp_router_kernel<<<rows, QWEN4EXP_MAX_EXPERT, 0, cuda_decode_stream()>>>(
+        (int32_t *)sel->ptr, (float *)selw->ptr, (const float *)logits->ptr, n_expert, n_used);
+    return cuda_ok(cudaGetLastError(), "Flash-Next router launch");
+}
+
+/* One warp per (slot, output column) over the slot's expert: the stacked
+ * [n_expert][out][in] NVFP4 tensor is indexed by sel and scaled per expert.
+ * The input row is the slot's own row (x_per_slot) or its token's row. */
+__global__ static void qwen4exp_expert_matvec_kernel(
+        float *out, const uint8_t *w, uint64_t expert_bytes, const float *scales, const int32_t *sel,
+        const float *x, uint32_t x_per_slot, uint32_t in_dim, uint32_t out_dim, uint32_t n_used) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = blockIdx.x * 8u + warp;
+    const uint32_t slot = blockIdx.y;
+    if (col >= out_dim) return;
+    const int32_t e = sel[slot];
+    const uint32_t n_super = in_dim / 64u;
+    const uint8_t *wrow = w + (uint64_t)e * expert_bytes + (uint64_t)col * n_super * 36u;
+    const float *xrow = x + (uint64_t)(x_per_slot ? slot : slot / n_used) * in_dim;
+    const float sum = qwen35_nvfp4_warp_dot(wrow, xrow, n_super, lane);
+    if (lane == 0u) out[(uint64_t)slot * out_dim + col] = sum * scales[e];
+}
+
+extern "C" int ds4_gpu_qwen4exp_expert_matvec(
+        ds4_gpu_tensor       *out,          /* [rows * n_used][out_dim] */
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset, /* [n_expert][out_dim][in_dim] NVFP4 */
+        uint64_t              scales_offset, /* [n_expert] f32 */
+        const ds4_gpu_tensor *sel,
+        const ds4_gpu_tensor *x,
+        int                   x_per_slot,
+        uint32_t              n_expert,
+        uint32_t              n_used,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              rows) {
+    const uint64_t expert_bytes = qwen35_weight_bytes(QWEN35_W_NVFP4, in_dim, out_dim);
+    const uint64_t slots = (uint64_t)rows * n_used;
+    if (!model_map || rows == 0u || n_used == 0u || n_expert == 0u || expert_bytes == 0u ||
+        weight_offset > model_size || expert_bytes * n_expert > model_size - weight_offset ||
+        !qwen4exp_elems_fit(out, slots * out_dim) ||
+        !qwen4exp_elems_fit(x, (x_per_slot ? slots : rows) * in_dim) ||
+        !sel || sel->bytes < slots * sizeof(int32_t)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(out);
+    const char *w = cuda_resolve_weight_ptr(model_map, weight_offset, expert_bytes * n_expert, tier,
+                                            "Flash-Next experts");
+    const float *scales = glm53_cuda_weight_f32(model_map, model_size, scales_offset, n_expert, tier,
+                                                "Flash-Next expert scales");
+    if (!w || !scales) return 0;
+    const dim3 grid((out_dim + 7u) / 8u, (unsigned)slots, 1u);
+    qwen4exp_expert_matvec_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const uint8_t *)w, expert_bytes, scales, (const int32_t *)sel->ptr,
+        (const float *)x->ptr, x_per_slot != 0, in_dim, out_dim, n_used);
+    return cuda_ok(cudaGetLastError(), "Flash-Next expert matvec launch");
+}
+
+/* y = sum over slots of selw * ed, plus the shared expert already in y
+ * scaled by its sigmoid gate. */
+__global__ static void qwen4exp_moe_combine_kernel(
+        float *y, const float *ed, const float *selw, const float *sg, uint32_t n, uint32_t n_used, uint32_t rows) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (uint64_t)rows * n) return;
+    const uint64_t t = i / n;
+    const uint64_t j = i - t * n;
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < n_used; k++) {
+        const uint64_t slot = t * n_used + k;
+        acc = fmaf(selw[slot], ed[slot * n + j], acc);
+    }
+    y[i] = fmaf(qwen35_cuda_sigmoid(sg[t]), y[i], acc);
+}
+
+extern "C" int ds4_gpu_qwen4exp_moe_combine(
+        ds4_gpu_tensor       *y,
+        const ds4_gpu_tensor *ed,
+        const ds4_gpu_tensor *selw,
+        const ds4_gpu_tensor *sg,
+        uint32_t              n_embd,
+        uint32_t              n_used,
+        uint32_t              rows) {
+    const uint64_t n = (uint64_t)rows * n_embd;
+    if (n == 0u || n_used == 0u || !qwen4exp_elems_fit(y, n) || !qwen4exp_elems_fit(ed, n * n_used) ||
+        !qwen4exp_elems_fit(selw, (uint64_t)rows * n_used) || !qwen4exp_elems_fit(sg, rows)) {
+        return 0;
+    }
+    qwen4exp_moe_combine_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+        (float *)y->ptr, (const float *)ed->ptr, (const float *)selw->ptr, (const float *)sg->ptr,
+        n_embd, n_used, rows);
+    return cuda_ok(cudaGetLastError(), "Flash-Next MoE combine launch");
+}
+
+/* PLE gate, block per (token, stream): the normalised key against the
+ * normalised stream gives a signed-sqrt sigmoid gate on the value; the gated
+ * value is kept for the residual add and its stream-normalised form is the
+ * conv input. */
+__global__ static void qwen4exp_ple_gate_kernel(
+        float *gated, float *pnorm, const float *pkey, const float *x, const float *pval,
+        const float *w_key, const float *w_query, const float *w_conv,
+        uint32_t n, uint32_t n_hc, uint32_t rows, float eps) {
+    __shared__ float scratch[32];
+    const uint32_t row = blockIdx.x;
+    if (row >= rows * n_hc) return;
+    const uint32_t t = row / n_hc;
+    const uint64_t off = (uint64_t)(row % n_hc) * n;
+    const float *k = pkey + (uint64_t)row * n;
+    const float *q = x + (uint64_t)row * n;
+    const float *v = pval + (uint64_t)t * n;
+    float ssk = 0.0f, ssq = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        ssk = fmaf(k[i], k[i], ssk);
+        ssq = fmaf(q[i], q[i], ssq);
+    }
+    ssk = qwen35_cuda_block_sum(ssk, scratch);
+    ssq = qwen35_cuda_block_sum(ssq, scratch);
+    const float sk = rsqrtf(ssk / (float)n + eps);
+    const float sq = rsqrtf(ssq / (float)n + eps);
+    float dot = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        dot = fmaf(k[i] * sk * w_key[off + i], q[i] * sq * w_query[off + i], dot);
+    }
+    const float s = qwen35_cuda_block_sum(dot, scratch) / sqrtf((float)n);
+    const float mag = sqrtf(fmaxf(fabsf(s), 1e-6f));
+    const float gate = qwen35_cuda_sigmoid(s > 0.0f ? mag : s < 0.0f ? -mag : 0.0f);
+    float *g = gated + (uint64_t)row * n;
+    float ssg = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float gv = v[i] * gate;
+        g[i] = gv;
+        ssg = fmaf(gv, gv, ssg);
+    }
+    const float sg = rsqrtf(qwen35_cuda_block_sum(ssg, scratch) / (float)n + eps);
+    float *o = pnorm + (uint64_t)row * n;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) o[i] = g[i] * sg * w_conv[off + i];
+}
+
+extern "C" int ds4_gpu_qwen4exp_ple_gate(
+        ds4_gpu_tensor       *gated,        /* [rows][n_hc][n_embd] */
+        ds4_gpu_tensor       *pnorm,        /* [rows][n_hc][n_embd] */
+        const ds4_gpu_tensor *pkey,         /* [rows][n_hc][n_embd] */
+        const ds4_gpu_tensor *x,            /* [rows][n_hc][n_embd] */
+        const ds4_gpu_tensor *pval,         /* [rows][n_embd] */
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              key_norm_offset,
+        uint64_t              query_norm_offset,
+        uint64_t              conv_norm_offset,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows,
+        float                 eps) {
+    const uint64_t wide = (uint64_t)rows * n_hc * n_embd;
+    if (!model_map || wide == 0u || !qwen4exp_elems_fit(gated, wide) || !qwen4exp_elems_fit(pnorm, wide) ||
+        !qwen4exp_elems_fit(pkey, wide) || !qwen4exp_elems_fit(x, wide) ||
+        !qwen4exp_elems_fit(pval, (uint64_t)rows * n_embd)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(gated);
+    const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
+    const float *w_key = glm53_cuda_weight_f32(model_map, model_size, key_norm_offset, hc_dim, tier, "PLE key norm");
+    const float *w_query = glm53_cuda_weight_f32(model_map, model_size, query_norm_offset, hc_dim, tier, "PLE query norm");
+    const float *w_conv = glm53_cuda_weight_f32(model_map, model_size, conv_norm_offset, hc_dim, tier, "PLE conv norm");
+    if (!w_key || !w_query || !w_conv) return 0;
+    qwen4exp_ple_gate_kernel<<<rows * n_hc, 256, 0, cuda_decode_stream()>>>(
+        (float *)gated->ptr, (float *)pnorm->ptr, (const float *)pkey->ptr, (const float *)x->ptr,
+        (const float *)pval->ptr, w_key, w_query, w_conv, n_embd, n_hc, rows, eps);
+    return cuda_ok(cudaGetLastError(), "Flash-Next PLE gate launch");
+}
+
+/* Dilated depthwise causal conv over the normalised gated value, taps
+ * oldest..newest with the last tap on the current token and tap k reading
+ * (kernel-1-k)*dilation tokens back, from the batch or the history (oldest
+ * first).  x += gated + SiLU(conv). */
+__global__ static void qwen4exp_ple_conv_kernel(
+        float *x, const float *gated, const float *pnorm, const float *hist, const float *taps,
+        uint32_t hc_dim, uint32_t kern, uint32_t dil, uint32_t rows) {
+    const uint32_t ch = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (ch >= hc_dim || t >= rows) return;
+    const float *tp = taps + (uint64_t)ch * kern;
+    const int32_t hist_rows = (int32_t)((kern - 1u) * dil);
+    const uint64_t cur = (uint64_t)t * hc_dim + ch;
+    float acc = tp[kern - 1u] * pnorm[cur];
+    for (uint32_t k = 0; k + 1u < kern; k++) {
+        const int32_t src = (int32_t)t - (int32_t)((kern - 1u - k) * dil);
+        const float v = src >= 0
+            ? pnorm[(uint64_t)src * hc_dim + ch]
+            : hist[(uint64_t)(hist_rows + src) * hc_dim + ch];
+        acc = fmaf(tp[k], v, acc);
+    }
+    x[cur] += gated[cur] + qwen35_cuda_silu(acc);
+}
+
+extern "C" int ds4_gpu_qwen4exp_ple_conv(
+        ds4_gpu_tensor       *x,            /* [rows][hc_dim] */
+        const ds4_gpu_tensor *gated,        /* [rows][hc_dim] */
+        const ds4_gpu_tensor *pnorm,        /* [rows][hc_dim] */
+        ds4_gpu_tensor       *hist,         /* [(kernel-1)*dilation][hc_dim], slid forward afterwards */
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              taps_offset,  /* [hc_dim][kernel] f32 */
+        uint32_t              hc_dim,
+        uint32_t              kern,
+        uint32_t              dil,
+        uint32_t              rows) {
+    const uint64_t n = (uint64_t)rows * hc_dim;
+    const uint32_t hist_rows = (kern - 1u) * dil;
+    if (!model_map || n == 0u || kern < 2u || dil == 0u || !qwen4exp_elems_fit(x, n) ||
+        !qwen4exp_elems_fit(gated, n) || !qwen4exp_elems_fit(pnorm, n) ||
+        !qwen4exp_elems_fit(hist, (uint64_t)hist_rows * hc_dim)) {
+        return 0;
+    }
+    const float *taps = glm53_cuda_weight_f32(model_map, model_size, taps_offset, (uint64_t)hc_dim * kern,
+                                              ds4_tensor_device_idx(x), "PLE conv");
+    if (!taps) return 0;
+    cudaStream_t stream = cuda_decode_stream();
+    qwen4exp_ple_conv_kernel<<<dim3((hc_dim + 255u) / 256u, rows, 1u), 256, 0, stream>>>(
+        (float *)x->ptr, (const float *)gated->ptr, (const float *)pnorm->ptr, (const float *)hist->ptr,
+        taps, hc_dim, kern, dil, rows);
+    qwen35_gdn_conv_state_kernel<<<(hc_dim + 255u) / 256u, 256, 0, stream>>>(
+        (float *)hist->ptr, (const float *)pnorm->ptr, hc_dim, hist_rows, rows);
+    return cuda_ok(cudaGetLastError(), "Flash-Next PLE conv launch");
 }

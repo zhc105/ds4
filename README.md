@@ -270,14 +270,16 @@ with `<think>` handling; disk KV checkpoints and the MTP block are not wired
 up yet.
 
 Qwen3.8-Flash-Next (`qwen4exp`) GGUFs from the same converter load and run
-on the CPU reference path: hyper-connection residual streams, routed NVFP4
-experts (softmax router, renormalised top-k) beside the gated shared expert,
-gated GQA attention (dense; the QSA indexer is bound but not yet applied, so
-prompts must stay under the 2048-token budget), the sigmoid-gated GDN, and
-the PLE n-gram injection reading rows from the mmapped `.ngram` sidecar.
-`--inspect` shows the shape and the n-gram table.
+on the CPU reference path and on the CUDA graph: hyper-connection residual
+streams, routed NVFP4 experts (softmax router, renormalised top-k) beside the
+gated shared expert, gated GQA attention with the QSA block indexer
+(`DS4_QSA_DENSE=1` ignores the indexer; the graph still attends densely, so
+graph prompts must stay within the 2048-token budget until the gather-style
+QSA lands), the sigmoid-gated GDN, and the PLE n-gram injection reading rows
+from the mmapped `.ngram` sidecar (the host gathers the rows, the GPU never
+maps the table).  `--inspect` shows the shape and the n-gram table.
 
-Two references check it.  `tests/qwen_vllm_compare.py` scores a
+Two references check the CPU path.  `tests/qwen_vllm_compare.py` scores a
 `DS4_QWEN_DUMP_LOGITS` dump teacher-forced against a vLLM server serving the
 same checkpoint (argmax agreement, top-k overlap, log-prob gap on the tokens
 vLLM reports; `--noise` measures vLLM's own batch-to-batch noise, which is
@@ -285,6 +287,12 @@ where ds4 lands).  `tests/qwen_flash_next_ref.py` is an independent f32
 numpy forward straight from the HF safetensors that agrees with the dump to
 about 1e-5 and is the tool for doubts vLLM's FP4 noise cannot settle.
 `DS4_QWEN_TRACE=1` prints per-layer residual norms for locating a divergence.
+The graph is checked against the CPU dump with `tests/qwen_dump_compare.py
+cpu.bin gpu.bin --chunk C` (KL and argmax per position; C is the
+`--prefill-chunk` of the graph run), where it lands at KL 1e-10.  Every graph
+matmul keeps f32 activations (NVFP4/BF16/F32 weights dequantised on the fly),
+which is what makes that comparison exact; tensor-core paths are a later,
+separately measured step.
 
 ## GLM 5.3 Flash
 
