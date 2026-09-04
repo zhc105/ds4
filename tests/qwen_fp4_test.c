@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { N_EXPERT = 5, N_USED = 3, ROWS = 45, K = 128, M = 200, TILE = 32 };
+enum { N_EXPERT = 5, N_USED = 3, ROWS = 45, K = 640, M = 200, TILE = 32 };   /* K spans several pipeline steps */
 enum { N_SUPER = K / 64, SLOTS = ROWS * N_USED };
 
 static const float e2m1[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };

@@ -24,7 +24,7 @@ int ds4_qwen_fp4_quantize(const float *x, void *xq, int rows, int K, cudaStream_
  * for every (token, slot) pair, with `plan`/`order` the expert grouping made
  * by ds4_gpu_qwen4exp_expert_plan (32-slot tiles).  W is the stacked
  * [n_expert][M][K] NVFP4 tensor; xq has one NVFP4 row per slot (x_per_slot)
- * or per token (row = slot / n_used).  K % 64 == 0. */
+ * or per token (row = slot / n_used).  K % 128 == 0. */
 int ds4_qwen_fp4_moe_gemm(
     const void     *W,
     const float    *scales,
