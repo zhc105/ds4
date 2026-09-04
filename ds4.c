@@ -550,6 +550,7 @@ typedef struct {
     uint32_t ple_layer;         /* Qwen layer carrying the PLE n-gram injection, UINT32_MAX if none */
     uint32_t n_ple_row;         /* PLE table row width (all heads concatenated) */
     uint32_t n_ple_conv;        /* PLE causal conv kernel size */
+    uint32_t n_ple_ngram;       /* PLE n-gram window (tokens hashed together), also the conv dilation */
     int32_t  ple_reset_token;   /* PLE n-gram window restarts after this token */
     float rms_eps;
     float hc_eps;
@@ -833,6 +834,7 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_PLE_LAYER                 (g_ds4_shape.ple_layer)
 #define DS4_N_PLE_ROW                 (g_ds4_shape.n_ple_row)
 #define DS4_N_PLE_CONV                (g_ds4_shape.n_ple_conv)
+#define DS4_N_PLE_NGRAM               (g_ds4_shape.n_ple_ngram)
 #define DS4_PLE_RESET_TOKEN           (g_ds4_shape.ple_reset_token)
 
 static bool ds4_model_is_glm53(void) {
@@ -2243,10 +2245,11 @@ typedef struct {
 
 /* Qwen PLE n-gram table: a ds4 ".ngram" sidecar next to the GGUF (see
  * gguf-tools/hf_gguf.py ngram_header).  Row i of E4M3 values lives at
- * DS4_NGRAM_HEADER_BYTES + i * row_bytes; a row is n_head groups of
- * row_bytes / n_head values, all multiplied by scale.  The table is mmapped
- * and only touched row by row: the hash of the last ngram_size tokens picks
- * one row per head, so the working set is a tiny slice of the file. */
+ * DS4_NGRAM_HEADER_BYTES + i * row_bytes, all multiplied by scale.  Each of
+ * the n_head hash heads owns a disjoint row range and gathers one full row;
+ * the n_head rows concatenated (head slowest) form the n_embd-wide n-gram
+ * embedding.  The table is mmapped and only touched row by row, so the
+ * working set is a tiny slice of the file. */
 enum { DS4_NGRAM_HEADER_BYTES = 4096, DS4_NGRAM_MAX_MULT = 4, DS4_NGRAM_MAX_HEAD = 32 };
 
 typedef struct {
@@ -6607,6 +6610,7 @@ static void config_validate_qwen_model(const ds4_model *m, const char *arch) {
         s->ple_layer = ple_layers[0];
         s->n_ple_row = required_u32(m, QK("embedding_length_per_layer_input"));
         s->n_ple_conv = required_u32(m, QK("ple.conv_kernel"));
+        s->n_ple_ngram = required_u32(m, QK("ple.ngram_size"));
         s->ple_reset_token = (int32_t)required_u32(m, QK("ple.eos_token_id"));
         if (s->n_expert == 0 || s->n_expert > DS4_MAX_EXPERT ||
             s->n_expert_used == 0 || s->n_expert_used > DS4_MAX_EXPERT_USED ||
@@ -6624,6 +6628,7 @@ static void config_validate_qwen_model(const ds4_model *m, const char *arch) {
         }
         if (s->ple_layer >= s->n_layer || !ds4_qwen_layer_is_gdn(s->ple_layer) ||
             s->n_ple_row == 0 || s->n_ple_conv < 2 || s->n_ple_conv > DS4_MAX_KDA_CONV ||
+            s->n_ple_ngram < 2 || s->n_ple_ngram > DS4_NGRAM_MAX_MULT ||
             s->ple_reset_token < 0 || (uint32_t)s->ple_reset_token >= s->n_vocab) {
             ds4_die("qwen: unsupported PLE layout");
         }
@@ -6717,7 +6722,8 @@ static void qwen_ngram_open(ds4_model *m, const char *model_path) {
     p += 8u * t->n_head;
     memcpy(t->head_vocab, p, 8u * t->n_head);
 
-    if (t->row_bytes != DS4_N_PLE_ROW || t->row_bytes % t->n_head != 0 ||
+    if (t->row_bytes != DS4_N_PLE_ROW || (uint64_t)t->n_head * t->row_bytes != DS4_N_EMBD ||
+        t->n_mult != DS4_N_PLE_NGRAM || t->n_head % (t->n_mult - 1) != 0 ||
         t->size != DS4_NGRAM_HEADER_BYTES + t->rows * t->row_bytes) {
         ds4_die("qwen: PLE n-gram table size disagrees with its header and the GGUF");
     }
@@ -15376,6 +15382,7 @@ typedef struct {
     float *state;   /* GDN: [n_v_head][head_dim (v)][head_dim (k)] */
     float *k;       /* attention: [ctx][n_head_kv * head_dim], RoPE applied */
     float *v;       /* attention: [ctx][n_head_kv * head_dim] */
+    float *ple_conv;/* PLE layer: [(n_ple_conv - 1) * ngram][hc_dim] conv inputs, oldest first */
 } ds4_qwen_layer_state;
 
 typedef struct {
@@ -15383,8 +15390,8 @@ typedef struct {
     uint32_t ctx;
     uint32_t n_tokens;
     /* scratch, sized once for the largest projection of either layer kind */
-    float *x;       /* residual stream [n_embd] */
-    float *h;       /* normalised input [n_embd] */
+    float *x;       /* residual stream [n_embd], or the n_hc streams [n_hc][n_embd] with hyper-connections */
+    float *h;       /* sub-layer input [n_embd] */
     float *y;       /* branch output [n_embd] */
     float *proj;    /* [max(conv_dim, 2 * n_head * head_dim)] */
     float *mixed;   /* [max(conv_dim, n_ff)] */
@@ -15393,6 +15400,21 @@ typedef struct {
     float *kv;      /* [2 * n_head_kv * head_dim] k then v */
     float *att;     /* [max(v_dim, n_head * head_dim)] */
     float *scores;  /* [ctx] */
+    /* Flash-Next.  The mixer leaves the normalised streams and the inject
+     * weights behind because the combine after the sub-layer needs them. */
+    float *xn;      /* hc: [n_hc][n_embd] normalised streams */
+    float *lo;      /* hc: [n_hc_low] */
+    float *hgate;   /* hc: [n_hc][n_embd] stream gate; PLE reuses it for the gated value */
+    float *inject;  /* hc: [n_hc] */
+    float *emb;     /* PLE: gathered n-gram embedding [n_embd] */
+    float *pkey;    /* PLE: [n_hc][n_embd] */
+    float *pval;    /* PLE: [n_embd] */
+    float *pnorm;   /* PLE: [n_hc][n_embd] normalised gated value, the conv input */
+    int32_t ple_prev[DS4_NGRAM_MAX_MULT];   /* PLE: the ngram-1 tokens before the current one, newest first */
+    float *router;  /* MoE: [n_expert] */
+    float *eg;      /* MoE: [n_ff_exp] expert gate, then the SwiGLU activation */
+    float *eu;      /* MoE: [n_ff_exp] expert up */
+    float *ed;      /* MoE: [n_embd] one expert's output */
 } ds4_qwen_state;
 
 static uint64_t qwen_conv_dim(void) {
@@ -15404,6 +15426,14 @@ static uint64_t qwen_max_u64(uint64_t a, uint64_t b) {
     return a > b ? a : b;
 }
 
+/* PLE conv taps are ngram_size tokens apart, so the history spans
+ * (kernel - 1) * ngram_size tokens. */
+static uint64_t qwen_ple_hist_rows(void) {
+    return DS4_PLE_LAYER == UINT32_MAX ? 0 : (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM;
+}
+
+static void qwen_state_reset(ds4_qwen_state *st);
+
 static void qwen_state_init(ds4_qwen_state *st, uint32_t ctx) {
     memset(st, 0, sizeof(*st));
     st->ctx = ctx;
@@ -15412,6 +15442,8 @@ static void qwen_state_init(ds4_qwen_state *st, uint32_t ctx) {
     const uint64_t v_dim = (uint64_t)DS4_N_KDA_V_HEAD * hd;
     const uint64_t attn_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t n_ff = qwen_max_u64(DS4_N_FF_DENSE, qwen_max_u64(DS4_N_FF_SHEXP, DS4_N_FF_EXP));
     for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
         ds4_qwen_layer_state *l = &st->layer[il];
         if (ds4_qwen_layer_is_gdn(il)) {
@@ -15421,30 +15453,56 @@ static void qwen_state_init(ds4_qwen_state *st, uint32_t ctx) {
             l->k = xmalloc_zeroed((uint64_t)ctx * kv_dim, sizeof(float));
             l->v = xmalloc_zeroed((uint64_t)ctx * kv_dim, sizeof(float));
         }
+        if (ds4_qwen_layer_has_ple(il)) {
+            l->ple_conv = xmalloc_zeroed(qwen_ple_hist_rows() * hc_dim, sizeof(float));
+        }
     }
-    st->x = xmalloc(DS4_N_EMBD * sizeof(float));
+    st->x = xmalloc(qwen_max_u64(hc_dim, DS4_N_EMBD) * sizeof(float));
     st->h = xmalloc(DS4_N_EMBD * sizeof(float));
     st->y = xmalloc(DS4_N_EMBD * sizeof(float));
     st->proj = xmalloc(qwen_max_u64(conv_dim, 2u * attn_dim) * sizeof(float));
-    st->mixed = xmalloc(qwen_max_u64(conv_dim, DS4_N_FF_DENSE) * sizeof(float));
-    st->z = xmalloc(qwen_max_u64(v_dim, DS4_N_FF_DENSE) * sizeof(float));
+    st->mixed = xmalloc(qwen_max_u64(conv_dim, n_ff) * sizeof(float));
+    st->z = xmalloc(qwen_max_u64(v_dim, n_ff) * sizeof(float));
     st->ab = xmalloc(2u * DS4_N_KDA_V_HEAD * sizeof(float));
     st->kv = xmalloc(2u * kv_dim * sizeof(float));
     st->att = xmalloc(qwen_max_u64(v_dim, attn_dim) * sizeof(float));
     st->scores = xmalloc((uint64_t)ctx * sizeof(float));
+    if (ds4_qwen_has_hc()) {
+        st->xn = xmalloc(hc_dim * sizeof(float));
+        st->lo = xmalloc(DS4_N_HC_LOW * sizeof(float));
+        st->hgate = xmalloc(hc_dim * sizeof(float));
+        st->inject = xmalloc(DS4_N_HC * sizeof(float));
+    }
+    if (DS4_PLE_LAYER != UINT32_MAX) {
+        st->emb = xmalloc(DS4_N_EMBD * sizeof(float));
+        st->pkey = xmalloc(hc_dim * sizeof(float));
+        st->pval = xmalloc(DS4_N_EMBD * sizeof(float));
+        st->pnorm = xmalloc(hc_dim * sizeof(float));
+    }
+    if (ds4_qwen_is_moe()) {
+        st->router = xmalloc(DS4_N_EXPERT * sizeof(float));
+        st->eg = xmalloc(DS4_N_FF_EXP * sizeof(float));
+        st->eu = xmalloc(DS4_N_FF_EXP * sizeof(float));
+        st->ed = xmalloc(DS4_N_EMBD * sizeof(float));
+    }
+    qwen_state_reset(st);
 }
 
 static void qwen_state_reset(ds4_qwen_state *st) {
     const uint64_t conv_dim = qwen_conv_dim();
     const uint64_t hd = DS4_N_KDA_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_qwen_layer_state *l = &st->layer[il];
         if (l->conv) memset(l->conv, 0, (DS4_N_KDA_CONV - 1u) * conv_dim * sizeof(float));
         if (l->state) memset(l->state, 0, (uint64_t)DS4_N_KDA_V_HEAD * hd * hd * sizeof(float));
         if (l->k) memset(l->k, 0, (uint64_t)st->ctx * kv_dim * sizeof(float));
         if (l->v) memset(l->v, 0, (uint64_t)st->ctx * kv_dim * sizeof(float));
+        if (l->ple_conv) memset(l->ple_conv, 0, qwen_ple_hist_rows() * hc_dim * sizeof(float));
     }
+    /* before the sequence starts every n-gram predecessor reads as the reset token */
+    for (uint32_t i = 0; i < DS4_NGRAM_MAX_MULT; i++) st->ple_prev[i] = DS4_PLE_RESET_TOKEN;
     st->n_tokens = 0;
 }
 
@@ -15454,6 +15512,7 @@ static void qwen_state_free(ds4_qwen_state *st) {
         free(st->layer[il].state);
         free(st->layer[il].k);
         free(st->layer[il].v);
+        free(st->layer[il].ple_conv);
     }
     free(st->x);
     free(st->h);
@@ -15465,6 +15524,18 @@ static void qwen_state_free(ds4_qwen_state *st) {
     free(st->kv);
     free(st->att);
     free(st->scores);
+    free(st->xn);
+    free(st->lo);
+    free(st->hgate);
+    free(st->inject);
+    free(st->emb);
+    free(st->pkey);
+    free(st->pval);
+    free(st->pnorm);
+    free(st->router);
+    free(st->eg);
+    free(st->eu);
+    free(st->ed);
     memset(st, 0, sizeof(*st));
 }
 
@@ -15535,6 +15606,7 @@ static void qwen_gdn_forward(
     const float *a_neg = tensor_data(m, l->ssm_a);
     const float *norm_w = tensor_data(m, l->ssm_norm);
     const float q_scale = 1.0f / sqrtf((float)hd);
+    const bool sigmoid_gate = DS4_MODEL_VARIANT == DS4_VARIANT_QWEN4EXP;
     for (uint32_t hv = 0; hv < nv; hv++) {
         const uint32_t hk = hv % nk;
         const float *qh = q + (uint64_t)hk * hd;
@@ -15559,10 +15631,16 @@ static void qwen_gdn_forward(
             }
             o[j] = oj * q_scale;
         }
-        /* RMSNormGated: normalise the head, scale, then gate with SiLU(z) */
+        /* RMSNormGated: normalise the head, scale, then gate with z.  The one
+         * numerical difference between the family members' GDN: Qwen3.5 gates
+         * with SiLU(z), Flash-Next with sigmoid(z) (output_gate_type). */
         rms_norm_weight(o, o, norm_w, hd, eps);
         const float *zh = z + (uint64_t)hv * hd;
-        for (uint32_t j = 0; j < hd; j++) o[j] *= silu(zh[j]);
+        if (sigmoid_gate) {
+            for (uint32_t j = 0; j < hd; j++) o[j] *= sigmoid_stable(zh[j]);
+        } else {
+            for (uint32_t j = 0; j < hd; j++) o[j] *= silu(zh[j]);
+        }
     }
     matvec_any(out, m, l->ssm_out, y);
 }
@@ -15671,6 +15749,236 @@ static void qwen_ffn_forward(
     matvec_any(out, m, l->ffn_down, gate);
 }
 
+/* Hyper-connection mix (Flash-Next): the residual is n_hc streams.  Each is
+ * RMS-normalised and scaled by its slice of the [hc_dim] gamma, a low-rank
+ * SiLU/sigmoid gate weighs every element, and the gated streams are averaged
+ * into the sub-layer input.  The normalised streams also produce the n_hc
+ * inject weights the combine uses; the output mixer has none. */
+static void qwen_hc_mix(
+        ds4_qwen_state            *st,
+        const ds4_model           *m,
+        const ds4_qwen_hc_weights *hc,
+        float                     *mixed,
+        float                     *inject) {
+    const uint32_t n_hc = DS4_N_HC;
+    const uint64_t n = DS4_N_EMBD;
+    const float *gamma = tensor_data(m, hc->norm);
+    for (uint32_t c = 0; c < n_hc; c++) {
+        rms_norm_weight(st->xn + c * n, st->x + c * n, gamma + c * n, n, DS4_RMS_EPS);
+    }
+    matvec_any(st->lo, m, hc->down, st->xn);
+    for (uint32_t i = 0; i < DS4_N_HC_LOW; i++) st->lo[i] = silu(st->lo[i] / (float)n_hc);
+    matvec_any(st->hgate, m, hc->up, st->lo);
+    for (uint64_t i = 0; i < n; i++) {
+        float acc = 0.0f;
+        for (uint32_t c = 0; c < n_hc; c++) {
+            acc += st->xn[c * n + i] * sigmoid_stable(st->hgate[c * n + i]);
+        }
+        mixed[i] = acc / (float)n_hc;
+    }
+    if (inject) matvec_any(inject, m, hc->inject, st->xn);
+}
+
+/* Hyper-connection combine: 2*sigmoid centres the per-stream weight on 1, so
+ * a zero injection is a plain residual add into every stream. */
+static void qwen_hc_combine(ds4_qwen_state *st, const float *y) {
+    const uint32_t n_hc = DS4_N_HC;
+    const uint64_t n = DS4_N_EMBD;
+    for (uint32_t c = 0; c < n_hc; c++) {
+        const float wc = 2.0f * sigmoid_stable(st->inject[c] / (float)n_hc);
+        float *xc = st->x + c * n;
+        for (uint64_t i = 0; i < n; i++) xc[i] += y[i] * wc;
+    }
+}
+
+/* Sub-layer input and output around the residual: RMSNorm and add for the
+ * plain residual, the hyper-connection mix and combine for Flash-Next. */
+static void qwen_sublayer_in(ds4_qwen_state *st, const ds4_model *m,
+                             const ds4_tensor *norm, const ds4_qwen_hc_weights *hc) {
+    if (ds4_qwen_has_hc()) {
+        qwen_hc_mix(st, m, hc, st->h, st->inject);
+    } else {
+        rms_norm_weight(st->h, st->x, tensor_data(m, norm), DS4_N_EMBD, DS4_RMS_EPS);
+    }
+}
+
+static void qwen_sublayer_out(ds4_qwen_state *st, const float *y) {
+    if (ds4_qwen_has_hc()) {
+        qwen_hc_combine(st, y);
+    } else {
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) st->x[i] += y[i];
+    }
+}
+
+static inline float ds4_e4m3_to_f32(uint8_t bits) {
+    const float v = ds4_ue4m3_to_f32(bits & 0x7f);
+    return (bits & 0x80) ? -v : v;
+}
+
+/* PLE row selection.  The window is the token and its ngram-1 predecessors;
+ * a reset token among the predecessors (or the sequence start) replaces it
+ * and everything older by the reset token, while the token itself never cuts
+ * its own window.  Every n-gram order from 2 up hashes its prefix of the
+ * window, and heads_per_ngram heads share that hash with their own modulus
+ * and row range. */
+static void qwen_ple_rows(const ds4_ngram_table *t, const int32_t *prev, int token, uint64_t *rows) {
+    const uint32_t n_gram = t->n_mult;
+    const uint32_t per_gram = t->n_head / (n_gram - 1u);
+    uint64_t window[DS4_NGRAM_MAX_MULT];
+    window[0] = (uint64_t)token;
+    bool cut = false;
+    for (uint32_t s = 1; s < n_gram; s++) {
+        cut = cut || prev[s - 1] == DS4_PLE_RESET_TOKEN;
+        window[s] = cut ? (uint64_t)DS4_PLE_RESET_TOKEN : (uint64_t)prev[s - 1];
+    }
+    for (uint32_t n = 2; n <= n_gram; n++) {
+        uint64_t mixed = window[0] * t->mult[0];
+        for (uint32_t j = 1; j < n; j++) mixed ^= window[j] * t->mult[j];
+        for (uint32_t g = 0; g < per_gram; g++) {
+            const uint32_t h = (n - 2u) * per_gram + g;
+            rows[h] = mixed % t->head_vocab[h] + t->head_offset[h];
+        }
+    }
+}
+
+/* PLE injection on its layer, before the attention mixer.  The gathered
+ * n-gram embedding projects to a key per stream and one value; each stream's
+ * normalised key against its normalised residual gives a signed-sqrt sigmoid
+ * gate on the value, and the gated value is added both directly and through
+ * a dilated depthwise causal conv with SiLU. */
+static void qwen_ple_forward(
+        ds4_qwen_state          *st,
+        const ds4_model         *m,
+        const ds4_layer_weights *l,
+        ds4_qwen_layer_state    *ls,
+        int                      token) {
+    const ds4_ngram_table *t = &m->ngram;
+    const uint32_t n_hc = DS4_N_HC;
+    const uint64_t n = DS4_N_EMBD;
+    const uint64_t hc_dim = (uint64_t)n_hc * n;
+    const float eps = DS4_RMS_EPS;
+
+    uint64_t rows[DS4_NGRAM_MAX_HEAD];
+    qwen_ple_rows(t, st->ple_prev, token, rows);
+    for (uint32_t s = t->n_mult - 1u; s > 1; s--) st->ple_prev[s - 1] = st->ple_prev[s - 2];
+    st->ple_prev[0] = token;
+    for (uint32_t h = 0; h < t->n_head; h++) {
+        const uint8_t *row = t->map + DS4_NGRAM_HEADER_BYTES + rows[h] * t->row_bytes;
+        float *e = st->emb + (uint64_t)h * t->row_bytes;
+        for (uint32_t i = 0; i < t->row_bytes; i++) e[i] = ds4_e4m3_to_f32(row[i]) * t->scale;
+    }
+
+    matvec_any(st->pkey, m, l->ple_key, st->emb);
+    matvec_any(st->pval, m, l->ple_value, st->emb);
+    const float *w_key = tensor_data(m, l->ple_norm_key);
+    const float *w_query = tensor_data(m, l->ple_norm_query);
+    const float *w_conv = tensor_data(m, l->ple_norm_conv);
+    float *gated = st->hgate;
+    for (uint32_t c = 0; c < n_hc; c++) {
+        float *kc = st->pkey + c * n;
+        float *qc = st->xn + c * n;
+        rms_norm_weight(kc, kc, w_key + c * n, n, eps);
+        rms_norm_weight(qc, st->x + c * n, w_query + c * n, n, eps);
+        float s = 0.0f;
+        for (uint64_t i = 0; i < n; i++) s += kc[i] * qc[i];
+        s /= sqrtf((float)n);
+        const float mag = sqrtf(fmaxf(fabsf(s), 1e-6f));
+        const float gate = sigmoid_stable(s > 0.0f ? mag : s < 0.0f ? -mag : 0.0f);
+        for (uint64_t i = 0; i < n; i++) gated[c * n + i] = st->pval[i] * gate;
+        rms_norm_weight(st->pnorm + c * n, gated + c * n, w_conv + c * n, n, eps);
+    }
+
+    /* Depthwise conv over the normalised value: tap k of the [kernel] row for
+     * channel ch reads (kernel-1-k)*ngram tokens back; the last tap is the
+     * current token.  The history holds hist_rows past inputs, oldest first. */
+    const uint32_t kern = DS4_N_PLE_CONV;
+    const uint32_t dil = DS4_N_PLE_NGRAM;
+    const uint64_t hist_rows = qwen_ple_hist_rows();
+    const float *cw = tensor_data(m, l->ple_conv1d);
+    float *hist = ls->ple_conv;
+    for (uint64_t ch = 0; ch < hc_dim; ch++) {
+        const float *taps = cw + ch * kern;
+        float acc = taps[kern - 1u] * st->pnorm[ch];
+        for (uint32_t k = 0; k + 1 < kern; k++) {
+            const uint64_t back = (uint64_t)(kern - 1u - k) * dil;
+            acc += taps[k] * hist[(hist_rows - back) * hc_dim + ch];
+        }
+        st->x[ch] += gated[ch] + silu(acc);
+    }
+    memmove(hist, hist + hc_dim, (hist_rows - 1u) * hc_dim * sizeof(float));
+    memcpy(hist + (hist_rows - 1u) * hc_dim, st->pnorm, hc_dim * sizeof(float));
+}
+
+/* One expert of a stacked [n_expert][out][in] tensor as a 2D tensor with
+ * its own global scale, so the dense matvec can run on it. */
+static ds4_tensor qwen_expert_view(const ds4_tensor *w, uint32_t e) {
+    const gguf_type_info *info = tensor_type(w->type);
+    ds4_tensor v = *w;
+    v.ndim = 2;
+    v.dim[2] = 0;
+    v.elements = w->dim[0] * w->dim[1];
+    v.bytes = w->dim[1] * (w->dim[0] / info->block_elems * info->block_bytes);
+    v.abs_offset += (uint64_t)e * v.bytes;
+    v.scale = w->scales ? w->scales[e] : w->scale;
+    v.scales = NULL;
+    return v;
+}
+
+/* Routed experts plus the gated shared expert.  The router is a softmax
+ * over all experts; the top n_expert_used probabilities are renormalised to
+ * sum to one (norm_topk_prob).  The shared expert is a SwiGLU scaled by its
+ * own sigmoid gate, added to the routed sum. */
+static void qwen_moe_forward(
+        float                   *out,
+        const ds4_model         *m,
+        const ds4_layer_weights *l,
+        ds4_qwen_state          *st,
+        const float             *x) {
+    const uint32_t n_expert = DS4_N_EXPERT;
+    const uint32_t n_used = DS4_N_EXPERT_USED;
+    float *p = st->router;
+    matvec_any(p, m, l->ffn_gate_inp, x);
+    /* the softmax denominator cancels in the top-k renormalisation */
+    float max = -INFINITY;
+    for (uint32_t e = 0; e < n_expert; e++) max = fmaxf(max, p[e]);
+    for (uint32_t e = 0; e < n_expert; e++) p[e] = expf(p[e] - max);
+    uint32_t sel[DS4_MAX_EXPERT_USED];
+    float sel_p[DS4_MAX_EXPERT_USED];
+    float sel_sum = 0.0f;
+    for (uint32_t k = 0; k < n_used; k++) {
+        uint32_t best = 0;
+        for (uint32_t e = 1; e < n_expert; e++) if (p[e] > p[best]) best = e;
+        sel[k] = best;
+        sel_p[k] = p[best];
+        sel_sum += p[best];
+        p[best] = -1.0f;
+    }
+
+    memset(out, 0, DS4_N_EMBD * sizeof(float));
+    for (uint32_t k = 0; k < n_used; k++) {
+        const ds4_tensor gate = qwen_expert_view(l->ffn_gate_exps, sel[k]);
+        const ds4_tensor up = qwen_expert_view(l->ffn_up_exps, sel[k]);
+        const ds4_tensor down = qwen_expert_view(l->ffn_down_exps, sel[k]);
+        matvec_any(st->eg, m, &gate, x);
+        matvec_any(st->eu, m, &up, x);
+        for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) st->eg[i] = silu(st->eg[i]) * st->eu[i];
+        matvec_any(st->ed, m, &down, st->eg);
+        const float wk = sel_p[k] / sel_sum;
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) out[i] += wk * st->ed[i];
+    }
+
+    float *gate = st->mixed;
+    float *up = st->z;
+    matvec_any(gate, m, l->ffn_gate_shexp, x);
+    matvec_any(up, m, l->ffn_up_shexp, x);
+    for (uint32_t i = 0; i < DS4_N_FF_SHEXP; i++) gate[i] = silu(gate[i]) * up[i];
+    matvec_any(st->ed, m, l->ffn_down_shexp, gate);
+    float sg = 0.0f;
+    matvec_any(&sg, m, l->ffn_gate_inp_shexp, x);
+    sg = sigmoid_stable(sg);
+    for (uint32_t i = 0; i < DS4_N_EMBD; i++) out[i] += sg * st->ed[i];
+}
+
 /* One token through every executable layer.  logits may be NULL for prompt
  * tokens whose distribution is not needed, which skips the output head. */
 static void qwen_forward_token(
@@ -15681,28 +15989,52 @@ static void qwen_forward_token(
         int                token,
         uint32_t           pos) {
     if (pos >= st->ctx) ds4_die("qwen: token position exceeds the session context");
-    if (ds4_qwen_has_hc()) ds4_die("qwen: the Flash-Next forward pass is not implemented yet");
     float *x = st->x;
     float *h = st->h;
     float *y = st->y;
-    embed_token_any(m, w, token, x);
+    if (ds4_qwen_has_hc()) {
+        /* the wide residual starts as n_hc identical copies of the embedding */
+        embed_token_any(m, w, token, h);
+        for (uint32_t c = 0; c < DS4_N_HC; c++) memcpy(x + (uint64_t)c * DS4_N_EMBD, h, DS4_N_EMBD * sizeof(float));
+    } else {
+        embed_token_any(m, w, token, x);
+    }
     for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         ds4_qwen_layer_state *ls = &st->layer[il];
-        rms_norm_weight(h, x, tensor_data(m, l->attn_norm), DS4_N_EMBD, DS4_RMS_EPS);
+        if (ds4_qwen_layer_has_ple(il)) qwen_ple_forward(st, m, l, ls, token);
+        qwen_sublayer_in(st, m, l->attn_norm, &l->hc_mix_attn);
         if (ds4_qwen_layer_is_gdn(il)) {
             qwen_gdn_forward(y, m, l, ls, st, h);
         } else {
             qwen_attention_forward(y, m, l, ls, st, h, pos);
         }
-        for (uint32_t i = 0; i < DS4_N_EMBD; i++) x[i] += y[i];
-        rms_norm_weight(h, x, tensor_data(m, l->post_attention_norm), DS4_N_EMBD, DS4_RMS_EPS);
-        qwen_ffn_forward(y, m, l, st, h);
-        for (uint32_t i = 0; i < DS4_N_EMBD; i++) x[i] += y[i];
+        qwen_sublayer_out(st, y);
+        qwen_sublayer_in(st, m, l->post_attention_norm, &l->hc_mix_ffn);
+        if (ds4_qwen_is_moe()) {
+            qwen_moe_forward(y, m, l, st, h);
+        } else {
+            qwen_ffn_forward(y, m, l, st, h);
+        }
+        qwen_sublayer_out(st, y);
+        /* DS4_QWEN_TRACE=1: per-layer norms to locate a divergence against
+         * tests/qwen_flash_next_ref.py, which prints the same line. */
+        if (getenv("DS4_QWEN_TRACE")) {
+            const uint64_t nx = ds4_qwen_has_hc() ? (uint64_t)DS4_N_HC * DS4_N_EMBD : DS4_N_EMBD;
+            double sx = 0, sy = 0, sh = 0;
+            for (uint64_t i = 0; i < nx; i++) sx += (double)x[i] * x[i];
+            for (uint64_t i = 0; i < DS4_N_EMBD; i++) { sy += (double)y[i] * y[i]; sh += (double)h[i] * h[i]; }
+            fprintf(stderr, "trace pos %u layer %u |x|=%.4g |h|=%.4g |ffn|=%.4g\n", pos, il,
+                    sqrt(sx), sqrt(sh), sqrt(sy));
+        }
     }
     st->n_tokens = pos + 1;
     if (logits) {
-        rms_norm_weight(h, x, tensor_data(m, w->output_norm), DS4_N_EMBD, DS4_RMS_EPS);
+        if (ds4_qwen_has_hc()) {
+            qwen_hc_mix(st, m, &w->output_hc_mix, h, NULL);
+        } else {
+            rms_norm_weight(h, x, tensor_data(m, w->output_norm), DS4_N_EMBD, DS4_RMS_EPS);
+        }
         matvec_any(logits, m, w->output, h);
     }
 }

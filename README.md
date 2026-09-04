@@ -269,15 +269,22 @@ matmuls does not enter the comparison.  Supported prompt format is ChatML
 with `<think>` handling; disk KV checkpoints and the MTP block are not wired
 up yet.
 
-Qwen3.8-Flash-Next (`qwen4exp`) GGUFs from the same converter load and
-validate completely: hyper-connection mixers, routed NVFP4 experts with
-per-expert scales, the QSA indexer, the PLE projections, and the `.ngram`
-sidecar (mmapped, header checked against the GGUF hash constants).  The
-forward pass for that variant is the next step; `--inspect` shows the
-shape and the n-gram table.  `tests/qwen_vllm_compare.py` checks a
+Qwen3.8-Flash-Next (`qwen4exp`) GGUFs from the same converter load and run
+on the CPU reference path: hyper-connection residual streams, routed NVFP4
+experts (softmax router, renormalised top-k) beside the gated shared expert,
+gated GQA attention (dense; the QSA indexer is bound but not yet applied, so
+prompts must stay under the 2048-token budget), the sigmoid-gated GDN, and
+the PLE n-gram injection reading rows from the mmapped `.ngram` sidecar.
+`--inspect` shows the shape and the n-gram table.
+
+Two references check it.  `tests/qwen_vllm_compare.py` scores a
 `DS4_QWEN_DUMP_LOGITS` dump teacher-forced against a vLLM server serving the
-same checkpoint (argmax agreement, top-k overlap, and the log-prob gap on
-the tokens vLLM reports), which is the reference for the Flash-Next work.
+same checkpoint (argmax agreement, top-k overlap, log-prob gap on the tokens
+vLLM reports; `--noise` measures vLLM's own batch-to-batch noise, which is
+where ds4 lands).  `tests/qwen_flash_next_ref.py` is an independent f32
+numpy forward straight from the HF safetensors that agrees with the dump to
+about 1e-5 and is the tool for doubts vLLM's FP4 noise cannot settle.
+`DS4_QWEN_TRACE=1` prints per-layer residual norms for locating a divergence.
 
 ## GLM 5.3 Flash
 

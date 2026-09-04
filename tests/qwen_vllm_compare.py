@@ -14,20 +14,25 @@ reports.  Row i of the ds4 dump is the distribution after prompt token i and
 vLLM's prompt_logprobs[i + 1] is the same distribution; the last ds4 row has
 no vLLM counterpart and is skipped.
 
-vLLM's FP4 activation quantisation puts its own noise around 1e-2 in the
-logits, so this catches wrong operators, not rounding differences.
+vLLM's FP4 activation quantisation is coarse: the same prompt scored in a
+different batch moves non-top log-probs by ~0.7 nats and swaps a few close
+argmaxes.  --noise measures that floor by scoring the prompt again alongside
+a long dummy request, so the ds4 numbers can be read against it.  The check
+catches wrong operators, not rounding differences.
 """
 import argparse
 import json
 import re
 import sys
+import threading
 import urllib.request
 
 import numpy as np
 
 V = 248320
-PASS_ARGMAX = 0.98
-PASS_OVERLAP = 18.0
+# vLLM against itself in another batch scores ~95% / 17.3 on a 56-token prompt
+PASS_ARGMAX = 0.90
+PASS_OVERLAP = 16.0
 
 
 def read_ids(path):
@@ -54,6 +59,25 @@ def vllm_rows(response, n):
     return rows, tops
 
 
+def vllm_self_noise(url, model, ids, top_k, rows, tops):
+    """Score the prompt again while a long dummy request shares the batch and
+    report how much vLLM disagrees with itself."""
+    out = {}
+    dummy = list(range(1000, 2500))
+    ts = [threading.Thread(target=lambda: out.setdefault("a", query_vllm(url, model, ids, top_k))),
+          threading.Thread(target=lambda: query_vllm(url, model, dummy, top_k))]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    rows2, tops2 = vllm_rows(out["a"], len(ids))
+    agree = np.mean([a == b for a, b in zip(tops, tops2)])
+    overlap = [len(set(sorted(x, key=x.get)[-top_k:]) & set(sorted(y, key=y.get)[-top_k:]))
+               for x, y in zip(rows, rows2)]
+    gaps = [abs(x[t] - y[t]) for x, y in zip(rows, rows2) for t in set(x) & set(y)]
+    print(f"vllm-vs-vllm (other batch): argmax agreement {agree * 100:.1f}%, "
+          f"top-{top_k} overlap mean {np.mean(overlap):.1f} min {min(overlap)}, "
+          f"|dlogp| mean {np.mean(gaps):.3f}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("ids")
@@ -64,6 +88,7 @@ def main():
     ap.add_argument("--csv", help="write per-position metrics")
     ap.add_argument("--response", help="reuse a saved vLLM response instead of querying")
     ap.add_argument("--save-response", help="save the raw vLLM response JSON")
+    ap.add_argument("--noise", action="store_true", help="also measure vLLM's own batch-to-batch noise")
     args = ap.parse_args()
 
     ids = read_ids(args.ids)
@@ -120,6 +145,8 @@ def main():
     for i in worst:
         print(f"  pos {i}: token {ids[i + 1]} agree={int(agree[i])} overlap={int(overlap[i])} "
               f"dlogp={gap_actual[i]:+.3f} ds4_rank_of_vllm_argmax={ds4_rank_of_vllm_top[i]}")
+    if args.noise:
+        vllm_self_noise(args.url, args.model, ids, k, rows, tops)
     ok = agree.mean() >= PASS_ARGMAX and overlap.mean() >= PASS_OVERLAP
     print("qwen-vllm-compare: PASS" if ok else "qwen-vllm-compare: FAIL")
     sys.exit(0 if ok else 1)
