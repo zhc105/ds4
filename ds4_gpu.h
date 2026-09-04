@@ -3231,10 +3231,22 @@ int ds4_gpu_qwen4exp_stream_norm(
         uint32_t              rows,
         float                 eps);
 int ds4_gpu_qwen4exp_hc_low(ds4_gpu_tensor *lo, uint32_t n_low, uint32_t n_hc, uint32_t rows);
+int ds4_gpu_qwen4exp_hc_gate(
+        ds4_gpu_tensor       *gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              wtype,
+        float                 scale,
+        const ds4_gpu_tensor *lo,
+        uint32_t              n_low,
+        uint32_t              out_dim,
+        uint32_t              rows);
 int ds4_gpu_qwen4exp_hc_mix(
         ds4_gpu_tensor       *mixed,
         const ds4_gpu_tensor *xn,
         const ds4_gpu_tensor *gate,
+        int                   gate_bf16,
         uint32_t              n_embd,
         uint32_t              n_hc,
         uint32_t              rows);

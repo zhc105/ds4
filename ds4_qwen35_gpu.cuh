@@ -482,8 +482,9 @@ extern "C" int ds4_gpu_qwen35_bf16(ds4_gpu_tensor *dst, const ds4_gpu_tensor *x,
 }
 
 /* cuBLAS loads its GEMM kernels on first use, a few hundred milliseconds
- * that would otherwise land in the first prompt's prefill: run one small
- * bf16 and one f32 GEMM over scratch at graph creation. */
+ * per kernel family that would otherwise land in the first prompt's
+ * prefill: run one small GEMM of each kind the graph uses (bf16 in with
+ * f32 out, bf16 in and out, f32 pedantic) over scratch at graph creation. */
 extern "C" int ds4_gpu_qwen35_warm(ds4_gpu_tensor *f32, ds4_gpu_tensor *bf16, ds4_gpu_tensor *out) {
     const uint32_t d = 64u;
     if (!g_cublas_ready) return 1;
@@ -497,6 +498,11 @@ extern "C" int ds4_gpu_qwen35_warm(ds4_gpu_tensor *f32, ds4_gpu_tensor *bf16, ds
     cublasStatus_t st = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, (int)d, (int)d, (int)d,
                                      &one, bf16->ptr, CUDA_R_16BF, (int)d, bf16->ptr, CUDA_R_16BF, (int)d,
                                      &zero, out->ptr, CUDA_R_32F, (int)d, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (st == CUBLAS_STATUS_SUCCESS) {
+        st = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, (int)d, (int)d, (int)d,
+                          &one, bf16->ptr, CUDA_R_16BF, (int)d, bf16->ptr, CUDA_R_16BF, (int)d,
+                          &zero, out->ptr, CUDA_R_16BF, (int)d, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    }
     if (st == CUBLAS_STATUS_SUCCESS) {
         st = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, (int)d, (int)d, (int)d,
                           &one, f32->ptr, CUDA_R_32F, (int)d, f32->ptr, CUDA_R_32F, (int)d,
@@ -1358,9 +1364,48 @@ extern "C" int ds4_gpu_qwen4exp_hc_low(ds4_gpu_tensor *lo, uint32_t n_low, uint3
     return cuda_ok(cudaGetLastError(), "Flash-Next hc gate launch");
 }
 
-/* mixed = mean over streams of xn * sigmoid(gate). */
+/* The prefill hc gate GEMM gate = lo W_up^T written in bf16: its [rows][n_hc *
+ * n_embd] f32 output was the projection's whole cost (100 MB per call), and
+ * the gate only feeds a sigmoid in qwen4exp_hc_mix, which reads it back in
+ * bf16.  The checkpoint's recipe keeps this gate in bf16 as well. */
+extern "C" int ds4_gpu_qwen4exp_hc_gate(
+        ds4_gpu_tensor       *gate,          /* bf16 [rows][n_hc * n_embd] */
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset, /* BF16 [n_hc * n_embd][n_low] */
+        uint32_t              wtype,
+        float                 scale,
+        const ds4_gpu_tensor *lo,            /* f32 [rows][n_low] */
+        uint32_t              n_low,
+        uint32_t              out_dim,
+        uint32_t              rows) {
+    const uint64_t weight_bytes = qwen35_weight_bytes(wtype, n_low, out_dim);
+    if (!gate || !lo || !model_map || wtype != QWEN35_W_BF16 || !g_cublas_ready || rows == 0u || n_low == 0u ||
+        out_dim == 0u || weight_bytes == 0u || weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        !qwen4exp_elems_fit(lo, (uint64_t)rows * n_low) ||
+        gate->bytes < (uint64_t)rows * out_dim * sizeof(__nv_bfloat16)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(gate);
+    cudaStream_t stream = cuda_decode_stream();
+    const char *w = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, tier, "hc up");
+    const uint64_t n = (uint64_t)rows * n_low;
+    __nv_bfloat16 *a = (__nv_bfloat16 *)cuda_tmp_alloc_on(tier, n * sizeof(__nv_bfloat16), "hc gate activations");
+    if (!w || !a) return 0;
+    qwen35_to_bf16(a, (const float *)lo->ptr, n, stream);
+    if (!cuda_ok(cudaGetLastError(), "hc gate convert launch")) return 0;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(tier), CUBLAS_OP_T, CUBLAS_OP_N,
+                                     (int)out_dim, (int)rows, (int)n_low,
+                                     &scale, w, CUDA_R_16BF, (int)n_low, a, CUDA_R_16BF, (int)n_low,
+                                     &beta, gate->ptr, CUDA_R_16BF, (int)out_dim, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(st, "hc gate GEMM");
+}
+
+/* mixed = mean over streams of xn * sigmoid(gate); the gate is bf16 after
+ * the prefill GEMM above and f32 after a decode matvec. */
 __global__ static void qwen4exp_hc_mix_kernel(
-        float *mixed, const float *xn, const float *gate, uint32_t n, uint32_t n_hc, uint32_t rows) {
+        float *mixed, const float *xn, const void *gate, uint32_t gate_bf16, uint32_t n, uint32_t n_hc, uint32_t rows) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (uint64_t)rows * n) return;
     const uint64_t t = i / n;
@@ -1368,7 +1413,8 @@ __global__ static void qwen4exp_hc_mix_kernel(
     float acc = 0.0f;
     for (uint32_t c = 0; c < n_hc; c++) {
         const uint64_t idx = (t * n_hc + c) * n + j;
-        acc = fmaf(xn[idx], qwen35_cuda_sigmoid(gate[idx]), acc);
+        const float g = gate_bf16 ? __bfloat162float(((const __nv_bfloat16 *)gate)[idx]) : ((const float *)gate)[idx];
+        acc = fmaf(xn[idx], qwen35_cuda_sigmoid(g), acc);
     }
     mixed[i] = acc / (float)n_hc;
 }
@@ -1377,16 +1423,17 @@ extern "C" int ds4_gpu_qwen4exp_hc_mix(
         ds4_gpu_tensor       *mixed,
         const ds4_gpu_tensor *xn,
         const ds4_gpu_tensor *gate,
+        int                   gate_bf16,
         uint32_t              n_embd,
         uint32_t              n_hc,
         uint32_t              rows) {
     const uint64_t n = (uint64_t)rows * n_embd;
-    if (n == 0u || n_hc == 0u || !qwen4exp_elems_fit(mixed, n) ||
-        !qwen4exp_elems_fit(xn, n * n_hc) || !qwen4exp_elems_fit(gate, n * n_hc)) {
+    if (n == 0u || n_hc == 0u || !qwen4exp_elems_fit(mixed, n) || !qwen4exp_elems_fit(xn, n * n_hc) ||
+        !gate || gate->bytes < n * n_hc * (gate_bf16 ? sizeof(__nv_bfloat16) : sizeof(float))) {
         return 0;
     }
     qwen4exp_hc_mix_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
-        (float *)mixed->ptr, (const float *)xn->ptr, (const float *)gate->ptr, n_embd, n_hc, rows);
+        (float *)mixed->ptr, (const float *)xn->ptr, gate->ptr, gate_bf16 != 0, n_embd, n_hc, rows);
     return cuda_ok(cudaGetLastError(), "Flash-Next hc mix launch");
 }
 

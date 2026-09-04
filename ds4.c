@@ -16485,8 +16485,14 @@ static bool qwen_graph_hc_mix(
                                            DS4_N_EMBD, DS4_N_HC, n, DS4_RMS_EPS) != 0;
     if (ok) ok = qwen_graph_matmul_bf16(g->lo, m, hc->down, g->xn, xn_bf16, n);
     if (ok) ok = ds4_gpu_qwen4exp_hc_low(g->lo, DS4_N_HC_LOW, DS4_N_HC, n) != 0;
-    if (ok) ok = qwen_graph_matmul(g->hgate, m, hc->up, g->lo, n);
-    if (ok) ok = ds4_gpu_qwen4exp_hc_mix(mixed, g->xn, g->hgate, DS4_N_EMBD, DS4_N_HC, n) != 0;
+    /* the prefill gate GEMM writes bf16 (its f32 output was its whole cost) */
+    if (ok) {
+        ok = xn_bf16
+            ? ds4_gpu_qwen4exp_hc_gate(g->hgate, m->map, m->size, hc->up->abs_offset, hc->up->type, hc->up->scale,
+                                       g->lo, DS4_N_HC_LOW, (uint32_t)(DS4_N_HC * DS4_N_EMBD), n) != 0
+            : qwen_graph_matmul(g->hgate, m, hc->up, g->lo, n);
+    }
+    if (ok) ok = ds4_gpu_qwen4exp_hc_mix(mixed, g->xn, g->hgate, xn_bf16 != NULL, DS4_N_EMBD, DS4_N_HC, n) != 0;
     if (ok && inject) ok = qwen_graph_matmul_bf16(inject, m, hc->inject, g->xn, xn_bf16, n);
     return ok;
 }
