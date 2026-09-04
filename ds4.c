@@ -15856,6 +15856,29 @@ static void qwen_attention_forward(
         }
         for (uint32_t i = 0; i < hd; i++) oh[i] *= sigmoid_stable(gate[i]);
     }
+    /* DS4_QSA_STATS=1: how much of the dense attention mass the indexer's
+     * selection keeps, per QSA layer and token.  A correct indexer keeps
+     * ~99% while dropping most cells; a broken one keeps the dropped fraction. */
+    if (getenv("DS4_QSA_STATS") && n_sel < pos + 1u) {
+        double kept = 0.0;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = qg + (uint64_t)h * 2 * hd;
+            const uint64_t kvo = (uint64_t)(h / group) * hd;
+            float max = -INFINITY;
+            for (uint32_t t = 0; t <= pos; t++) {
+                const float *kt = ls->k + (uint64_t)t * kv_dim + kvo;
+                float dot = 0.0f;
+                for (uint32_t i = 0; i < hd; i++) dot += qh[i] * kt[i];
+                scores[t] = dot * scale;
+                if (scores[t] > max) max = scores[t];
+            }
+            double sum = 0.0, in = 0.0;
+            for (uint32_t t = 0; t <= pos; t++) { scores[t] = expf(scores[t] - max); sum += scores[t]; }
+            for (uint32_t s = 0; s < n_sel; s++) in += scores[sel[s]];
+            kept += in / sum;
+        }
+        fprintf(stderr, "qsa-stats pos %u n_sel %u of %u kept_mass %.4f\n", pos, n_sel, pos + 1u, kept / n_head);
+    }
     matvec_any(out, m, l->attn_output, att);
 }
 
