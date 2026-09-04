@@ -1425,54 +1425,31 @@ extern "C" int ds4_gpu_qwen4exp_expert_plan(
     return cuda_ok(cudaGetLastError(), "Flash-Next expert plan launch");
 }
 
-/* Grouped expert GEMM: block (column tile, global row tile).  The row tile
- * maps through the tile starts to one expert and up to QWEN35_MMA_ROWS of its slots;
- * activations are gathered by slot (or the slot's token) and results
- * scattered back to the slot rows, scaled per expert. */
-__global__ static void qwen4exp_expert_gemm_kernel(
-        float *out, const uint8_t *w, uint64_t expert_bytes, const float *scales,
-        const int32_t *order, const uint32_t *plan, const float *x, uint32_t x_per_slot,
-        uint32_t n_expert, uint32_t n_used, uint32_t in_dim, uint32_t out_dim) {
-    extern __shared__ __align__(32) unsigned char smem[];
-    __shared__ const float *xr[QWEN35_MMA_ROWS];
-    __shared__ int32_t slot_of[QWEN35_MMA_ROWS];
-    __shared__ uint32_t tiles[QWEN4EXP_MAX_EXPERT + 1u];
-    const uint32_t tid = threadIdx.x;
-    const uint32_t *start = plan + QWEN4EXP_PLAN_START * (n_expert + 1u);
-    const uint32_t *tile_start = plan + QWEN4EXP_PLAN_TILE * (n_expert + 1u);
-    for (uint32_t i = tid; i <= n_expert; i += blockDim.x) tiles[i] = tile_start[i];
-    __syncthreads();
-    const uint32_t bx = blockIdx.x;
-    if (bx >= tiles[n_expert]) return;
-    uint32_t lo = 0, hi = n_expert;              /* last e with tiles[e] <= bx */
-    while (lo + 1u < hi) {
-        const uint32_t mid = (lo + hi) / 2u;
-        if (tiles[mid] <= bx) lo = mid; else hi = mid;
+/* Prefill expert projections on the Blackwell FP4 tensor cores
+ * (cuda/mmq/ds4_qwen_fp4.cu): the activations are quantised once per layer
+ * into the weights' own NVFP4 layout and both operands feed the block-scaled
+ * FP4 MMA, so every weight byte is read once per chunk and nothing is
+ * dequantised.  This is the checkpoint's activation recipe, the one vLLM
+ * and SGLang run. */
+extern "C" int ds4_gpu_qwen4exp_quantize_fp4(ds4_gpu_tensor *xq, const ds4_gpu_tensor *x, uint32_t rows, uint32_t k) {
+    if (!xq || !x || rows == 0u || k == 0u || k % 64u != 0u ||
+        x->bytes < (uint64_t)rows * k * sizeof(float) || xq->bytes < (uint64_t)rows * (k / 64u) * 36u) {
+        return 0;
     }
-    const uint32_t e = lo;
-    const uint32_t first = start[e] + (bx - tiles[e]) * QWEN35_MMA_ROWS;
-    const uint32_t end = start[e + 1u];
-    if (tid < QWEN35_MMA_ROWS) {
-        const uint32_t idx = first + tid;
-        const int32_t slot = idx < end ? order[idx] : -1;
-        slot_of[tid] = slot;
-        xr[tid] = slot >= 0 ? x + (uint64_t)(x_per_slot ? (uint32_t)slot : (uint32_t)slot / n_used) * in_dim : NULL;
-    }
-    __syncthreads();
-    qwen35_mma_tile(out, out_dim, scales[e], slot_of, xr, w + (uint64_t)e * expert_bytes, QWEN35_W_NVFP4,
-                    in_dim, blockIdx.y * QWEN35_MMA_COLS, smem);
+    return ds4_qwen_fp4_quantize((const float *)x->ptr, xq->ptr, (int)rows, (int)k, cuda_decode_stream()) == 0 &&
+           cuda_ok(cudaGetLastError(), "Flash-Next FP4 activation quantize launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_expert_gemm(
+extern "C" int ds4_gpu_qwen4exp_expert_fp4(
         ds4_gpu_tensor       *out,          /* [rows * n_used][out_dim] */
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              weight_offset, /* [n_expert][out_dim][in_dim] NVFP4 */
         uint64_t              scales_offset, /* [n_expert] f32 */
+        const ds4_gpu_tensor *xq,            /* NVFP4 rows: per slot (x_per_slot) or per token */
+        int                   x_per_slot,
         const ds4_gpu_tensor *order,
         const ds4_gpu_tensor *plan,
-        const ds4_gpu_tensor *x,
-        int                   x_per_slot,
         uint32_t              n_expert,
         uint32_t              n_used,
         uint32_t              in_dim,
@@ -1480,29 +1457,22 @@ extern "C" int ds4_gpu_qwen4exp_expert_gemm(
         uint32_t              rows) {
     const uint64_t expert_bytes = qwen35_weight_bytes(QWEN35_W_NVFP4, in_dim, out_dim);
     const uint64_t slots = (uint64_t)rows * n_used;
-    if (!model_map || rows == 0u || n_used == 0u || n_expert == 0u || n_expert > QWEN4EXP_MAX_EXPERT ||
-        expert_bytes == 0u || weight_offset > model_size || expert_bytes * n_expert > model_size - weight_offset ||
+    if (!model_map || rows == 0u || n_used == 0u || n_expert == 0u || expert_bytes == 0u ||
+        weight_offset > model_size || expert_bytes * n_expert > model_size - weight_offset ||
         !qwen4exp_elems_fit(out, slots * out_dim) ||
-        !qwen4exp_elems_fit(x, (x_per_slot ? slots : rows) * in_dim) ||
+        !xq || xq->bytes < (x_per_slot ? slots : rows) * (in_dim / 64u) * 36u ||
         !order || order->bytes < slots * sizeof(int32_t) ||
         !plan || plan->bytes < 4ull * (n_expert + 1u) * sizeof(uint32_t)) {
         return 0;
     }
     const int tier = ds4_tensor_device_idx(out);
-    const char *w = cuda_resolve_weight_ptr(model_map, weight_offset, expert_bytes * n_expert, tier,
-                                            "Flash-Next experts");
-    const float *scales = glm53_cuda_weight_f32(model_map, model_size, scales_offset, n_expert, tier,
-                                                "Flash-Next expert scales");
+    const char *w = cuda_resolve_weight_ptr(model_map, weight_offset, expert_bytes * n_expert, tier, "Flash-Next experts");
+    const float *scales = glm53_cuda_weight_f32(model_map, model_size, scales_offset, n_expert, tier, "Flash-Next expert scales");
     if (!w || !scales) return 0;
-    static bool ready = false;
-    if (!qwen35_mma_smem_ready((const void *)qwen4exp_expert_gemm_kernel, &ready)) return 0;
-    /* every expert adds at most one partial tile to the slots' full tiles */
-    const uint32_t max_tiles = (uint32_t)((slots + QWEN35_MMA_ROWS - 1u) / QWEN35_MMA_ROWS) + n_expert;
-    const dim3 grid(max_tiles, (out_dim + QWEN35_MMA_COLS - 1u) / QWEN35_MMA_COLS, 1u);
-    qwen4exp_expert_gemm_kernel<<<grid, 256, QWEN35_MMA_SMEM, cuda_decode_stream()>>>(
-        (float *)out->ptr, (const uint8_t *)w, expert_bytes, scales, (const int32_t *)order->ptr,
-        (const uint32_t *)plan->ptr, (const float *)x->ptr, x_per_slot != 0, n_expert, n_used, in_dim, out_dim);
-    return cuda_ok(cudaGetLastError(), "Flash-Next expert GEMM launch");
+    return ds4_qwen_fp4_moe_gemm(w, scales, xq->ptr, x_per_slot, (const int32_t *)order->ptr, (const uint32_t *)plan->ptr,
+                                 (int)n_expert, (int)n_used, (int)in_dim, (int)out_dim, (int)rows,
+                                 (float *)out->ptr, cuda_decode_stream()) == 0 &&
+           cuda_ok(cudaGetLastError(), "Flash-Next FP4 expert GEMM launch");
 }
 
 /* y = sum over slots of selw * ed, plus the shared expert already in y

@@ -3276,16 +3276,17 @@ int ds4_gpu_qwen4exp_expert_plan(
         const ds4_gpu_tensor *esel,
         uint32_t              n_expert,
         uint32_t              slots);
-int ds4_gpu_qwen4exp_expert_gemm(
+int ds4_gpu_qwen4exp_quantize_fp4(ds4_gpu_tensor *xq, const ds4_gpu_tensor *x, uint32_t rows, uint32_t k);
+int ds4_gpu_qwen4exp_expert_fp4(
         ds4_gpu_tensor       *out,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              weight_offset,
         uint64_t              scales_offset,
+        const ds4_gpu_tensor *xq,
+        int                   x_per_slot,
         const ds4_gpu_tensor *order,
         const ds4_gpu_tensor *plan,
-        const ds4_gpu_tensor *x,
-        int                   x_per_slot,
         uint32_t              n_expert,
         uint32_t              n_used,
         uint32_t              in_dim,

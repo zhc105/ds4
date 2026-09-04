@@ -22,6 +22,7 @@
 #include <algorithm>
 
 #include "cuda/mmq/ds4_mmq.h"
+#include "cuda/mmq/ds4_qwen_fp4.h"
 #include "cuda/mmq/ds4_repack.h"
 #include "ds4_image.h"
 
