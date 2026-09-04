@@ -273,11 +273,12 @@ Qwen3.8-Flash-Next (`qwen4exp`) GGUFs from the same converter load and run
 on the CPU reference path and on the CUDA graph: hyper-connection residual
 streams, routed NVFP4 experts (softmax router, renormalised top-k) beside the
 gated shared expert, gated GQA attention with the QSA block indexer
-(`DS4_QSA_DENSE=1` ignores the indexer; the graph still attends densely, so
-graph prompts must stay within the 2048-token budget until the gather-style
-QSA lands), the sigmoid-gated GDN, and the PLE n-gram injection reading rows
-from the mmapped `.ngram` sidecar (the host gathers the rows, the GPU never
-maps the table).  `--inspect` shows the shape and the n-gram table.
+(`DS4_QSA_DENSE=1` ignores the indexer on either backend; on the graph the
+selection is a deterministic radix select over block keys and the attention
+gathers only the selected cells, so a decode step costs the same at any
+context length), the sigmoid-gated GDN, and the PLE n-gram injection reading
+rows from the mmapped `.ngram` sidecar (the host gathers the rows, the GPU
+never maps the table).  `--inspect` shows the shape and the n-gram table.
 
 Two references check the CPU path.  `tests/qwen_vllm_compare.py` scores a
 `DS4_QWEN_DUMP_LOGITS` dump teacher-forced against a vLLM server serving the
@@ -292,7 +293,13 @@ cpu.bin gpu.bin --chunk C` (KL and argmax per position; C is the
 `--prefill-chunk` of the graph run), where it lands at KL 1e-10.  Every graph
 matmul keeps f32 activations (NVFP4/BF16/F32 weights dequantised on the fly),
 which is what makes that comparison exact; tensor-core paths are a later,
-separately measured step.
+separately measured step.  Over long prompts the comparison is bounded by
+the router, not the kernels: about once per 500 tokens two experts tie
+within f32 rounding, a different summation order picks the other one, and
+the states drift apart from there.  `DS4_QWEN_TRACE=1` prints every router
+gap on the CPU so such a position can be confirmed as a tie.  The QSA
+selection kernel itself is checked exactly by `tests/qwen_qsa_select_test`
+(`make cuda-regression`).
 
 ## GLM 5.3 Flash
 

@@ -477,14 +477,17 @@ __global__ static void qwen35_attn_prepare_kernel(
     }
 }
 
-/* Per (token, head, key split): scores against a contiguous key range,
- * partial softmax (max, sum) and unnormalised weighted values.  With one
- * split the block finalises directly, including the sigmoid output gate;
- * otherwise the partials go to `part` and qwen35_attention_merge_kernel
- * combines them.  Decode uses splits because n_tokens * n_head blocks alone
- * cannot fill the GPU while scanning a long cache. */
+/* Per (token, head, key split): scores against a key range, partial softmax
+ * (max, sum) and unnormalised weighted values.  The keys are the causal
+ * prefix, or with `sel` the token's own list of n_sel cells (QSA), gathered
+ * from the cache by index.  With one split the block finalises directly,
+ * including the sigmoid output gate; otherwise the partials go to `part`
+ * and qwen35_attention_merge_kernel combines them.  Decode uses splits
+ * because n_tokens * n_head blocks alone cannot fill the GPU while scanning
+ * a long cache. */
 __global__ static void qwen35_attention_kernel(
         float *att, float *part, const float *qg, const float *k_cache, const float *v_cache,
+        const int32_t *sel, const uint32_t *n_sel, uint32_t max_sel,
         uint32_t n_head, uint32_t n_kv, uint32_t hd, uint32_t pos0, uint32_t n_tokens,
         uint32_t n_splits) {
     extern __shared__ float scores[];
@@ -500,7 +503,8 @@ __global__ static void qwen35_attention_kernel(
     const float *q = qg + ((uint64_t)t * n_head + h) * 2u * hd;
     const float *gate = q + hd;
     const uint32_t kvh = h / (n_head / n_kv);
-    const uint32_t n_keys = pos0 + t + 1u;
+    const uint32_t n_keys = sel ? n_sel[t] : pos0 + t + 1u;
+    const int32_t *cells = sel ? sel + (uint64_t)t * max_sel : NULL;
     const uint32_t chunk = (n_keys + n_splits - 1u) / n_splits;
     const uint32_t key0 = split * chunk;
     const uint32_t key1 = key0 + chunk < n_keys ? key0 + chunk : n_keys;
@@ -511,7 +515,8 @@ __global__ static void qwen35_attention_kernel(
     float qv[8];
     for (uint32_t i = 0; i < per; i++) qv[i] = q[lane * per + i];
     for (uint32_t key = warp; key < n_local; key += n_warps) {
-        const float *kr = k_cache + (key0 + key) * kv_stride + kvh * hd + lane * per;
+        const uint32_t cell = cells ? (uint32_t)cells[key0 + key] : key0 + key;
+        const float *kr = k_cache + cell * kv_stride + kvh * hd + lane * per;
         float dot = 0.0f;
         for (uint32_t i = 0; i < per; i++) dot = fmaf(qv[i], kr[i], dot);
         dot = warp_sum_f32(dot);
@@ -535,8 +540,11 @@ __global__ static void qwen35_attention_kernel(
     const float sum = qwen35_cuda_block_sum(local_sum, scratch);
     __syncthreads();
     float acc = 0.0f;
-    const float *vc = v_cache + key0 * kv_stride + kvh * hd + tid;
-    for (uint32_t key = 0; key < n_local; key++) acc = fmaf(scores[key], vc[key * kv_stride], acc);
+    const float *vc = v_cache + kvh * hd + tid;
+    for (uint32_t key = 0; key < n_local; key++) {
+        const uint32_t cell = cells ? (uint32_t)cells[key0 + key] : key0 + key;
+        acc = fmaf(scores[key], vc[cell * kv_stride], acc);
+    }
     if (n_splits == 1u) {
         att[((uint64_t)t * n_head + h) * hd + tid] = acc / sum * qwen35_cuda_sigmoid(gate[tid]);
         return;
@@ -579,6 +587,9 @@ extern "C" int ds4_gpu_qwen35_attention(
         ds4_gpu_tensor       *v_cache,
         const ds4_gpu_tensor *k,            /* [n_tok][n_kv * hd] */
         const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *sel,          /* QSA: int32 [n_tok][max_sel] cells per token, or NULL for the causal prefix */
+        const ds4_gpu_tensor *n_sel,        /* QSA: uint32 [n_tok] */
+        uint32_t              max_sel,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              q_norm_offset,
@@ -607,6 +618,11 @@ extern "C" int ds4_gpu_qwen35_attention(
         v_cache->bytes < (uint64_t)ctx * kv_dim * sizeof(float)) {
         return 0;
     }
+    if (sel && (!n_sel || max_sel == 0u ||
+                sel->bytes < (uint64_t)n_tokens * max_sel * sizeof(int32_t) ||
+                n_sel->bytes < (uint64_t)n_tokens * sizeof(uint32_t))) {
+        return 0;
+    }
     const int tier = ds4_tensor_device_idx(att);
     const float *q_norm = glm53_cuda_weight_f32(model_map, model_size, q_norm_offset, hd, tier, "attn q norm");
     const float *k_norm = glm53_cuda_weight_f32(model_map, model_size, k_norm_offset, hd, tier, "attn k norm");
@@ -617,7 +633,7 @@ extern "C" int ds4_gpu_qwen35_attention(
         (const float *)k->ptr, (const float *)v->ptr, q_norm, k_norm,
         n_head, n_kv, hd, n_rot, pos0, n_tokens, freq_base, eps);
     /* Decode-sized batches split the key range so enough blocks are in flight. */
-    const uint32_t n_keys = pos0 + n_tokens;
+    const uint32_t n_keys = sel ? max_sel : pos0 + n_tokens;
     uint32_t n_splits = 1u;
     if (n_tokens <= QWEN35_ATTN_SPLIT_ROWS) {
         n_splits = (n_keys + 127u) / 128u;
@@ -635,14 +651,16 @@ extern "C" int ds4_gpu_qwen35_attention(
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  (int)smem) != cudaSuccess) {
             fprintf(stderr, "ds4: Qwen3.5 attention needs %zu bytes of shared memory for %u keys\n",
-                    smem, pos0 + n_tokens);
+                    smem, n_keys);
             return 0;
         }
         smem_limit = smem;
     }
     qwen35_attention_kernel<<<dim3(n_tokens, n_head, n_splits), hd, smem, stream>>>(
         (float *)att->ptr, (float *)part->ptr, (const float *)qg->ptr, (const float *)k_cache->ptr,
-        (const float *)v_cache->ptr, n_head, n_kv, hd, pos0, n_tokens, n_splits);
+        (const float *)v_cache->ptr, sel ? (const int32_t *)sel->ptr : NULL,
+        sel ? (const uint32_t *)n_sel->ptr : NULL, max_sel,
+        n_head, n_kv, hd, pos0, n_tokens, n_splits);
     if (n_splits > 1u) {
         qwen35_attention_merge_kernel<<<dim3(n_tokens, n_head, 1u), hd, 0, stream>>>(
             (float *)att->ptr, (const float *)part->ptr, (const float *)qg->ptr,
@@ -1088,4 +1106,263 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv(
     qwen35_gdn_conv_state_kernel<<<(hc_dim + 255u) / 256u, 256, 0, stream>>>(
         (float *)hist->ptr, (const float *)pnorm->ptr, hc_dim, hist_rows, rows);
     return cuda_ok(cudaGetLastError(), "Flash-Next PLE conv launch");
+}
+
+/* ---- QSA block indexer ----------------------------------------------------
+ * Mirrors qwen_attention_cells: each completed block of `r` cells has one
+ * key (the mean of the block's raw indexer keys, normalised, rotated at the
+ * block's first position); a token scores every completed block it can see
+ * by the sum over indexer heads of relu(q_h . k_b) and attends to the
+ * `budget` best blocks plus the incomplete tail block.
+ *   bkey   [ctx / r][d]        block key cache
+ *   hist   [r - 1][d]          raw keys before the chunk, oldest first
+ *   sel    [n_tok][max_sel]    selected cells in position order, n_sel each
+ */
+
+#define QWEN4EXP_INDEXER_MAX_DIM 128u
+#define QWEN4EXP_INDEXER_MAX_Q 1024u
+#define QWEN4EXP_SELECT_THREADS 1024u
+
+/* NeoX rotation of the first n_rot dims of a head held in shared memory. */
+__device__ __forceinline__ void qwen4exp_rope_shared(float *head, uint32_t n_rot, uint32_t pos, float freq_base) {
+    const uint32_t half = n_rot / 2u;
+    if (threadIdx.x < half) {
+        const uint32_t i = threadIdx.x;
+        const float theta = (float)pos * powf(freq_base, -(float)(2u * i) / (float)n_rot);
+        const float c = cosf(theta);
+        const float s = sinf(theta);
+        const float x0 = head[i];
+        const float x1 = head[i + half];
+        head[i] = x0 * c - x1 * s;
+        head[i + half] = x0 * s + x1 * c;
+    }
+}
+
+/* Block per token; only the token that completes a block writes its key,
+ * summing the block's raw keys in position order like the CPU ring. */
+__global__ static void qwen4exp_block_key_kernel(
+        float *bkey, const float *raw, const float *hist, const float *k_norm,
+        uint32_t d, uint32_t r, uint32_t n_rot, uint32_t pos0, uint32_t n_tokens, float freq_base, float eps) {
+    __shared__ float scratch[32];
+    __shared__ float kb[QWEN4EXP_INDEXER_MAX_DIM];
+    const uint32_t t = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t pos = pos0 + t;
+    if (t >= n_tokens || pos % r != r - 1u) return;
+    float acc = 0.0f;
+    for (uint32_t j = 0; j < r; j++) {
+        const int32_t src = (int32_t)t - (int32_t)(r - 1u) + (int32_t)j;
+        acc += src >= 0 ? raw[(uint64_t)src * d + tid] : hist[(uint64_t)(int32_t)(r - 1u + src) * d + tid];
+    }
+    const float v = acc / (float)r;
+    const float total = qwen35_cuda_block_sum(v * v, scratch);
+    kb[tid] = v * rsqrtf(total / (float)d + eps) * k_norm[tid];
+    __syncthreads();
+    qwen4exp_rope_shared(kb, n_rot, pos + 1u - r, freq_base);
+    __syncthreads();
+    bkey[(uint64_t)(pos / r) * d + tid] = kb[tid];
+}
+
+extern "C" int ds4_gpu_qwen4exp_block_keys(
+        ds4_gpu_tensor       *bkey,
+        const ds4_gpu_tensor *raw,          /* [n_tok][d] raw indexer keys of the chunk */
+        ds4_gpu_tensor       *hist,         /* [r-1][d], slid forward afterwards */
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              k_norm_offset,
+        uint32_t              d,
+        uint32_t              r,
+        uint32_t              n_rot,
+        uint32_t              ctx,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        float                 freq_base,
+        float                 eps) {
+    if (!model_map || d == 0u || d > QWEN4EXP_INDEXER_MAX_DIM || d % 32u != 0u || r < 2u || n_rot == 0u ||
+        n_rot % 2u != 0u || n_rot > d || n_tokens == 0u || pos0 + n_tokens > ctx ||
+        !qwen4exp_elems_fit(bkey, (uint64_t)(ctx / r) * d) || !qwen4exp_elems_fit(raw, (uint64_t)n_tokens * d) ||
+        !qwen4exp_elems_fit(hist, (uint64_t)(r - 1u) * d)) {
+        return 0;
+    }
+    const float *k_norm = glm53_cuda_weight_f32(model_map, model_size, k_norm_offset, d,
+                                                ds4_tensor_device_idx(bkey), "indexer k norm");
+    if (!k_norm) return 0;
+    cudaStream_t stream = cuda_decode_stream();
+    qwen4exp_block_key_kernel<<<n_tokens, d, 0, stream>>>(
+        (float *)bkey->ptr, (const float *)raw->ptr, (const float *)hist->ptr, k_norm,
+        d, r, n_rot, pos0, n_tokens, freq_base, eps);
+    qwen35_gdn_conv_state_kernel<<<(d + 255u) / 256u, 256, 0, stream>>>(
+        (float *)hist->ptr, (const float *)raw->ptr, d, r - 1u, n_tokens);
+    return cuda_ok(cudaGetLastError(), "Flash-Next block key launch");
+}
+
+/* Per (token, indexer head): RMS-normalise and rotate the query in place. */
+__global__ static void qwen4exp_indexer_query_kernel(
+        float *q, const float *q_norm, uint32_t n_head, uint32_t d, uint32_t n_rot,
+        uint32_t pos0, uint32_t n_tokens, float freq_base, float eps) {
+    __shared__ float scratch[32];
+    __shared__ float qh[QWEN4EXP_INDEXER_MAX_DIM];
+    const uint32_t t = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens || h >= n_head) return;
+    float *head = q + ((uint64_t)t * n_head + h) * d;
+    const float x = head[tid];
+    const float total = qwen35_cuda_block_sum(x * x, scratch);
+    qh[tid] = x * rsqrtf(total / (float)d + eps) * q_norm[tid];
+    __syncthreads();
+    qwen4exp_rope_shared(qh, n_rot, pos0 + t, freq_base);
+    __syncthreads();
+    head[tid] = qh[tid];
+}
+
+extern "C" int ds4_gpu_qwen4exp_indexer_query(
+        ds4_gpu_tensor       *q,            /* [n_tok][n_head][d], modified in place */
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_norm_offset,
+        uint32_t              n_head,
+        uint32_t              d,
+        uint32_t              n_rot,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        float                 freq_base,
+        float                 eps) {
+    if (!model_map || n_head == 0u || d == 0u || d > QWEN4EXP_INDEXER_MAX_DIM || d % 32u != 0u ||
+        n_rot == 0u || n_rot % 2u != 0u || n_rot > d || n_tokens == 0u ||
+        !qwen4exp_elems_fit(q, (uint64_t)n_tokens * n_head * d)) {
+        return 0;
+    }
+    const float *q_norm = glm53_cuda_weight_f32(model_map, model_size, q_norm_offset, d,
+                                                ds4_tensor_device_idx(q), "indexer q norm");
+    if (!q_norm) return 0;
+    qwen4exp_indexer_query_kernel<<<dim3(n_tokens, n_head, 1u), d, 0, cuda_decode_stream()>>>(
+        (float *)q->ptr, q_norm, n_head, d, n_rot, pos0, n_tokens, freq_base, eps);
+    return cuda_ok(cudaGetLastError(), "Flash-Next indexer query launch");
+}
+
+/* Block selection, one 1024-thread block per token (blocks stride over the
+ * tokens and own one row of key scratch).  Tokens that see no more than
+ * `budget` completed blocks attend to every cell.  Otherwise every block's
+ * score becomes a 64-bit key (score bits above the negated block index, so
+ * keys are unique and order by score first, older block first), an 8-pass
+ * radix select finds the budget-th largest key exactly, and the blocks at
+ * or above it are emitted in position order and expanded to cells, then
+ * the tail cells.  Deterministic, and the same choice as the CPU's repeated
+ * argmax with ties to the older block. */
+__global__ static void qwen4exp_qsa_select_kernel(
+        int32_t *sel, uint32_t *n_sel, uint64_t *keys_scratch, uint64_t keys_stride,
+        const float *q, const float *bkey, uint32_t n_head, uint32_t d, uint32_t r,
+        uint32_t budget, uint32_t max_sel, uint32_t pos0, uint32_t n_tokens) {
+    __shared__ float qs[QWEN4EXP_INDEXER_MAX_Q];
+    __shared__ uint32_t hist[256];
+    __shared__ uint32_t scan[QWEN4EXP_SELECT_THREADS];
+    __shared__ uint32_t s_bin, s_k;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nthreads = blockDim.x;
+    uint64_t *keys = keys_scratch + (uint64_t)blockIdx.x * keys_stride;
+    for (uint32_t t = blockIdx.x; t < n_tokens; t += gridDim.x) {
+        const uint32_t pos = pos0 + t;
+        const uint32_t n_blocks = (pos + 1u) / r;
+        int32_t *out = sel + (uint64_t)t * max_sel;
+        if (n_blocks <= budget) {
+            for (uint32_t c = tid; c <= pos; c += nthreads) out[c] = (int32_t)c;
+            if (tid == 0u) n_sel[t] = pos + 1u;
+            continue;
+        }
+        __syncthreads();
+        for (uint32_t i = tid; i < n_head * d; i += nthreads) qs[i] = q[(uint64_t)t * n_head * d + i];
+        __syncthreads();
+        for (uint32_t b = tid; b < n_blocks; b += nthreads) {
+            const float *kb = bkey + (uint64_t)b * d;
+            float s = 0.0f;
+            for (uint32_t h = 0; h < n_head; h++) {
+                float dot = 0.0f;
+                for (uint32_t i = 0; i < d; i++) dot = fmaf(qs[h * d + i], kb[i], dot);
+                if (dot > 0.0f) s += dot;
+            }
+            keys[b] = ((uint64_t)__float_as_uint(s) << 32) | (uint64_t)(0xFFFFFFFFu - b);
+        }
+        __syncthreads();
+        uint64_t prefix = 0, mask = 0;
+        uint32_t k = budget;
+        for (int pass = 7; pass >= 0; pass--) {
+            if (tid < 256u) hist[tid] = 0u;
+            __syncthreads();
+            for (uint32_t b = tid; b < n_blocks; b += nthreads) {
+                const uint64_t key = keys[b];
+                if ((key & mask) == prefix) atomicAdd(&hist[(uint32_t)(key >> (8 * pass)) & 0xffu], 1u);
+            }
+            __syncthreads();
+            if (tid == 0u) {
+                uint32_t cum = 0;
+                int bin = 255;
+                for (; bin > 0; bin--) {
+                    if (cum + hist[bin] >= k) break;
+                    cum += hist[bin];
+                }
+                s_bin = (uint32_t)bin;
+                s_k = k - cum;
+            }
+            __syncthreads();
+            prefix |= (uint64_t)s_bin << (8 * pass);
+            mask |= 0xffull << (8 * pass);
+            k = s_k;
+            __syncthreads();
+        }
+        const uint64_t threshold = prefix;
+        uint32_t base = 0;
+        for (uint32_t tile = 0; tile < n_blocks; tile += nthreads) {
+            const uint32_t b = tile + tid;
+            const uint32_t flag = b < n_blocks && keys[b] >= threshold ? 1u : 0u;
+            __syncthreads();
+            scan[tid] = flag;
+            __syncthreads();
+            for (uint32_t off = 1; off < nthreads; off <<= 1) {
+                const uint32_t v = tid >= off ? scan[tid - off] : 0u;
+                __syncthreads();
+                scan[tid] += v;
+                __syncthreads();
+            }
+            if (flag) {
+                const uint32_t o = base + scan[tid] - 1u;
+                for (uint32_t j = 0; j < r; j++) out[o * r + j] = (int32_t)(b * r + j);
+            }
+            base += scan[nthreads - 1u];
+        }
+        const uint32_t tail0 = n_blocks * r;
+        for (uint32_t c = tail0 + tid; c <= pos; c += nthreads) out[budget * r + (c - tail0)] = (int32_t)c;
+        if (tid == 0u) n_sel[t] = budget * r + (pos + 1u - tail0);
+    }
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_select(
+        ds4_gpu_tensor       *sel,          /* int32 [n_tok][max_sel] */
+        ds4_gpu_tensor       *n_sel,        /* uint32 [n_tok] */
+        ds4_gpu_tensor       *keys,         /* uint64 [keys_rows][ctx / r] scratch, one row per concurrent token */
+        uint32_t              keys_rows,
+        const ds4_gpu_tensor *q,            /* [n_tok][n_head][d] normalised, rotated */
+        const ds4_gpu_tensor *bkey,         /* [ctx / r][d] */
+        uint32_t              n_head,
+        uint32_t              d,
+        uint32_t              r,
+        uint32_t              budget,
+        uint32_t              max_sel,
+        uint32_t              ctx,
+        uint32_t              pos0,
+        uint32_t              n_tokens) {
+    const uint64_t max_blocks = ctx / r;
+    if (n_head == 0u || d == 0u || n_head * d > QWEN4EXP_INDEXER_MAX_Q || r < 2u || budget == 0u ||
+        max_sel < budget * r + r - 1u || n_tokens == 0u || pos0 + n_tokens > ctx || keys_rows == 0u ||
+        !sel || sel->bytes < (uint64_t)n_tokens * max_sel * sizeof(int32_t) ||
+        !n_sel || n_sel->bytes < (uint64_t)n_tokens * sizeof(uint32_t) ||
+        !keys || keys->bytes < (uint64_t)keys_rows * max_blocks * sizeof(uint64_t) ||
+        !qwen4exp_elems_fit(q, (uint64_t)n_tokens * n_head * d) || !qwen4exp_elems_fit(bkey, max_blocks * d)) {
+        return 0;
+    }
+    const uint32_t grid = n_tokens < keys_rows ? n_tokens : keys_rows;
+    qwen4exp_qsa_select_kernel<<<grid, QWEN4EXP_SELECT_THREADS, 0, cuda_decode_stream()>>>(
+        (int32_t *)sel->ptr, (uint32_t *)n_sel->ptr, (uint64_t *)keys->ptr, max_blocks,
+        (const float *)q->ptr, (const float *)bkey->ptr, n_head, d, r, budget, max_sel, pos0, n_tokens);
+    return cuda_ok(cudaGetLastError(), "Flash-Next QSA select launch");
 }

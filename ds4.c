@@ -16268,13 +16268,28 @@ typedef struct {
     float *emb_host;             /* PLE: host staging for emb */
     int32_t ple_prev[DS4_NGRAM_MAX_MULT];   /* PLE: the ngram-1 tokens before the next one, newest first */
     ds4_gpu_tensor *router;      /* MoE: [max_rows][n_expert] */
-    ds4_gpu_tensor *sel;         /* MoE: int32 [max_rows][n_used] */
+    ds4_gpu_tensor *esel;        /* MoE: int32 [max_rows][n_used] routed expert ids */
     ds4_gpu_tensor *selw;        /* MoE: [max_rows][n_used] renormalised weights */
     ds4_gpu_tensor *eg;          /* MoE: [max_rows*n_used][n_ff_exp] gate, then the activation */
     ds4_gpu_tensor *eu;          /* MoE: [max_rows*n_used][n_ff_exp] up */
     ds4_gpu_tensor *ed;          /* MoE: [max_rows*n_used][n_embd] expert outputs */
     ds4_gpu_tensor *sg;          /* MoE: shared expert gate logit [max_rows] */
+    /* QSA (see qwen_attention_cells): per layer the block key cache and the
+     * raw keys of the block being filled; per chunk the raw keys, the
+     * indexer queries, the selected cells and the select scratch. */
+    ds4_gpu_tensor *bkey[DS4_MAX_LAYER];    /* [ctx / ratio][idx_dim] */
+    ds4_gpu_tensor *khist[DS4_MAX_LAYER];   /* [ratio - 1][idx_dim], oldest first */
+    ds4_gpu_tensor *ikraw;       /* [max_rows][idx_dim] */
+    ds4_gpu_tensor *iq;          /* [max_rows][n_idx_head][idx_dim] */
+    ds4_gpu_tensor *sel;         /* int32 [max_rows][max_sel] */
+    ds4_gpu_tensor *n_sel;       /* uint32 [max_rows] */
+    ds4_gpu_tensor *skeys;       /* uint64 select scratch, QWEN_QSA_SELECT_ROWS rows of ctx / ratio keys */
+    uint32_t max_sel;            /* budget cells plus the tail block */
 } ds4_qwen_gpu_graph;
+
+/* Tokens the QSA select kernel scores concurrently, each with its own row
+ * of block keys in the scratch. */
+enum { QWEN_QSA_SELECT_ROWS = 128 };
 
 static void qwen_graph_free(ds4_qwen_gpu_graph *g) {
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -16282,11 +16297,14 @@ static void qwen_graph_free(ds4_qwen_gpu_graph *g) {
         if (g->ssm_state[il]) ds4_gpu_tensor_free(g->ssm_state[il]);
         if (g->k_cache[il]) ds4_gpu_tensor_free(g->k_cache[il]);
         if (g->v_cache[il]) ds4_gpu_tensor_free(g->v_cache[il]);
+        if (g->bkey[il]) ds4_gpu_tensor_free(g->bkey[il]);
+        if (g->khist[il]) ds4_gpu_tensor_free(g->khist[il]);
     }
     ds4_gpu_tensor **scratch[] = { &g->tokens, &g->x, &g->h, &g->y, &g->proj, &g->mixed,
                                    &g->z, &g->alpha, &g->beta, &g->k, &g->v, &g->att, &g->att_part, &g->logits,
                                    &g->xn, &g->lo, &g->hgate, &g->inject, &g->emb, &g->pkey, &g->pval, &g->pnorm,
-                                   &g->ple_hist, &g->router, &g->sel, &g->selw, &g->eg, &g->eu, &g->ed, &g->sg };
+                                   &g->ple_hist, &g->router, &g->esel, &g->selw, &g->eg, &g->eu, &g->ed, &g->sg,
+                                   &g->ikraw, &g->iq, &g->sel, &g->n_sel, &g->skeys };
     for (size_t i = 0; i < sizeof(scratch) / sizeof(scratch[0]); i++) {
         if (*scratch[i]) ds4_gpu_tensor_free(*scratch[i]);
     }
@@ -16330,6 +16348,7 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
     const uint64_t x_dim = ds4_qwen_has_hc() ? (uint64_t)DS4_N_HC * DS4_N_EMBD : DS4_N_EMBD;
     const uint64_t ff_dim = qwen_max_u64(DS4_N_FF_DENSE, DS4_N_FF_SHEXP);
     bool ok = true;
+    uint32_t max_ratio = 0;
     for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
         if (ds4_qwen_layer_is_gdn(il)) {
             g->conv_state[il] = qwen_graph_tensor((DS4_N_KDA_CONV - 1u) * conv_dim, &ok);
@@ -16337,7 +16356,22 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
         } else {
             g->k_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim, &ok);
             g->v_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim, &ok);
+            if (ds4_qwen_layer_is_qsa(il)) {
+                const uint32_t r = g_ds4_compress_ratios[il];
+                g->bkey[il] = qwen_graph_tensor((uint64_t)(ctx / r) * DS4_N_INDEXER_HEAD_DIM, &ok);
+                g->khist[il] = qwen_graph_tensor((uint64_t)(r - 1u) * DS4_N_INDEXER_HEAD_DIM, &ok);
+                if (r > max_ratio) max_ratio = r;
+            }
         }
+    }
+    if (max_ratio) {
+        const uint64_t idx_dim = DS4_N_INDEXER_HEAD_DIM;
+        g->max_sel = DS4_N_INDEXER_TOP_K + max_ratio - 1u;
+        g->ikraw = qwen_graph_tensor(rows * idx_dim, &ok);
+        g->iq = qwen_graph_tensor(rows * DS4_N_INDEXER_HEAD * idx_dim, &ok);
+        g->sel = qwen_graph_tensor(rows * g->max_sel, &ok);
+        g->n_sel = qwen_graph_tensor(rows, &ok);
+        g->skeys = qwen_graph_tensor(2ull * QWEN_QSA_SELECT_ROWS * (ctx / 2u), &ok);   /* uint64 keys, ratio >= 2 */
     }
     g->tokens = qwen_graph_tensor(rows, &ok);
     g->x = qwen_graph_tensor(rows * x_dim, &ok);
@@ -16371,7 +16405,7 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
     if (ds4_qwen_is_moe()) {
         const uint64_t slots = rows * DS4_N_EXPERT_USED;
         g->router = qwen_graph_tensor(rows * DS4_N_EXPERT, &ok);
-        g->sel = qwen_graph_tensor(slots, &ok);
+        g->esel = qwen_graph_tensor(slots, &ok);
         g->selw = qwen_graph_tensor(slots, &ok);
         g->eg = qwen_graph_tensor(slots * DS4_N_FF_EXP, &ok);
         g->eu = qwen_graph_tensor(slots * DS4_N_FF_EXP, &ok);
@@ -16445,19 +16479,19 @@ static bool qwen_graph_moe(
     const uint64_t slots = (uint64_t)n * n_used;
     const ds4_tensor *gate = l->ffn_gate_exps, *up = l->ffn_up_exps, *down = l->ffn_down_exps;
     bool ok = qwen_graph_matmul(g->router, m, l->ffn_gate_inp, g->h, n);
-    if (ok) ok = ds4_gpu_qwen4exp_router(g->sel, g->selw, g->router, DS4_N_EXPERT, n_used, n) != 0;
+    if (ok) ok = ds4_gpu_qwen4exp_router(g->esel, g->selw, g->router, DS4_N_EXPERT, n_used, n) != 0;
     if (ok) ok = ds4_gpu_qwen4exp_expert_matvec(g->eg, m->map, m->size, gate->abs_offset,
                                                 (uint64_t)((const uint8_t *)gate->scales - m->map),
-                                                g->sel, g->h, 0, DS4_N_EXPERT, n_used,
+                                                g->esel, g->h, 0, DS4_N_EXPERT, n_used,
                                                 (uint32_t)gate->dim[0], (uint32_t)gate->dim[1], n) != 0;
     if (ok) ok = ds4_gpu_qwen4exp_expert_matvec(g->eu, m->map, m->size, up->abs_offset,
                                                 (uint64_t)((const uint8_t *)up->scales - m->map),
-                                                g->sel, g->h, 0, DS4_N_EXPERT, n_used,
+                                                g->esel, g->h, 0, DS4_N_EXPERT, n_used,
                                                 (uint32_t)up->dim[0], (uint32_t)up->dim[1], n) != 0;
     if (ok) ok = ds4_gpu_swiglu_tensor(g->eg, g->eg, g->eu, (uint32_t)(slots * DS4_N_FF_EXP), 0.0f, 1.0f) != 0;
     if (ok) ok = ds4_gpu_qwen4exp_expert_matvec(g->ed, m->map, m->size, down->abs_offset,
                                                 (uint64_t)((const uint8_t *)down->scales - m->map),
-                                                g->sel, g->eg, 1, DS4_N_EXPERT, n_used,
+                                                g->esel, g->eg, 1, DS4_N_EXPERT, n_used,
                                                 (uint32_t)down->dim[0], (uint32_t)down->dim[1], n) != 0;
     if (ok) ok = qwen_graph_matmul(g->mixed, m, l->ffn_gate_shexp, g->h, n);
     if (ok) ok = qwen_graph_matmul(g->z, m, l->ffn_up_shexp, g->h, n);
@@ -16506,6 +16540,39 @@ static bool qwen_graph_ple_rows(ds4_qwen_gpu_graph *g, const ds4_model *m, const
     return ds4_gpu_tensor_write(g->emb, 0, g->emb_host, (uint64_t)n * DS4_N_EMBD * sizeof(float)) != 0;
 }
 
+/* QSA indexer for a chunk (see qwen_attention_cells): fold the chunk's raw
+ * keys into the block key cache, and when any token in the chunk sees more
+ * completed blocks than the budget, score and select its cells.  Returns
+ * whether the attention must gather by g->sel; within the budget (and
+ * under DS4_QSA_DENSE=1) it attends to the causal prefix directly. */
+static bool qwen_graph_qsa_select(
+        ds4_qwen_gpu_graph      *g,
+        const ds4_model         *m,
+        const ds4_layer_weights *l,
+        uint32_t                 il,
+        uint32_t                 n,
+        uint32_t                 pos0,
+        bool                    *ok) {
+    static int dense = -1;
+    if (dense < 0) dense = getenv("DS4_QSA_DENSE") != NULL;
+    if (!ds4_qwen_layer_is_qsa(il)) return false;
+    const uint32_t r = g_ds4_compress_ratios[il];
+    const uint32_t d = DS4_N_INDEXER_HEAD_DIM;
+    const uint32_t budget = DS4_N_INDEXER_TOP_K / r;
+    *ok = qwen_graph_matmul(g->ikraw, m, l->indexer_k, g->h, n) &&
+          ds4_gpu_qwen4exp_block_keys(g->bkey[il], g->ikraw, g->khist[il], m->map, m->size,
+                                      l->indexer_k_norm->abs_offset, d, r, DS4_N_ROT, g->ctx, pos0, n,
+                                      DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) != 0;
+    if (!*ok || dense || (pos0 + n) / r <= budget) return false;
+    *ok = qwen_graph_matmul(g->iq, m, l->indexer_q, g->h, n) &&
+          ds4_gpu_qwen4exp_indexer_query(g->iq, m->map, m->size, l->indexer_q_norm->abs_offset,
+                                         DS4_N_INDEXER_HEAD, d, DS4_N_ROT, pos0, n,
+                                         DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) != 0 &&
+          ds4_gpu_qwen4exp_qsa_select(g->sel, g->n_sel, g->skeys, QWEN_QSA_SELECT_ROWS, g->iq, g->bkey[il],
+                                      DS4_N_INDEXER_HEAD, d, r, budget, g->max_sel, g->ctx, pos0, n) != 0;
+    return *ok;
+}
+
 static bool qwen_graph_layer(
         ds4_qwen_gpu_graph    *g,
         const ds4_model         *m,
@@ -16529,11 +16596,13 @@ static bool qwen_graph_layer(
                                         n, DS4_MODEL_VARIANT == DS4_VARIANT_QWEN4EXP, DS4_RMS_EPS) != 0;
         if (ok) ok = qwen_graph_matmul(g->y, m, l->ssm_out, g->att, n);
     } else {
+        const bool sparse = ok && qwen_graph_qsa_select(g, m, l, il, n, pos0, &ok);
         if (ok) ok = qwen_graph_matmul(g->proj, m, l->attn_q, g->h, n);
         if (ok) ok = qwen_graph_matmul(g->k, m, l->attn_k, g->h, n);
         if (ok) ok = qwen_graph_matmul(g->v, m, l->attn_v, g->h, n);
         if (ok) ok = ds4_gpu_qwen35_attention(g->att, g->att_part, g->proj, g->k_cache[il], g->v_cache[il],
-                                              g->k, g->v, m->map, m->size,
+                                              g->k, g->v, sparse ? g->sel : NULL, g->n_sel, g->max_sel,
+                                              m->map, m->size,
                                               l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                               DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
                                               g->ctx, pos0, n, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) != 0;
@@ -16550,6 +16619,25 @@ static bool qwen_graph_layer(
         if (ok) ok = qwen_graph_matmul(g->y, m, l->ffn_down, g->mixed, n);
     }
     if (ok) ok = qwen_graph_sublayer_out(g, n);
+    /* DS4_QWEN_TRACE=1: the CPU reference's per-layer norms for the chunk's
+     * last row, to locate a divergence by layer and position. */
+    if (ok && getenv("DS4_QWEN_TRACE")) {
+        const uint64_t nx = ds4_qwen_has_hc() ? (uint64_t)DS4_N_HC * DS4_N_EMBD : DS4_N_EMBD;
+        float *buf = xmalloc(nx * sizeof(float));
+        double sx = 0, sh = 0, sy = 0;
+        if (ds4_gpu_tensor_read(g->x, (uint64_t)(n - 1u) * nx * sizeof(float), buf, nx * sizeof(float))) {
+            for (uint64_t i = 0; i < nx; i++) sx += (double)buf[i] * buf[i];
+        }
+        if (ds4_gpu_tensor_read(g->h, (uint64_t)(n - 1u) * DS4_N_EMBD * sizeof(float), buf, DS4_N_EMBD * sizeof(float))) {
+            for (uint64_t i = 0; i < DS4_N_EMBD; i++) sh += (double)buf[i] * buf[i];
+        }
+        if (ds4_gpu_tensor_read(g->y, (uint64_t)(n - 1u) * DS4_N_EMBD * sizeof(float), buf, DS4_N_EMBD * sizeof(float))) {
+            for (uint64_t i = 0; i < DS4_N_EMBD; i++) sy += (double)buf[i] * buf[i];
+        }
+        fprintf(stderr, "trace pos %u layer %u |x|=%.4g |h|=%.4g |ffn|=%.4g\n", pos0 + n - 1u, il,
+                sqrt(sx), sqrt(sh), sqrt(sy));
+        free(buf);
+    }
     return ok;
 }
 
