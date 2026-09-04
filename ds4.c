@@ -16626,21 +16626,43 @@ static bool qwen_graph_ple(
 }
 
 /* Gather the n-gram rows of a chunk on the host: the table stays mmapped
- * and is read row by row, so the GPU never touches it, and the hash window
- * advances token by token exactly as the CPU reference does. */
-static bool qwen_graph_ple_rows(ds4_qwen_gpu_graph *g, const ds4_model *m, const int *tokens, uint32_t n) {
-    const ds4_ngram_table *t = &m->ngram;
-    for (uint32_t i = 0; i < n; i++) {
-        uint64_t rows[DS4_NGRAM_MAX_HEAD];
-        qwen_ple_rows(t, g->ple_prev, tokens[i], rows);
-        for (uint32_t s = t->n_mult - 1u; s > 1; s--) g->ple_prev[s - 1] = g->ple_prev[s - 2];
-        g->ple_prev[0] = tokens[i];
-        float *e = g->emb_host + (uint64_t)i * DS4_N_EMBD;
+ * and is read row by row, so the GPU never touches it.  The hash window
+ * advances token by token exactly as the CPU reference does, which is
+ * cheap and sequential; the row reads and E4M3 decoding, the actual cost
+ * (70 ms for 2481 tokens single-threaded), go to the thread pool over
+ * tokens with a decode table. */
+typedef struct {
+    const ds4_ngram_table *t;
+    const uint64_t        *rows;      /* [n][n_head] */
+    float                 *emb;       /* [n][n_embd] */
+    float                  lut[256];  /* E4M3 code -> value * scale */
+} qwen_ple_gather_ctx;
+
+static void qwen_ple_gather_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    const qwen_ple_gather_ctx *c = vctx;
+    const ds4_ngram_table *t = c->t;
+    for (uint64_t i = row0; i < row1; i++) {
+        float *e = c->emb + i * DS4_N_EMBD;
         for (uint32_t h = 0; h < t->n_head; h++) {
-            const uint8_t *row = t->map + DS4_NGRAM_HEADER_BYTES + rows[h] * t->row_bytes;
-            for (uint32_t j = 0; j < t->row_bytes; j++) e[(uint64_t)h * t->row_bytes + j] = ds4_e4m3_to_f32(row[j]) * t->scale;
+            const uint8_t *row = t->map + DS4_NGRAM_HEADER_BYTES + c->rows[i * t->n_head + h] * t->row_bytes;
+            float *dst = e + (uint64_t)h * t->row_bytes;
+            for (uint32_t j = 0; j < t->row_bytes; j++) dst[j] = c->lut[row[j]];
         }
     }
+}
+
+static bool qwen_graph_ple_rows(ds4_qwen_gpu_graph *g, const ds4_model *m, const int *tokens, uint32_t n) {
+    const ds4_ngram_table *t = &m->ngram;
+    uint64_t *rows = xmalloc((uint64_t)n * t->n_head * sizeof(uint64_t));
+    for (uint32_t i = 0; i < n; i++) {
+        qwen_ple_rows(t, g->ple_prev, tokens[i], rows + (uint64_t)i * t->n_head);
+        for (uint32_t s = t->n_mult - 1u; s > 1; s--) g->ple_prev[s - 1] = g->ple_prev[s - 2];
+        g->ple_prev[0] = tokens[i];
+    }
+    qwen_ple_gather_ctx ctx = { .t = t, .rows = rows, .emb = g->emb_host };
+    for (uint32_t b = 0; b < 256u; b++) ctx.lut[b] = ds4_e4m3_to_f32((uint8_t)b) * t->scale;
+    ds4_parallel_for(n, qwen_ple_gather_worker, &ctx);
+    free(rows);
     return ds4_gpu_tensor_write(g->emb, 0, g->emb_host, (uint64_t)n * DS4_N_EMBD * sizeof(float)) != 0;
 }
 
