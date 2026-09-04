@@ -16242,8 +16242,7 @@ typedef struct {
     ds4_gpu_tensor *tokens;      /* int32 [max_rows] */
     ds4_gpu_tensor *x;           /* residual [max_rows][n_embd] */
     ds4_gpu_tensor *h;           /* normalised input */
-    ds4_gpu_tensor *h_hi;        /* h split into bf16 hi/lo once per sub-layer for the prefill GEMMs */
-    ds4_gpu_tensor *h_lo;
+    ds4_gpu_tensor *h_bf16;      /* h rounded to bf16 once per sub-layer for the prefill GEMMs */
     ds4_gpu_tensor *y;           /* branch output */
     ds4_gpu_tensor *proj;        /* qkv projection or [query|gate] heads */
     ds4_gpu_tensor *mixed;       /* conv output or FFN gate */
@@ -16307,7 +16306,7 @@ static void qwen_graph_free(ds4_qwen_gpu_graph *g) {
         if (g->bkey[il]) ds4_gpu_tensor_free(g->bkey[il]);
         if (g->khist[il]) ds4_gpu_tensor_free(g->khist[il]);
     }
-    ds4_gpu_tensor **scratch[] = { &g->tokens, &g->x, &g->h, &g->h_hi, &g->h_lo, &g->y, &g->proj, &g->mixed,
+    ds4_gpu_tensor **scratch[] = { &g->tokens, &g->x, &g->h, &g->h_bf16, &g->y, &g->proj, &g->mixed,
                                    &g->z, &g->alpha, &g->beta, &g->k, &g->v, &g->att, &g->att_part, &g->att_split, &g->logits,
                                    &g->xn, &g->lo, &g->hgate, &g->inject, &g->emb, &g->pkey, &g->pval, &g->pnorm,
                                    &g->ple_hist, &g->router, &g->esel, &g->selw, &g->eg, &g->eu, &g->ed, &g->sg,
@@ -16383,8 +16382,7 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
     g->tokens = qwen_graph_tensor(rows, &ok);
     g->x = qwen_graph_tensor(rows * x_dim, &ok);
     g->h = qwen_graph_tensor(rows * DS4_N_EMBD, &ok);
-    g->h_hi = qwen_graph_tensor(rows * DS4_N_EMBD / 2u, &ok);   /* bf16 */
-    g->h_lo = qwen_graph_tensor(rows * DS4_N_EMBD / 2u, &ok);
+    g->h_bf16 = qwen_graph_tensor(rows * DS4_N_EMBD / 2u, &ok);
     g->y = qwen_graph_tensor(rows * DS4_N_EMBD, &ok);
     g->proj = qwen_graph_tensor(rows * qwen_max_u64(conv_dim, 2u * attn_dim), &ok);
     g->mixed = qwen_graph_tensor(rows * qwen_max_u64(conv_dim, ff_dim), &ok);
@@ -16441,10 +16439,10 @@ static bool qwen_graph_matmul(
         ds4_gpu_tensor   *x,
         uint32_t          n_tok) {
     return ds4_gpu_qwen35_matmul(out, m->map, m->size, w->abs_offset, w->type, w->scale,
-                                 (uint32_t)w->dim[0], (uint32_t)w->dim[1], x, NULL, NULL, n_tok) != 0;
+                                 (uint32_t)w->dim[0], (uint32_t)w->dim[1], x, NULL, n_tok) != 0;
 }
 
-/* The same over the sub-layer input h, whose bf16 split qwen_graph_sublayer_in
+/* The same over the sub-layer input h, whose bf16 copy qwen_graph_sublayer_in
  * made once for every projection that reads it. */
 static bool qwen_graph_matmul_h(
         ds4_qwen_gpu_graph *g,
@@ -16453,7 +16451,7 @@ static bool qwen_graph_matmul_h(
         const ds4_tensor   *w,
         uint32_t            n_tok) {
     return ds4_gpu_qwen35_matmul(out, m->map, m->size, w->abs_offset, w->type, w->scale,
-                                 (uint32_t)w->dim[0], (uint32_t)w->dim[1], g->h, g->h_hi, g->h_lo, n_tok) != 0;
+                                 (uint32_t)w->dim[0], (uint32_t)w->dim[1], g->h, g->h_bf16, n_tok) != 0;
 }
 
 /* Hyper-connection mix of the n rows of x into mixed; inject, when given,
@@ -16488,8 +16486,8 @@ static bool qwen_graph_sublayer_in(
         ? qwen_graph_hc_mix(g, m, hc, g->x, n, g->h, g->inject)
         : ds4_gpu_rms_norm_weight_rows_tensor(g->h, g->x, m->map, m->size, norm->abs_offset,
                                               DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
-    /* prefill GEMMs on h use the tensor cores on its bf16 split; decode matvecs read h itself */
-    return ok && (n <= 8u || ds4_gpu_qwen35_split(g->h_hi, g->h_lo, g->h, (uint64_t)n * DS4_N_EMBD) != 0);
+    /* prefill GEMMs on h use the tensor cores on its bf16 copy; decode matvecs read h itself */
+    return ok && (n <= 8u || ds4_gpu_qwen35_bf16(g->h_bf16, g->h, (uint64_t)n * DS4_N_EMBD) != 0);
 }
 
 static bool qwen_graph_sublayer_out(ds4_qwen_gpu_graph *g, uint32_t n) {

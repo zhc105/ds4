@@ -419,8 +419,9 @@ __global__ static void qwen35_gemm_mma_kernel(
     qwen35_mma_tile(out, out_dim, scale, orow, xr, w, wtype, in_dim, col0, smem);
 }
 
-/* Split f32 activations into a bf16 high part and a bf16 remainder for the
- * two-pass cuBLAS GEMM below. */
+/* Split f32 activations into a bf16 high part and a bf16 remainder (the
+ * exact operands of the tensor-core attention), or round them to bf16
+ * alone (the operands of the bypass GEMMs). */
 __global__ static void qwen35_split_bf16_kernel(__nv_bfloat16 *hi, __nv_bfloat16 *lo, const float *x, uint64_t n) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -430,46 +431,44 @@ __global__ static void qwen35_split_bf16_kernel(__nv_bfloat16 *hi, __nv_bfloat16
     lo[i] = __float2bfloat16(v - __bfloat162float(h));
 }
 
-/* BF16-weight prefill GEMM through cuBLAS with the same split-bf16
- * activations as qwen35_mma_tile: out = W lo, then out += W hi, both on
- * bf16 tensor cores with f32 accumulation, scaled by alpha.  cuBLAS is
- * deterministic here (no atomics) and pipelines the tiles far better than
- * the hand-written kernel, which stays for NVFP4 weights. */
+__global__ static void qwen35_to_bf16_kernel(__nv_bfloat16 *dst, const float *x, uint64_t n) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2bfloat16(x[i]);
+}
+
+/* BF16-weight prefill GEMM through cuBLAS on bf16 activations with f32
+ * accumulation, scaled by alpha: the checkpoint's own recipe for these
+ * projections (vLLM and SGLang run them the same way), which measured
+ * indistinguishable from an exact hi/lo split in perplexity and vLLM
+ * agreement at twice the speed.  cuBLAS is deterministic here (no atomics)
+ * and pipelines the tiles far better than the hand-written kernel, which
+ * stays for NVFP4 weights. */
 static int qwen35_cublas_bf16(
-        float *out, const uint16_t *w, const float *x, const __nv_bfloat16 *x_hi, const __nv_bfloat16 *x_lo,
+        float *out, const uint16_t *w, const float *x, const __nv_bfloat16 *x_bf16,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_rows, float scale, int tier, cudaStream_t stream) {
     const uint64_t n = (uint64_t)n_rows * in_dim;
-    const __nv_bfloat16 *hi = x_hi, *lo = x_lo;
-    if (!hi) {
-        __nv_bfloat16 *buf = (__nv_bfloat16 *)cuda_tmp_alloc_on(tier, 2u * n * sizeof(__nv_bfloat16), "Qwen split-bf16 activations");
+    const __nv_bfloat16 *a = x_bf16;
+    if (!a) {
+        __nv_bfloat16 *buf = (__nv_bfloat16 *)cuda_tmp_alloc_on(tier, n * sizeof(__nv_bfloat16), "Qwen bf16 activations");
         if (!buf) return 0;
-        qwen35_split_bf16_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(buf, buf + n, x, n);
-        if (!cuda_ok(cudaGetLastError(), "Qwen split-bf16 launch")) return 0;
-        hi = buf;
-        lo = buf + n;
+        qwen35_to_bf16_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(buf, x, n);
+        if (!cuda_ok(cudaGetLastError(), "Qwen bf16 convert launch")) return 0;
+        a = buf;
     }
-    const float beta0 = 0.0f, beta1 = 1.0f;
-    cublasHandle_t handle = cuda_cublas_for_tier(tier);
-    cublasStatus_t st = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_rows, (int)in_dim,
-                                     &scale, w, CUDA_R_16BF, (int)in_dim, lo, CUDA_R_16BF, (int)in_dim,
-                                     &beta0, out, CUDA_R_32F, (int)out_dim, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-    if (st == CUBLAS_STATUS_SUCCESS) {
-        st = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_rows, (int)in_dim,
-                          &scale, w, CUDA_R_16BF, (int)in_dim, hi, CUDA_R_16BF, (int)in_dim,
-                          &beta1, out, CUDA_R_32F, (int)out_dim, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-    }
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(tier), CUBLAS_OP_T, CUBLAS_OP_N,
+                                     (int)out_dim, (int)n_rows, (int)in_dim,
+                                     &scale, w, CUDA_R_16BF, (int)in_dim, a, CUDA_R_16BF, (int)in_dim,
+                                     &beta, out, CUDA_R_32F, (int)out_dim, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     return cublas_ok(st, "Qwen BF16 GEMM");
 }
 
-/* Split an activation buffer once for the matmuls that share it. */
-extern "C" int ds4_gpu_qwen35_split(ds4_gpu_tensor *hi, ds4_gpu_tensor *lo, const ds4_gpu_tensor *x, uint64_t n) {
-    if (n == 0u || !hi || !lo || !x || hi->bytes < n * sizeof(__nv_bfloat16) || lo->bytes < n * sizeof(__nv_bfloat16) ||
-        x->bytes < n * sizeof(float)) {
-        return 0;
-    }
-    qwen35_split_bf16_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
-        (__nv_bfloat16 *)hi->ptr, (__nv_bfloat16 *)lo->ptr, (const float *)x->ptr, n);
-    return cuda_ok(cudaGetLastError(), "Qwen split-bf16 launch");
+/* Round an activation buffer to bf16 once for the matmuls that share it. */
+extern "C" int ds4_gpu_qwen35_bf16(ds4_gpu_tensor *dst, const ds4_gpu_tensor *x, uint64_t n) {
+    if (n == 0u || !dst || !x || dst->bytes < n * sizeof(__nv_bfloat16) || x->bytes < n * sizeof(float)) return 0;
+    qwen35_to_bf16_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+        (__nv_bfloat16 *)dst->ptr, (const float *)x->ptr, n);
+    return cuda_ok(cudaGetLastError(), "Qwen bf16 convert launch");
 }
 
 /* Opt a tensor-core kernel into its dynamic shared memory once. */
@@ -500,8 +499,9 @@ static uint64_t qwen35_weight_bytes(uint32_t wtype, uint32_t in_dim, uint32_t ou
 /* out[n_tok][out_dim] = x[n_tok][in_dim] W^T times the global scale, for a
  * weight of any storage type the loader accepts.  Decode-sized batches use
  * one warp or block per output column on f32 activations; larger ones the
- * tensor-core GEMMs on split-bf16 activations (x_hi/x_lo when the caller
- * split x already, else split here), exact to f32 rounding either way. */
+ * tensor cores: BF16 weights through cuBLAS on bf16 activations (x_bf16
+ * when the caller rounded x already, else rounded here), NVFP4 and F32
+ * weights on kernels exact to f32 rounding. */
 extern "C" int ds4_gpu_qwen35_matmul(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -512,8 +512,7 @@ extern "C" int ds4_gpu_qwen35_matmul(
         uint32_t              in_dim,
         uint32_t              out_dim,
         const ds4_gpu_tensor *x,
-        const ds4_gpu_tensor *x_hi,
-        const ds4_gpu_tensor *x_lo,
+        const ds4_gpu_tensor *x_bf16,
         uint32_t              n_tok) {
     const uint64_t weight_bytes = qwen35_weight_bytes(wtype, in_dim, out_dim);
     if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u || n_tok == 0u ||
@@ -521,7 +520,7 @@ extern "C" int ds4_gpu_qwen35_matmul(
         weight_bytes > model_size - weight_offset ||
         x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tok * out_dim * sizeof(float) ||
-        (x_hi && (!x_lo || x_hi->bytes < (uint64_t)n_tok * in_dim * 2u || x_lo->bytes < (uint64_t)n_tok * in_dim * 2u))) {
+        (x_bf16 && x_bf16->bytes < (uint64_t)n_tok * in_dim * sizeof(__nv_bfloat16))) {
         return 0;
     }
     const char *w = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes,
@@ -532,14 +531,22 @@ extern "C" int ds4_gpu_qwen35_matmul(
     const float *xp = (const float *)x->ptr;
     if (n_tok > 8u) {
         if (wtype == QWEN35_W_F32) {
+            /* exact f32 (cuBLAS' default math mode keeps TF32 off); the
+             * router's top-k depends on it */
+            if (g_cublas_ready) {
+                const float beta = 0.0f;
+                cublasStatus_t st = cublasSgemm(cuda_cublas_for_tier(ds4_tensor_device_idx(out)),
+                                                CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_tok, (int)in_dim,
+                                                &scale, (const float *)w, (int)in_dim, xp, (int)in_dim,
+                                                &beta, o, (int)out_dim);
+                return cublas_ok(st, "Qwen f32 GEMM");
+            }
             const dim3 grid((n_tok + 63u) / 64u, (out_dim + 63u) / 64u, 1u);
             qwen35_gemm_f32_kernel<<<grid, 256, 0, stream>>>(o, (const uint8_t *)w, xp, in_dim, out_dim, n_tok, scale);
             return cuda_ok(cudaGetLastError(), "Qwen f32 GEMM launch");
         }
         if (wtype == QWEN35_W_BF16 && g_cublas_ready) {
-            return qwen35_cublas_bf16(o, (const uint16_t *)w, xp,
-                                      x_hi ? (const __nv_bfloat16 *)x_hi->ptr : NULL,
-                                      x_hi ? (const __nv_bfloat16 *)x_lo->ptr : NULL,
+            return qwen35_cublas_bf16(o, (const uint16_t *)w, xp, x_bf16 ? (const __nv_bfloat16 *)x_bf16->ptr : NULL,
                                       in_dim, out_dim, n_tok, scale, ds4_tensor_device_idx(out), stream);
         }
         static bool ready = false;
@@ -627,33 +634,58 @@ __global__ static void qwen35_gdn_recurrence_kernel(
         uint32_t n_k, uint32_t n_v, uint32_t n_tokens, float q_scale) {
     const uint32_t hd = QWEN35_CUDA_GDN_DIM;
     const uint32_t hv = blockIdx.x;
-    const uint32_t value = blockIdx.y * 4u + (threadIdx.x >> 5u);
+    const uint32_t v0 = blockIdx.y * 16u + (threadIdx.x >> 5u) * 4u;   /* this warp's four value columns */
     const uint32_t lane = threadIdx.x & 31u;
-    if (hv >= n_v || value >= hd) return;
+    if (hv >= n_v || v0 >= hd) return;
     const uint32_t hk = hv % n_k;
     const uint32_t conv_dim = (2u * n_k + n_v) * hd;
     const uint32_t k0 = lane * 4u;
-    float4 *sp = (float4 *)(state + ((uint64_t)hv * hd + value) * hd + k0);
-    float4 h = *sp;
+    const float a_head = a_neg[hv];
+    const float dt_head = dt_bias[hv];
+    float4 h[4];
+    for (uint32_t c = 0; c < 4u; c++) h[c] = *(const float4 *)(state + ((uint64_t)hv * hd + v0 + c) * hd + k0);
+    /* The token chain is latency-bound, so the next token's inputs are
+     * fetched a step ahead and the four columns' reductions overlap. */
+    float4 q_next = *(const float4 *)(mixed + hk * hd + k0);
+    float4 k_next = *(const float4 *)(mixed + (n_k + hk) * hd + k0);
+    float4 v_next = *(const float4 *)(mixed + (2u * n_k + hv) * hd + v0);
+    float alpha_next = alpha[hv];
+    float beta_next = beta[hv];
     for (uint32_t t = 0; t < n_tokens; t++) {
-        const float *row = mixed + (uint64_t)t * conv_dim;
-        const float4 q4 = *(const float4 *)(row + hk * hd + k0);
-        const float4 k4 = *(const float4 *)(row + (n_k + hk) * hd + k0);
-        const float vval = row[(2u * n_k + hv) * hd + value];
-        const float decay = expf(a_neg[hv] *
-            qwen35_cuda_softplus(alpha[(uint64_t)t * n_v + hv] + dt_bias[hv]));
-        const float b = qwen35_cuda_sigmoid(beta[(uint64_t)t * n_v + hv]);
-        h.x *= decay; h.y *= decay; h.z *= decay; h.w *= decay;
-        const float sk = __shfl_sync(0xffffffffu, warp_sum_f32(dot4_f32(h, k4)), 0);
-        const float delta = (vval - sk) * b;
-        h.x = fmaf(k4.x, delta, h.x);
-        h.y = fmaf(k4.y, delta, h.y);
-        h.z = fmaf(k4.z, delta, h.z);
-        h.w = fmaf(k4.w, delta, h.w);
-        const float res = __shfl_sync(0xffffffffu, warp_sum_f32(dot4_f32(h, q4)), 0);
-        if (lane == 0u) o[(uint64_t)t * n_v * hd + hv * hd + value] = res * q_scale;
+        const float4 q4 = q_next, k4 = k_next, v4 = v_next;
+        const float alpha_t = alpha_next, beta_t = beta_next;
+        if (t + 1u < n_tokens) {
+            const float *row = mixed + (uint64_t)(t + 1u) * conv_dim;
+            q_next = *(const float4 *)(row + hk * hd + k0);
+            k_next = *(const float4 *)(row + (n_k + hk) * hd + k0);
+            v_next = *(const float4 *)(row + (2u * n_k + hv) * hd + v0);
+            alpha_next = alpha[(uint64_t)(t + 1u) * n_v + hv];
+            beta_next = beta[(uint64_t)(t + 1u) * n_v + hv];
+        }
+        const float decay = expf(a_head * qwen35_cuda_softplus(alpha_t + dt_head));
+        const float b = qwen35_cuda_sigmoid(beta_t);
+        const float vval[4] = { v4.x, v4.y, v4.z, v4.w };
+        float sk[4], res[4];
+        for (uint32_t c = 0; c < 4u; c++) {
+            h[c].x *= decay; h[c].y *= decay; h[c].z *= decay; h[c].w *= decay;
+            sk[c] = dot4_f32(h[c], k4);
+        }
+        for (uint32_t c = 0; c < 4u; c++) sk[c] = __shfl_sync(0xffffffffu, warp_sum_f32(sk[c]), 0);
+        for (uint32_t c = 0; c < 4u; c++) {
+            const float delta = (vval[c] - sk[c]) * b;
+            h[c].x = fmaf(k4.x, delta, h[c].x);
+            h[c].y = fmaf(k4.y, delta, h[c].y);
+            h[c].z = fmaf(k4.z, delta, h[c].z);
+            h[c].w = fmaf(k4.w, delta, h[c].w);
+            res[c] = dot4_f32(h[c], q4);
+        }
+        for (uint32_t c = 0; c < 4u; c++) res[c] = __shfl_sync(0xffffffffu, warp_sum_f32(res[c]), 0);
+        if (lane == 0u) {
+            *(float4 *)(o + (uint64_t)t * n_v * hd + hv * hd + v0) =
+                make_float4(res[0] * q_scale, res[1] * q_scale, res[2] * q_scale, res[3] * q_scale);
+        }
     }
-    *sp = h;
+    for (uint32_t c = 0; c < 4u; c++) *(float4 *)(state + ((uint64_t)hv * hd + v0 + c) * hd + k0) = h[c];
 }
 
 /* RMSNormGated per head: normalise, scale, then multiply by the output gate,
@@ -732,7 +764,7 @@ extern "C" int ds4_gpu_qwen35_gdn(
     qwen35_gdn_conv_state_kernel<<<(unsigned)((conv_dim + 255u) / 256u), 256, 0, stream>>>(
         (float *)conv_state->ptr, (const float *)qkv->ptr, (uint32_t)conv_dim,
         n_conv - 1u, n_tokens);
-    qwen35_gdn_recurrence_kernel<<<dim3(n_v, hd / 4u, 1u), 128, 0, stream>>>(
+    qwen35_gdn_recurrence_kernel<<<dim3(n_v, hd / 16u, 1u), 128, 0, stream>>>(
         (float *)out->ptr, (float *)ssm_state->ptr, (const float *)mixed->ptr,
         (const float *)alpha->ptr, (const float *)beta->ptr, a_neg, dt_bias,
         n_k, n_v, n_tokens, rsqrtf((float)hd));
