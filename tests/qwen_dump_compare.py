@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Compare two DS4_QWEN_DUMP_LOGITS dumps position by position.
 
-The CPU reference dumps every prompt position; the CUDA graph dumps the last
-row of its first prefill chunk and then one row per token, so with
---prefill-chunk C the graph's rows line up with CPU positions C-1, C, C+1, ...
-Pass that C as --chunk (default 1, i.e. both dumps start at position 0).
+Both backends dump every prompt position, so the rows line up from position
+0.  --chunk C drops the first C-1 rows of the reference for dumps made by
+older graph builds that only started at the end of the first prefill chunk.
 
-    tests/qwen_dump_compare.py cpu.bin gpu.bin --chunk 8 [--vocab 248320]
+    tests/qwen_dump_compare.py cpu.bin gpu.bin [--vocab 248320] [--max-kl 1e-6]
 
 Prints max |dlogit|, mean and max KL(cpu || gpu) and the argmax agreement and
 exits 1 when the KL or argmax thresholds are missed.

@@ -16678,15 +16678,42 @@ static bool qwen_graph_embed(
     return ok;
 }
 
+/* The output head for one row of the residual: the final norm or the
+ * output mixer, then the vocabulary projection into g->logits. */
+static bool qwen_graph_head(
+        ds4_qwen_gpu_graph *g,
+        const ds4_model      *m,
+        const ds4_weights    *w,
+        uint32_t              row) {
+    const uint64_t x_dim = ds4_qwen_has_hc() ? (uint64_t)DS4_N_HC * DS4_N_EMBD : DS4_N_EMBD;
+    const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_view(g->x, (uint64_t)row * x_dim * sizeof(float), x_dim * sizeof(float));
+    ds4_gpu_tensor *h = ds4_gpu_tensor_view(g->h, 0, row_bytes);
+    bool ok = x && h;
+    if (ok) {
+        ok = ds4_qwen_has_hc()
+            ? qwen_graph_hc_mix(g, m, &w->output_hc_mix, x, 1, h, NULL)
+            : ds4_gpu_rms_norm_weight_tensor(h, x, m->map, m->size, w->output_norm->abs_offset,
+                                             DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    }
+    if (ok) ok = qwen_graph_matmul(g->logits, m, w->output, h, 1);
+    if (x) ds4_gpu_tensor_free(x);
+    if (h) ds4_gpu_tensor_free(h);
+    return ok;
+}
+
 /* Fold n tokens into the state, in max_rows chunks.  logits_out, when set,
- * receives the distribution after the last token. */
+ * receives the distribution after the last token; dump, when set, receives
+ * the distribution after every token as f32 rows (DS4_QWEN_DUMP_LOGITS),
+ * which costs one head evaluation per row. */
 static bool qwen_graph_forward(
         ds4_qwen_gpu_graph *g,
         const ds4_model      *m,
         const ds4_weights    *w,
         const int            *tokens,
         uint32_t              n,
-        float                *logits_out) {
+        float                *logits_out,
+        FILE                 *dump) {
     if (n == 0 || g->n_tokens + n > g->ctx) return false;
     bool ok = ds4_gpu_begin_commands() != 0;
     uint32_t done = 0;
@@ -16700,29 +16727,18 @@ static bool qwen_graph_forward(
         for (uint32_t il = 0; ok && il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
             ok = qwen_graph_layer(g, m, &w->layer[il], il, rows, pos0);
         }
+        for (uint32_t r = 0; ok && dump && r < rows; r++) {
+            ok = qwen_graph_head(g, m, w, r) &&
+                 ds4_gpu_tensor_read(g->logits, 0, logits_out, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0 &&
+                 fwrite(logits_out, sizeof(float), DS4_N_VOCAB, dump) == DS4_N_VOCAB;
+        }
         g->n_tokens += rows;
         done += rows;
         last_rows = rows;
     }
-    if (ok && logits_out) {
-        const uint64_t x_dim = ds4_qwen_has_hc() ? (uint64_t)DS4_N_HC * DS4_N_EMBD : DS4_N_EMBD;
-        const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-        ds4_gpu_tensor *last = ds4_gpu_tensor_view(g->x, (uint64_t)(last_rows - 1u) * x_dim * sizeof(float),
-                                                   x_dim * sizeof(float));
-        ds4_gpu_tensor *h = ds4_gpu_tensor_view(g->h, 0, row_bytes);
-        ok = last && h;
-        if (ok) {
-            ok = ds4_qwen_has_hc()
-                ? qwen_graph_hc_mix(g, m, &w->output_hc_mix, last, 1, h, NULL)
-                : ds4_gpu_rms_norm_weight_tensor(h, last, m->map, m->size, w->output_norm->abs_offset,
-                                                 DS4_N_EMBD, DS4_RMS_EPS) != 0;
-        }
-        if (ok) ok = qwen_graph_matmul(g->logits, m, w->output, h, 1);
-        if (last) ds4_gpu_tensor_free(last);
-        if (h) ds4_gpu_tensor_free(h);
-    }
+    if (ok && logits_out && !dump) ok = qwen_graph_head(g, m, w, last_rows - 1u);
     if (ok) ok = ds4_gpu_end_commands() != 0;
-    if (ok && logits_out) {
+    if (ok && logits_out && !dump) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     return ok;
@@ -68350,12 +68366,10 @@ static int qwen_session_sync_graph(ds4_session *s, const ds4_tokens *prompt, cha
         }
         s->checkpoint.len = 0;
     }
-    /* DS4_QWEN_DUMP_LOGITS=FILE: one normal chunk, then single tokens, and
-     * the logits after every step appended as f32 rows.  The CPU reference
-     * dumps every position, so the two line up from the first chunk's end. */
+    /* DS4_QWEN_DUMP_LOGITS=FILE: the logits after every prompt position
+     * appended as f32 rows, the same layout as the CPU reference's dump. */
     const char *dump_path = getenv("DS4_QWEN_DUMP_LOGITS");
     FILE *dump = dump_path && dump_path[0] ? fopen(dump_path, "ab") : NULL;
-    bool first_chunk = true;
     for (int i = start; i < prompt->len;) {
         if (ds4_session_cancelled(s)) {
             if (dump) fclose(dump);
@@ -68364,17 +68378,14 @@ static int qwen_session_sync_graph(ds4_session *s, const ds4_tokens *prompt, cha
             s->mtp_draft_valid = false;
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
-        uint32_t rows = (uint32_t)(prompt->len - i) < g->max_rows ? (uint32_t)(prompt->len - i) : g->max_rows;
-        if (dump && !first_chunk) rows = 1;
-        first_chunk = false;
+        const uint32_t rows = (uint32_t)(prompt->len - i) < g->max_rows ? (uint32_t)(prompt->len - i) : g->max_rows;
         const bool last = i + (int)rows == prompt->len;
         if (!qwen_graph_forward(g, &e->model, &e->weights, prompt->v + i, rows,
-                                  dump || last ? s->logits : NULL)) {
+                                  dump || last ? s->logits : NULL, dump)) {
             if (dump) fclose(dump);
             snprintf(err, errlen, "Qwen3.5 graph prefill failed");
             return 1;
         }
-        if (dump) fwrite(s->logits, sizeof(float), DS4_N_VOCAB, dump);
         for (uint32_t j = 0; j < rows; j++) token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
         i += (int)rows;
         if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
@@ -68389,7 +68400,7 @@ static int qwen_session_sync_graph(ds4_session *s, const ds4_tokens *prompt, cha
 
 static int qwen_session_eval_graph(ds4_session *s, int token, char *err, size_t errlen) {
     ds4_engine *e = s->engine;
-    if (!qwen_graph_forward(&s->qwen_graph, &e->model, &e->weights, &token, 1, s->logits)) {
+    if (!qwen_graph_forward(&s->qwen_graph, &e->model, &e->weights, &token, 1, s->logits, NULL)) {
         snprintf(err, errlen, "Qwen3.5 graph decode failed");
         return 1;
     }
