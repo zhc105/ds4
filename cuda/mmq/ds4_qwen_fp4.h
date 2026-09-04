@@ -16,11 +16,11 @@
 extern "C" {
 #endif
 
-/* Quantise `rows` rows of K f32 values into NVFP4 super-blocks (K % 64 == 0):
- * per 16 values a UE4M3 scale of amax/6 and nearest E2M1 codes.  With `up`
- * the values are SiLU(x) * up (the expert activation), quantised without a
- * f32 round trip. */
-int ds4_qwen_fp4_quantize(const float *x, const float *up, void *xq, int rows, int K, cudaStream_t stream);
+/* Quantise `rows` rows of K values (f32, or bf16 with in_bf16) into NVFP4
+ * super-blocks (K % 64 == 0): per 16 values a UE4M3 scale of amax/6 and
+ * nearest E2M1 codes.  With `up` the values are SiLU(x) * up (the expert
+ * activation), quantised without a round trip through memory. */
+int ds4_qwen_fp4_quantize(const void *x, const void *up, int in_bf16, void *xq, int rows, int K, cudaStream_t stream);
 
 /* Grouped expert GEMM: out[slot][col] = scales[e] * xq[row(slot)] . W[e][col]
  * for every (token, slot) pair, with `plan`/`order` the expert grouping made

@@ -3133,6 +3133,7 @@ int ds4_gpu_qwen35_bf16(ds4_gpu_tensor *dst, const ds4_gpu_tensor *x, uint64_t n
 int ds4_gpu_qwen35_warm(ds4_gpu_tensor *f32, ds4_gpu_tensor *bf16, ds4_gpu_tensor *out);
 int ds4_gpu_qwen35_gdn(
         ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_bf16,
         ds4_gpu_tensor       *mixed,
         ds4_gpu_tensor       *conv_state,
         ds4_gpu_tensor       *ssm_state,
@@ -3154,6 +3155,7 @@ int ds4_gpu_qwen35_gdn(
         float                 eps);
 int ds4_gpu_qwen35_attention(
         ds4_gpu_tensor       *att,
+        ds4_gpu_tensor       *att_bf16,
         ds4_gpu_tensor       *part,
         ds4_gpu_tensor       *split,
         ds4_gpu_tensor       *qg,
@@ -3304,7 +3306,7 @@ int ds4_gpu_qwen4exp_expert_plan(
         uint32_t              n_expert,
         uint32_t              slots);
 int ds4_gpu_qwen4exp_quantize_fp4(
-        ds4_gpu_tensor *xq, const ds4_gpu_tensor *x, const ds4_gpu_tensor *up, uint32_t rows, uint32_t k);
+        ds4_gpu_tensor *xq, const ds4_gpu_tensor *x, const ds4_gpu_tensor *up, int in_bf16, uint32_t rows, uint32_t k);
 int ds4_gpu_qwen4exp_expert_fp4(
         ds4_gpu_tensor       *out,
         const void           *model_map,

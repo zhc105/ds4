@@ -756,7 +756,7 @@ __global__ static void qwen35_gdn_recurrence_kernel(
 /* RMSNormGated per head: normalise, scale, then multiply by the output gate,
  * SiLU(z) for Qwen3.5 and sigmoid(z) for Flash-Next. */
 __global__ static void qwen35_gdn_norm_gate_kernel(
-        float *o, const float *z, const float *norm_w, uint32_t n_v, uint32_t n_tokens,
+        float *o, __nv_bfloat16 *o_bf16, const float *z, const float *norm_w, uint32_t n_v, uint32_t n_tokens,
         uint32_t sigmoid_gate, float eps) {
     __shared__ float scratch[32];
     const uint32_t hd = QWEN35_CUDA_GDN_DIM;
@@ -769,11 +769,14 @@ __global__ static void qwen35_gdn_norm_gate_kernel(
     const float total = qwen35_cuda_block_sum(raw * raw, scratch);
     const float scale = rsqrtf(total / (float)hd + eps);
     const float gate = sigmoid_gate ? qwen35_cuda_sigmoid(z[idx]) : qwen35_cuda_silu(z[idx]);
-    o[idx] = raw * scale * norm_w[tid] * gate;
+    const float v = raw * scale * norm_w[tid] * gate;
+    if (o_bf16) o_bf16[idx] = __float2bfloat16(v);   /* the prefill out projection's operand */
+    else o[idx] = v;
 }
 
 extern "C" int ds4_gpu_qwen35_gdn(
         ds4_gpu_tensor       *out,          /* [n_tok][v_dim] */
+        ds4_gpu_tensor       *out_bf16,     /* optional: the output goes there in bf16 instead (prefill) */
         ds4_gpu_tensor       *mixed,        /* [n_tok][conv_dim] scratch */
         ds4_gpu_tensor       *conv_state,   /* [n_conv-1][conv_dim] */
         ds4_gpu_tensor       *ssm_state,    /* [n_v][hd][hd] */
@@ -833,8 +836,10 @@ extern "C" int ds4_gpu_qwen35_gdn(
         (float *)out->ptr, (float *)ssm_state->ptr, (const float *)mixed->ptr,
         (const float *)alpha->ptr, (const float *)beta->ptr, a_neg, dt_bias,
         n_k, n_v, n_tokens, rsqrtf((float)hd));
+    if (out_bf16 && out_bf16->bytes < (uint64_t)n_tokens * n_v * hd * sizeof(__nv_bfloat16)) return 0;
     qwen35_gdn_norm_gate_kernel<<<dim3(n_tokens, n_v, 1u), hd, 0, stream>>>(
-        (float *)out->ptr, (const float *)z->ptr, norm_w, n_v, n_tokens, sigmoid_gate != 0, eps);
+        (float *)out->ptr, out_bf16 ? (__nv_bfloat16 *)out_bf16->ptr : NULL, (const float *)z->ptr, norm_w,
+        n_v, n_tokens, sigmoid_gate != 0, eps);
     return cuda_ok(cudaGetLastError(), "Qwen3.5 GDN launch");
 }
 
@@ -1044,7 +1049,7 @@ __device__ __forceinline__ void qwen35_ldsm_x4(uint32_t *r, const void *p) {
 }
 
 __global__ static void __launch_bounds__(256, 2) qwen35_attention_tc_kernel(
-        float *att, const float *qg, const __nv_bfloat16 *qh, const __nv_bfloat16 *ql,
+        float *att, __nv_bfloat16 *att_bf16, const float *qg, const __nv_bfloat16 *qh, const __nv_bfloat16 *ql,
         const __nv_bfloat16 *kh, const __nv_bfloat16 *kl, const __nv_bfloat16 *vh, const __nv_bfloat16 *vl,
         const int32_t *sel, const uint32_t *n_sel, uint32_t max_sel,
         uint32_t n_head, uint32_t n_kv, uint32_t pos0, uint32_t n_tokens) {
@@ -1183,17 +1188,23 @@ __global__ static void __launch_bounds__(256, 2) qwen35_attention_tc_kernel(
         const float inv = 1.0f / lsum_s[r];
         const uint64_t head = (uint64_t)t * n_head + head0 + r;
         const float *gate = qg + head * 2u * hd + hd;
-        float *dst = att + head * hd;
         for (uint32_t j = 0; j < 4u; j++) {
             const uint32_t d = warp * 32u + j * 8u + (lane & 3u) * 2u;
-            dst[d] = o[j][half * 2u] * inv * qwen35_cuda_sigmoid(gate[d]);
-            dst[d + 1u] = o[j][half * 2u + 1u] * inv * qwen35_cuda_sigmoid(gate[d + 1u]);
+            const float v0 = o[j][half * 2u] * inv * qwen35_cuda_sigmoid(gate[d]);
+            const float v1 = o[j][half * 2u + 1u] * inv * qwen35_cuda_sigmoid(gate[d + 1u]);
+            if (att_bf16) {   /* the out projection's operand */
+                *(__nv_bfloat162 *)(att_bf16 + head * hd + d) = __floats2bfloat162_rn(v0, v1);
+            } else {
+                att[head * hd + d] = v0;
+                att[head * hd + d + 1u] = v1;
+            }
         }
     }
 }
 
 extern "C" int ds4_gpu_qwen35_attention(
         ds4_gpu_tensor       *att,          /* [n_tok][n_head * hd] */
+        ds4_gpu_tensor       *att_bf16,     /* optional: a prefill chunk's output goes there in bf16 instead */
         ds4_gpu_tensor       *part,         /* split partials, see QWEN35_ATTN_SPLIT_MAX */
         ds4_gpu_tensor       *split,        /* prefill: bf16 hi/lo copies of the caches and queries, see below */
         ds4_gpu_tensor       *qg,           /* [n_tok][n_head * 2 * hd], modified in place */
@@ -1266,8 +1277,9 @@ extern "C" int ds4_gpu_qwen35_attention(
         const unsigned blocks = (unsigned)((kv_elems + 255u) / 256u);
         qwen35_split_bf16_kernel<<<blocks, 256, 0, stream>>>(kh, kl, (const float *)k_cache->ptr, kv_elems);
         qwen35_split_bf16_kernel<<<blocks, 256, 0, stream>>>(vh, vl, (const float *)v_cache->ptr, kv_elems);
+        if (att_bf16 && att_bf16->bytes < (uint64_t)n_tokens * n_head * hd * sizeof(__nv_bfloat16)) return 0;
         qwen35_attention_tc_kernel<<<dim3(n_tokens, n_kv, 1u), 256, 0, stream>>>(
-            (float *)att->ptr, (const float *)qg->ptr, qh, ql, kh, kl, vh, vl,
+            (float *)att->ptr, att_bf16 ? (__nv_bfloat16 *)att_bf16->ptr : NULL, (const float *)qg->ptr, qh, ql, kh, kl, vh, vl,
             sel ? (const int32_t *)sel->ptr : NULL, sel ? (const uint32_t *)n_sel->ptr : NULL, max_sel,
             n_head, n_kv, pos0, n_tokens);
         return cuda_ok(cudaGetLastError(), "Qwen tensor-core attention launch");
@@ -1782,13 +1794,13 @@ extern "C" int ds4_gpu_qwen4exp_expert_plan(
  * dequantised.  This is the checkpoint's activation recipe, the one vLLM
  * and SGLang run. */
 extern "C" int ds4_gpu_qwen4exp_quantize_fp4(
-        ds4_gpu_tensor *xq, const ds4_gpu_tensor *x, const ds4_gpu_tensor *up, uint32_t rows, uint32_t k) {
+        ds4_gpu_tensor *xq, const ds4_gpu_tensor *x, const ds4_gpu_tensor *up, int in_bf16, uint32_t rows, uint32_t k) {
+    const uint64_t in_bytes = (uint64_t)rows * k * (in_bf16 ? sizeof(__nv_bfloat16) : sizeof(float));
     if (!xq || !x || rows == 0u || k == 0u || k % 64u != 0u ||
-        x->bytes < (uint64_t)rows * k * sizeof(float) || xq->bytes < (uint64_t)rows * (k / 64u) * 36u ||
-        (up && up->bytes < (uint64_t)rows * k * sizeof(float))) {
+        x->bytes < in_bytes || xq->bytes < (uint64_t)rows * (k / 64u) * 36u || (up && up->bytes < in_bytes)) {
         return 0;
     }
-    return ds4_qwen_fp4_quantize((const float *)x->ptr, up ? (const float *)up->ptr : NULL, xq->ptr,
+    return ds4_qwen_fp4_quantize(x->ptr, up ? up->ptr : NULL, in_bf16, xq->ptr,
                                  (int)rows, (int)k, cuda_decode_stream()) == 0 &&
            cuda_ok(cudaGetLastError(), "Flash-Next FP4 activation quantize launch");
 }

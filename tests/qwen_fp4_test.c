@@ -78,7 +78,7 @@ static int run(int K, int M) {
     void *dord = dev_copy(order, sizeof order), *dplan = dev_copy(plan, sizeof plan);
     void *dout = dev_copy(NULL, (size_t)SLOTS * M * sizeof(float));
     if (!dw || !dsc || !dx || !dxq || !dord || !dplan || !dout) return 1;
-    if (ds4_qwen_fp4_quantize(dx, NULL, dxq, ROWS, K, 0) != 0 ||
+    if (ds4_qwen_fp4_quantize(dx, NULL, 0, dxq, ROWS, K, 0) != 0 ||
         ds4_qwen_fp4_moe_gemm(dw, dsc, dxq, 0, dord, dplan, N_EXPERT, N_USED, K, M, ROWS, dout, 0, 0) != 0 ||
         cudaDeviceSynchronize() != cudaSuccess) {
         fprintf(stderr, "fp4-test: launch failed: %s\n", cudaGetErrorString(cudaGetLastError()));
