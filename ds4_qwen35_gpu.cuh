@@ -432,8 +432,19 @@ __global__ static void qwen35_split_bf16_kernel(__nv_bfloat16 *hi, __nv_bfloat16
 }
 
 __global__ static void qwen35_to_bf16_kernel(__nv_bfloat16 *dst, const float *x, uint64_t n) {
-    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2bfloat16(x[i]);
+    const uint64_t i = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) * 4u;
+    if (i + 4u <= n) {
+        const float4 v = *(const float4 *)(x + i);
+        *(__nv_bfloat162 *)(dst + i) = __floats2bfloat162_rn(v.x, v.y);
+        *(__nv_bfloat162 *)(dst + i + 2u) = __floats2bfloat162_rn(v.z, v.w);
+    } else {
+        for (uint64_t j = i; j < n; j++) dst[j] = __float2bfloat16(x[j]);
+    }
+}
+
+/* Launch helper: four elements per thread. */
+static void qwen35_to_bf16(__nv_bfloat16 *dst, const float *x, uint64_t n, cudaStream_t stream) {
+    qwen35_to_bf16_kernel<<<(unsigned)((n + 1023u) / 1024u), 256, 0, stream>>>(dst, x, n);
 }
 
 /* BF16-weight prefill GEMM through cuBLAS on bf16 activations with f32
@@ -451,7 +462,7 @@ static int qwen35_cublas_bf16(
     if (!a) {
         __nv_bfloat16 *buf = (__nv_bfloat16 *)cuda_tmp_alloc_on(tier, n * sizeof(__nv_bfloat16), "Qwen bf16 activations");
         if (!buf) return 0;
-        qwen35_to_bf16_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(buf, x, n);
+        qwen35_to_bf16(buf, x, n, stream);
         if (!cuda_ok(cudaGetLastError(), "Qwen bf16 convert launch")) return 0;
         a = buf;
     }
@@ -466,9 +477,32 @@ static int qwen35_cublas_bf16(
 /* Round an activation buffer to bf16 once for the matmuls that share it. */
 extern "C" int ds4_gpu_qwen35_bf16(ds4_gpu_tensor *dst, const ds4_gpu_tensor *x, uint64_t n) {
     if (n == 0u || !dst || !x || dst->bytes < n * sizeof(__nv_bfloat16) || x->bytes < n * sizeof(float)) return 0;
-    qwen35_to_bf16_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
-        (__nv_bfloat16 *)dst->ptr, (const float *)x->ptr, n);
+    qwen35_to_bf16((__nv_bfloat16 *)dst->ptr, (const float *)x->ptr, n, cuda_decode_stream());
     return cuda_ok(cudaGetLastError(), "Qwen bf16 convert launch");
+}
+
+/* cuBLAS loads its GEMM kernels on first use, a few hundred milliseconds
+ * that would otherwise land in the first prompt's prefill: run one small
+ * bf16 and one f32 GEMM over scratch at graph creation. */
+extern "C" int ds4_gpu_qwen35_warm(ds4_gpu_tensor *f32, ds4_gpu_tensor *bf16, ds4_gpu_tensor *out) {
+    const uint32_t d = 64u;
+    if (!g_cublas_ready) return 1;
+    if (!f32 || !bf16 || !out || f32->bytes < (uint64_t)d * d * sizeof(float) ||
+        bf16->bytes < (uint64_t)d * d * sizeof(__nv_bfloat16) || out->bytes < (uint64_t)d * d * sizeof(float)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(out);
+    cublasHandle_t handle = cuda_cublas_for_tier(tier);
+    const float one = 1.0f, zero = 0.0f;
+    cublasStatus_t st = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, (int)d, (int)d, (int)d,
+                                     &one, bf16->ptr, CUDA_R_16BF, (int)d, bf16->ptr, CUDA_R_16BF, (int)d,
+                                     &zero, out->ptr, CUDA_R_32F, (int)d, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (st == CUBLAS_STATUS_SUCCESS) {
+        st = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, (int)d, (int)d, (int)d,
+                          &one, f32->ptr, CUDA_R_32F, (int)d, f32->ptr, CUDA_R_32F, (int)d,
+                          &zero, out->ptr, CUDA_R_32F, (int)d, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT);
+    }
+    return cublas_ok(st, "Qwen cuBLAS warm-up") && cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "Qwen warm-up sync");
 }
 
 /* Opt a tensor-core kernel into its dynamic shared memory once. */
@@ -531,14 +565,15 @@ extern "C" int ds4_gpu_qwen35_matmul(
     const float *xp = (const float *)x->ptr;
     if (n_tok > 8u) {
         if (wtype == QWEN35_W_F32) {
-            /* exact f32 (cuBLAS' default math mode keeps TF32 off); the
-             * router's top-k depends on it */
+            /* exact f32: the handle allows TF32, which the pedantic compute
+             * type overrides; the router's top-k depends on it */
             if (g_cublas_ready) {
                 const float beta = 0.0f;
-                cublasStatus_t st = cublasSgemm(cuda_cublas_for_tier(ds4_tensor_device_idx(out)),
-                                                CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_tok, (int)in_dim,
-                                                &scale, (const float *)w, (int)in_dim, xp, (int)in_dim,
-                                                &beta, o, (int)out_dim);
+                cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(ds4_tensor_device_idx(out)),
+                                                 CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_tok, (int)in_dim,
+                                                 &scale, w, CUDA_R_32F, (int)in_dim, xp, CUDA_R_32F, (int)in_dim,
+                                                 &beta, o, CUDA_R_32F, (int)out_dim,
+                                                 CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT);
                 return cublas_ok(st, "Qwen f32 GEMM");
             }
             const dim3 grid((n_tok + 63u) / 64u, (out_dim + 63u) / 64u, 1u);
@@ -1261,9 +1296,11 @@ static bool qwen4exp_elems_fit(const ds4_gpu_tensor *t, uint64_t elems) {
 }
 
 /* RMSNorm of every stream with its own slice of the [n_hc * n] gamma: block
- * per (token, stream). */
+ * per (token, stream).  With out_bf16 the result is also written rounded
+ * to bf16, the operand of the prefill GEMMs that read it. */
 __global__ static void qwen4exp_stream_norm_kernel(
-        float *out, const float *x, const float *gamma, uint32_t n, uint32_t n_hc, uint32_t rows, float eps) {
+        float *out, __nv_bfloat16 *out_bf16, const float *x, const float *gamma,
+        uint32_t n, uint32_t n_hc, uint32_t rows, float eps) {
     __shared__ float scratch[32];
     const uint32_t row = blockIdx.x;
     if (row >= rows * n_hc) return;
@@ -1274,11 +1311,16 @@ __global__ static void qwen4exp_stream_norm_kernel(
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) ss = fmaf(xr[i], xr[i], ss);
     ss = qwen35_cuda_block_sum(ss, scratch);
     const float scale = rsqrtf(ss / (float)n + eps);
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) o[i] = xr[i] * scale * g[i];
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i] * scale * g[i];
+        o[i] = v;
+        if (out_bf16) out_bf16[(uint64_t)row * n + i] = __float2bfloat16(v);
+    }
 }
 
 extern "C" int ds4_gpu_qwen4exp_stream_norm(
         ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_bf16,     /* optional bf16 copy */
         const ds4_gpu_tensor *x,
         const void           *model_map,
         uint64_t              model_size,
@@ -1289,14 +1331,16 @@ extern "C" int ds4_gpu_qwen4exp_stream_norm(
         float                 eps) {
     const uint64_t elems = (uint64_t)rows * n_hc * n_embd;
     if (!model_map || n_embd == 0u || n_hc == 0u || rows == 0u ||
-        !qwen4exp_elems_fit(out, elems) || !qwen4exp_elems_fit(x, elems)) {
+        !qwen4exp_elems_fit(out, elems) || !qwen4exp_elems_fit(x, elems) ||
+        (out_bf16 && out_bf16->bytes < elems * sizeof(__nv_bfloat16))) {
         return 0;
     }
     const float *gamma = glm53_cuda_weight_f32(model_map, model_size, gamma_offset,
                                                (uint64_t)n_hc * n_embd, ds4_tensor_device_idx(out), "hc norm");
     if (!gamma) return 0;
     qwen4exp_stream_norm_kernel<<<rows * n_hc, 256, 0, cuda_decode_stream()>>>(
-        (float *)out->ptr, (const float *)x->ptr, gamma, n_embd, n_hc, rows, eps);
+        (float *)out->ptr, out_bf16 ? (__nv_bfloat16 *)out_bf16->ptr : NULL, (const float *)x->ptr, gamma,
+        n_embd, n_hc, rows, eps);
     return cuda_ok(cudaGetLastError(), "Flash-Next stream norm launch");
 }
 

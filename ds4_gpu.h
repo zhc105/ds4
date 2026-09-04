@@ -3130,6 +3130,7 @@ int ds4_gpu_qwen35_matmul(
         const ds4_gpu_tensor *x_bf16,
         uint32_t              n_tok);
 int ds4_gpu_qwen35_bf16(ds4_gpu_tensor *dst, const ds4_gpu_tensor *x, uint64_t n);
+int ds4_gpu_qwen35_warm(ds4_gpu_tensor *f32, ds4_gpu_tensor *bf16, ds4_gpu_tensor *out);
 int ds4_gpu_qwen35_gdn(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mixed,
@@ -3220,6 +3221,7 @@ int ds4_gpu_qwen4exp_qsa_select(
         uint32_t              n_tokens);
 int ds4_gpu_qwen4exp_stream_norm(
         ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_bf16,
         const ds4_gpu_tensor *x,
         const void           *model_map,
         uint64_t              model_size,

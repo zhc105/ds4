@@ -16259,6 +16259,7 @@ typedef struct {
      * normalised streams and inject weights for the combine, like the CPU
      * state. */
     ds4_gpu_tensor *xn;          /* hc: normalised streams */
+    ds4_gpu_tensor *xn_bf16;     /* hc prefill: the same rounded to bf16 for the GEMMs that read it */
     ds4_gpu_tensor *lo;          /* hc: [max_rows][n_hc_low] */
     ds4_gpu_tensor *hgate;       /* hc: stream gate; PLE reuses it for the gated value */
     ds4_gpu_tensor *inject;      /* hc: [max_rows][n_hc] */
@@ -16308,7 +16309,7 @@ static void qwen_graph_free(ds4_qwen_gpu_graph *g) {
     }
     ds4_gpu_tensor **scratch[] = { &g->tokens, &g->x, &g->h, &g->h_bf16, &g->y, &g->proj, &g->mixed,
                                    &g->z, &g->alpha, &g->beta, &g->k, &g->v, &g->att, &g->att_part, &g->att_split, &g->logits,
-                                   &g->xn, &g->lo, &g->hgate, &g->inject, &g->emb, &g->pkey, &g->pval, &g->pnorm,
+                                   &g->xn, &g->xn_bf16, &g->lo, &g->hgate, &g->inject, &g->emb, &g->pkey, &g->pval, &g->pnorm,
                                    &g->ple_hist, &g->router, &g->esel, &g->selw, &g->eg, &g->eu, &g->ed, &g->sg,
                                    &g->eorder, &g->eplan, &g->hq, &g->egq, &g->ikraw, &g->iq, &g->sel, &g->n_sel, &g->skeys };
     for (size_t i = 0; i < sizeof(scratch) / sizeof(scratch[0]); i++) {
@@ -16399,6 +16400,7 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
     g->logits = qwen_graph_tensor(DS4_N_VOCAB, &ok);
     if (ds4_qwen_has_hc()) {
         g->xn = qwen_graph_tensor(rows * x_dim, &ok);
+        g->xn_bf16 = qwen_graph_tensor(rows * x_dim / 2u, &ok);
         g->lo = qwen_graph_tensor(rows * DS4_N_HC_LOW, &ok);
         g->hgate = qwen_graph_tensor(rows * x_dim, &ok);
         g->inject = qwen_graph_tensor(rows * DS4_N_HC, &ok);
@@ -16426,6 +16428,7 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
         g->egq = qwen_graph_tensor(slots * (DS4_N_FF_EXP / 64u) * 9u, &ok);
     }
     if (ok) ok = qwen_graph_reset(g);
+    if (ok) ok = ds4_gpu_qwen35_warm(g->h, g->h_bf16, g->y) != 0;
     if (!ok) qwen_graph_free(g);
     return ok;
 }
@@ -16440,6 +16443,18 @@ static bool qwen_graph_matmul(
         uint32_t          n_tok) {
     return ds4_gpu_qwen35_matmul(out, m->map, m->size, w->abs_offset, w->type, w->scale,
                                  (uint32_t)w->dim[0], (uint32_t)w->dim[1], x, NULL, n_tok) != 0;
+}
+
+/* The same with a bf16 copy of x that the producer already wrote. */
+static bool qwen_graph_matmul_bf16(
+        ds4_gpu_tensor   *out,
+        const ds4_model  *m,
+        const ds4_tensor *w,
+        ds4_gpu_tensor   *x,
+        ds4_gpu_tensor   *x_bf16,
+        uint32_t          n_tok) {
+    return ds4_gpu_qwen35_matmul(out, m->map, m->size, w->abs_offset, w->type, w->scale,
+                                 (uint32_t)w->dim[0], (uint32_t)w->dim[1], x, x_bf16, n_tok) != 0;
 }
 
 /* The same over the sub-layer input h, whose bf16 copy qwen_graph_sublayer_in
@@ -16464,13 +16479,15 @@ static bool qwen_graph_hc_mix(
         uint32_t                   n,
         ds4_gpu_tensor            *mixed,
         ds4_gpu_tensor            *inject) {
-    bool ok = ds4_gpu_qwen4exp_stream_norm(g->xn, x, m->map, m->size, hc->norm->abs_offset,
+    /* prefill GEMMs read the normalised streams through their bf16 copy */
+    ds4_gpu_tensor *xn_bf16 = n > 8u ? g->xn_bf16 : NULL;
+    bool ok = ds4_gpu_qwen4exp_stream_norm(g->xn, xn_bf16, x, m->map, m->size, hc->norm->abs_offset,
                                            DS4_N_EMBD, DS4_N_HC, n, DS4_RMS_EPS) != 0;
-    if (ok) ok = qwen_graph_matmul(g->lo, m, hc->down, g->xn, n);
+    if (ok) ok = qwen_graph_matmul_bf16(g->lo, m, hc->down, g->xn, xn_bf16, n);
     if (ok) ok = ds4_gpu_qwen4exp_hc_low(g->lo, DS4_N_HC_LOW, DS4_N_HC, n) != 0;
     if (ok) ok = qwen_graph_matmul(g->hgate, m, hc->up, g->lo, n);
     if (ok) ok = ds4_gpu_qwen4exp_hc_mix(mixed, g->xn, g->hgate, DS4_N_EMBD, DS4_N_HC, n) != 0;
-    if (ok && inject) ok = qwen_graph_matmul(inject, m, hc->inject, g->xn, n);
+    if (ok && inject) ok = qwen_graph_matmul_bf16(inject, m, hc->inject, g->xn, xn_bf16, n);
     return ok;
 }
 
