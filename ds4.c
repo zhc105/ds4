@@ -16254,6 +16254,7 @@ typedef struct {
     ds4_gpu_tensor *v;
     ds4_gpu_tensor *att;         /* GDN or attention output before the out proj */
     ds4_gpu_tensor *att_part;    /* decode attention split partials */
+    ds4_gpu_tensor *att_split;   /* prefill attention: bf16 hi/lo copies of K/V cache rows and queries */
     ds4_gpu_tensor *logits;      /* [n_vocab] */
     /* Flash-Next.  x is then [max_rows][n_hc][n_embd]; the mixer leaves the
      * normalised streams and inject weights for the combine, like the CPU
@@ -16307,7 +16308,7 @@ static void qwen_graph_free(ds4_qwen_gpu_graph *g) {
         if (g->khist[il]) ds4_gpu_tensor_free(g->khist[il]);
     }
     ds4_gpu_tensor **scratch[] = { &g->tokens, &g->x, &g->h, &g->h_hi, &g->h_lo, &g->y, &g->proj, &g->mixed,
-                                   &g->z, &g->alpha, &g->beta, &g->k, &g->v, &g->att, &g->att_part, &g->logits,
+                                   &g->z, &g->alpha, &g->beta, &g->k, &g->v, &g->att, &g->att_part, &g->att_split, &g->logits,
                                    &g->xn, &g->lo, &g->hgate, &g->inject, &g->emb, &g->pkey, &g->pval, &g->pnorm,
                                    &g->ple_hist, &g->router, &g->esel, &g->selw, &g->eg, &g->eu, &g->ed, &g->sg,
                                    &g->eorder, &g->eplan, &g->hq, &g->egq, &g->ikraw, &g->iq, &g->sel, &g->n_sel, &g->skeys };
@@ -16395,6 +16396,8 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
     g->att = qwen_graph_tensor(rows * qwen_max_u64(v_dim, attn_dim), &ok);
     /* up to 8 decode rows x heads x 64 key splits x (values, max, sum) */
     g->att_part = qwen_graph_tensor(8ull * DS4_N_HEAD * 64ull * (DS4_N_HEAD_DIM + 2u), &ok);
+    /* prefill: bf16 hi/lo copies of the K and V caches and of the chunk's queries */
+    g->att_split = qwen_graph_tensor((4ull * ctx * kv_dim + 2ull * rows * attn_dim) / 2u, &ok);
     g->logits = qwen_graph_tensor(DS4_N_VOCAB, &ok);
     if (ds4_qwen_has_hc()) {
         g->xn = qwen_graph_tensor(rows * x_dim, &ok);
@@ -16660,7 +16663,7 @@ static bool qwen_graph_layer(
         if (ok) ok = qwen_graph_matmul_h(g, g->proj, m, l->attn_q, n);
         if (ok) ok = qwen_graph_matmul_h(g, g->k, m, l->attn_k, n);
         if (ok) ok = qwen_graph_matmul_h(g, g->v, m, l->attn_v, n);
-        if (ok) ok = ds4_gpu_qwen35_attention(g->att, g->att_part, g->proj, g->k_cache[il], g->v_cache[il],
+        if (ok) ok = ds4_gpu_qwen35_attention(g->att, g->att_part, g->att_split, g->proj, g->k_cache[il], g->v_cache[il],
                                               g->k, g->v, sparse ? g->sel : NULL, g->n_sel, g->max_sel,
                                               m->map, m->size,
                                               l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,

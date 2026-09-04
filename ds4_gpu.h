@@ -3155,6 +3155,7 @@ int ds4_gpu_qwen35_gdn(
 int ds4_gpu_qwen35_attention(
         ds4_gpu_tensor       *att,
         ds4_gpu_tensor       *part,
+        ds4_gpu_tensor       *split,
         ds4_gpu_tensor       *qg,
         ds4_gpu_tensor       *k_cache,
         ds4_gpu_tensor       *v_cache,
