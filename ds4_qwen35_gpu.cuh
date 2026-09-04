@@ -843,6 +843,98 @@ __global__ static void qwen35_attention_merge_kernel(
     att[((uint64_t)t * n_head + h) * hd + tid] = acc / sum * qwen35_cuda_sigmoid(gate[tid]);
 }
 
+/* ---- Grouped prefill attention -------------------------------------------
+ * f32 attention for a prefill chunk, block per (token, KV head): the
+ * group's query heads share every gathered K/V row, so a 16-cell tile of
+ * K and V is staged in shared memory once and dotted with all the group's
+ * queries.  Online softmax per head; each thread owns one value dimension
+ * for every head of the group.  Works for the causal prefix and for a QSA
+ * cell list alike, exactly in f32. */
+#define QWEN35_GA_TILE 16u
+#define QWEN35_GA_MAX_GROUP 16u
+#define QWEN35_GA_LDK 257u                                  /* padded K row so the 16 keys hit different banks */
+
+__global__ static void qwen35_attention_group_kernel(
+        float *att, const float *qg, const float *k_cache, const float *v_cache,
+        const int32_t *sel, const uint32_t *n_sel, uint32_t max_sel,
+        uint32_t n_head, uint32_t n_kv, uint32_t hd, uint32_t pos0, uint32_t n_tokens) {
+    __shared__ float qs[QWEN35_GA_MAX_GROUP][256];
+    __shared__ float kt[QWEN35_GA_TILE][QWEN35_GA_LDK];
+    __shared__ float vt[QWEN35_GA_TILE][256];
+    __shared__ float sc[QWEN35_GA_MAX_GROUP][QWEN35_GA_TILE];
+    __shared__ float rmax[QWEN35_GA_MAX_GROUP], rsum[QWEN35_GA_MAX_GROUP], alpha[QWEN35_GA_MAX_GROUP];
+    const uint32_t t = blockIdx.x;
+    const uint32_t kvh = blockIdx.y;
+    const uint32_t group = n_head / n_kv;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t n_cells = sel ? n_sel[t] : pos0 + t + 1u;
+    const int32_t *cells = sel ? sel + (uint64_t)t * max_sel : NULL;
+    const uint64_t kv_stride = (uint64_t)n_kv * hd;
+    const float scale = rsqrtf((float)hd);
+    for (uint32_t h = 0; h < group; h++) {
+        qs[h][tid] = qg[((uint64_t)t * n_head + kvh * group + h) * 2u * hd + tid];
+    }
+    if (tid < group) {
+        rmax[tid] = -INFINITY;
+        rsum[tid] = 0.0f;
+    }
+    float o[QWEN35_GA_MAX_GROUP];
+    for (uint32_t h = 0; h < QWEN35_GA_MAX_GROUP; h++) o[h] = 0.0f;
+    const uint32_t sh = tid / QWEN35_GA_TILE;               /* this thread's (head, key) in the score tile */
+    const uint32_t sj = tid % QWEN35_GA_TILE;
+    for (uint32_t c0 = 0; c0 < n_cells; c0 += QWEN35_GA_TILE) {
+        __syncthreads();
+        for (uint32_t j = 0; j < QWEN35_GA_TILE; j++) {
+            const uint32_t c = c0 + j;
+            if (c < n_cells) {
+                const uint64_t row = (uint64_t)(cells ? (uint32_t)cells[c] : c) * kv_stride + kvh * hd;
+                kt[j][tid] = k_cache[row + tid];
+                vt[j][tid] = v_cache[row + tid];
+            } else {
+                /* masked cells get zero probability, and 0 * garbage must not be NaN */
+                kt[j][tid] = 0.0f;
+                vt[j][tid] = 0.0f;
+            }
+        }
+        __syncthreads();
+        if (sh < group) {
+            float s = -INFINITY;
+            if (c0 + sj < n_cells) {
+                s = 0.0f;
+                for (uint32_t d = 0; d < hd; d++) s = fmaf(qs[sh][d], kt[sj][d], s);
+                s *= scale;
+            }
+            sc[sh][sj] = s;
+        }
+        __syncthreads();
+        if (tid < group) {
+            float m = rmax[tid];
+            for (uint32_t j = 0; j < QWEN35_GA_TILE; j++) m = fmaxf(m, sc[tid][j]);
+            const float a = expf(rmax[tid] - m);
+            float sum = rsum[tid] * a;
+            for (uint32_t j = 0; j < QWEN35_GA_TILE; j++) {
+                const float p = c0 + j < n_cells ? expf(sc[tid][j] - m) : 0.0f;
+                sc[tid][j] = p;
+                sum += p;
+            }
+            rmax[tid] = m;
+            rsum[tid] = sum;
+            alpha[tid] = a;
+        }
+        __syncthreads();
+        for (uint32_t h = 0; h < group; h++) {
+            float acc = o[h] * alpha[h];
+            for (uint32_t j = 0; j < QWEN35_GA_TILE; j++) acc = fmaf(sc[h][j], vt[j][tid], acc);
+            o[h] = acc;
+        }
+    }
+    for (uint32_t h = 0; h < group; h++) {
+        const uint64_t head = (uint64_t)t * n_head + kvh * group + h;
+        const float gate = qg[head * 2u * hd + hd + tid];
+        att[head * hd + tid] = o[h] / rsum[h] * qwen35_cuda_sigmoid(gate);
+    }
+}
+
 extern "C" int ds4_gpu_qwen35_attention(
         ds4_gpu_tensor       *att,          /* [n_tok][n_head * hd] */
         ds4_gpu_tensor       *part,         /* split partials, see QWEN35_ATTN_SPLIT_MAX */
@@ -896,6 +988,14 @@ extern "C" int ds4_gpu_qwen35_attention(
         (float *)qg->ptr, (float *)k_cache->ptr, (float *)v_cache->ptr,
         (const float *)k->ptr, (const float *)v->ptr, q_norm, k_norm,
         n_head, n_kv, hd, n_rot, pos0, n_tokens, freq_base, eps);
+    /* Prefill chunks with a cell list take the grouped kernel. */
+    if (n_tokens > QWEN35_ATTN_SPLIT_ROWS && hd == 256u && n_head / n_kv <= QWEN35_GA_MAX_GROUP) {
+        qwen35_attention_group_kernel<<<dim3(n_tokens, n_kv, 1u), 256, 0, stream>>>(
+            (float *)att->ptr, (const float *)qg->ptr, (const float *)k_cache->ptr, (const float *)v_cache->ptr,
+            sel ? (const int32_t *)sel->ptr : NULL, sel ? (const uint32_t *)n_sel->ptr : NULL, max_sel,
+            n_head, n_kv, hd, pos0, n_tokens);
+        return cuda_ok(cudaGetLastError(), "Qwen grouped attention launch");
+    }
     /* Decode-sized batches split the key range so enough blocks are in flight. */
     const uint32_t n_keys = sel ? max_sel : pos0 + n_tokens;
     uint32_t n_splits = 1u;
