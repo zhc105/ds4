@@ -16382,7 +16382,8 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
         g->skeys = qwen_graph_tensor(2ull * QWEN_QSA_SELECT_ROWS * (ctx / 2u), &ok);   /* uint64 keys, ratio >= 2 */
     }
     g->tokens = qwen_graph_tensor(rows, &ok);
-    g->x = qwen_graph_tensor(rows * x_dim, &ok);
+    /* the hc residual streams are bf16 (the checkpoint's recipe), the plain residual f32 */
+    g->x = qwen_graph_tensor(ds4_qwen_has_hc() ? rows * x_dim / 2u : rows * x_dim, &ok);
     g->h = qwen_graph_tensor(rows * DS4_N_EMBD, &ok);
     g->h_bf16 = qwen_graph_tensor(rows * DS4_N_EMBD / 2u, &ok);
     g->y = qwen_graph_tensor(rows * DS4_N_EMBD, &ok);
@@ -16480,11 +16481,12 @@ static bool qwen_graph_hc_mix(
         uint32_t                   n,
         ds4_gpu_tensor            *mixed,
         ds4_gpu_tensor            *inject) {
-    /* prefill GEMMs read the normalised streams through their bf16 copy;
-     * the previous sub-layer's combine may have normalised them already */
+    /* the normalised streams are bf16; decode's matvecs read a f32 copy,
+     * prefill's GEMMs the bf16 rows.  The previous sub-layer's combine may
+     * have normalised them already. */
     ds4_gpu_tensor *xn_bf16 = n > 8u ? g->xn_bf16 : NULL;
     bool ok = g->xn_ready ||
-              ds4_gpu_qwen4exp_stream_norm(g->xn, xn_bf16, x, m->map, m->size, hc->norm->abs_offset,
+              ds4_gpu_qwen4exp_stream_norm(n > 8u ? NULL : g->xn, g->xn_bf16, x, m->map, m->size, hc->norm->abs_offset,
                                            DS4_N_EMBD, DS4_N_HC, n, DS4_RMS_EPS) != 0;
     g->xn_ready = false;
     if (ok) ok = qwen_graph_matmul_bf16(g->lo, m, hc->down, g->xn, xn_bf16, n);
@@ -16496,7 +16498,7 @@ static bool qwen_graph_hc_mix(
                                        g->lo, DS4_N_HC_LOW, (uint32_t)(DS4_N_HC * DS4_N_EMBD), n) != 0
             : qwen_graph_matmul(g->hgate, m, hc->up, g->lo, n);
     }
-    if (ok) ok = ds4_gpu_qwen4exp_hc_mix(mixed, g->xn, g->hgate, xn_bf16 != NULL, DS4_N_EMBD, DS4_N_HC, n) != 0;
+    if (ok) ok = ds4_gpu_qwen4exp_hc_mix(mixed, g->xn_bf16, g->hgate, xn_bf16 != NULL, DS4_N_EMBD, DS4_N_HC, n) != 0;
     if (ok && inject) ok = qwen_graph_matmul_bf16(inject, m, hc->inject, g->xn, xn_bf16, n);
     return ok;
 }
@@ -16526,7 +16528,7 @@ static bool qwen_graph_sublayer_out(
         uint32_t                   n) {
     if (!ds4_qwen_has_hc()) return ds4_gpu_add_tensor(g->x, g->x, g->y, n * DS4_N_EMBD) != 0;
     if (!next) return ds4_gpu_qwen4exp_hc_combine(g->x, g->y, g->inject, DS4_N_EMBD, DS4_N_HC, n) != 0;
-    g->xn_ready = ds4_gpu_qwen4exp_hc_combine_norm(g->x, g->xn, n > 8u ? g->xn_bf16 : NULL, g->y, g->inject,
+    g->xn_ready = ds4_gpu_qwen4exp_hc_combine_norm(g->x, n > 8u ? NULL : g->xn, g->xn_bf16, g->y, g->inject,
                                                    m->map, m->size, next->norm->abs_offset,
                                                    DS4_N_EMBD, DS4_N_HC, n, DS4_RMS_EPS) != 0;
     return g->xn_ready;
@@ -16729,7 +16731,17 @@ static bool qwen_graph_layer(
         const uint64_t nx = ds4_qwen_has_hc() ? (uint64_t)DS4_N_HC * DS4_N_EMBD : DS4_N_EMBD;
         float *buf = xmalloc(nx * sizeof(float));
         double sx = 0, sh = 0, sy = 0;
-        if (ds4_gpu_tensor_read(g->x, (uint64_t)(n - 1u) * nx * sizeof(float), buf, nx * sizeof(float))) {
+        if (ds4_qwen_has_hc()) {
+            uint16_t *hb = (uint16_t *)buf;   /* bf16 streams */
+            if (ds4_gpu_tensor_read(g->x, (uint64_t)(n - 1u) * nx * 2u, hb, nx * 2u)) {
+                for (uint64_t i = 0; i < nx; i++) {
+                    const uint32_t bits = (uint32_t)hb[i] << 16;
+                    float v;
+                    memcpy(&v, &bits, sizeof v);
+                    sx += (double)v * v;
+                }
+            }
+        } else if (ds4_gpu_tensor_read(g->x, (uint64_t)(n - 1u) * nx * sizeof(float), buf, nx * sizeof(float))) {
             for (uint64_t i = 0; i < nx; i++) sx += (double)buf[i] * buf[i];
         }
         if (ds4_gpu_tensor_read(g->h, (uint64_t)(n - 1u) * DS4_N_EMBD * sizeof(float), buf, DS4_N_EMBD * sizeof(float))) {
@@ -16774,8 +16786,9 @@ static bool qwen_graph_head(
         const ds4_weights    *w,
         uint32_t              row) {
     const uint64_t x_dim = ds4_qwen_has_hc() ? (uint64_t)DS4_N_HC * DS4_N_EMBD : DS4_N_EMBD;
+    const uint64_t x_elem = ds4_qwen_has_hc() ? 2u : sizeof(float);   /* bf16 streams, f32 residual */
     const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-    ds4_gpu_tensor *x = ds4_gpu_tensor_view(g->x, (uint64_t)row * x_dim * sizeof(float), x_dim * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_view(g->x, (uint64_t)row * x_dim * x_elem, x_dim * x_elem);
     ds4_gpu_tensor *h = ds4_gpu_tensor_view(g->h, 0, row_bytes);
     bool ok = x && h;
     if (ok) {
