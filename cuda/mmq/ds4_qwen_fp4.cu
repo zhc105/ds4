@@ -11,12 +11,7 @@
 namespace {
 
 constexpr int TILE_ROWS = 32;                 /* slots per tile, matches the expert plan */
-constexpr int TILE_COLS = 128;                /* output columns per block */
-constexpr int KSTEP     = 2;                  /* super-blocks per K step: 72-byte row segments */
 constexpr int MAX_EXPERT = 512;
-constexpr int SEG_U2    = KSTEP * 36 / 8;     /* 8-byte words per row segment */
-constexpr int ITEMS     = (TILE_ROWS + TILE_COLS) * SEG_U2;
-constexpr int PER_THREAD = (ITEMS + 255) / 256;
 
 /* The plan arrays, in the order ds4_gpu_qwen4exp_expert_plan writes them. */
 enum { PLAN_COUNT = 0, PLAN_START = 1, PLAN_TILE = 2 };
@@ -87,19 +82,31 @@ __device__ __forceinline__ void mma_nvfp4(float c[4], const uint32_t a[4], const
 }
 
 /* Block (row tile, column tile), 32 x 8 threads: the row tile maps through
- * the plan to one expert and up to 32 of its slots.  Each K step stages two
- * super-blocks per row of both operands (codes for ldmatrix, the packed
- * scales beside them) in one of two shared buffers; the next step's 8-byte
- * global loads are issued before the current step's MMAs so their latency
- * overlaps, and one barrier per step separates the buffers.  Warp w owns
- * rows 16*(w/4).. and columns 32*(w%4).., four MMAs per super-block. */
-__global__ void __launch_bounds__(256, 3) moe_gemm_kernel(
+ * the plan to one expert and up to 32 of its slots, the column tile covers
+ * COLS outputs.  Each K step stages KS super-blocks per row of both
+ * operands (codes for ldmatrix, the packed scales beside them) in one of
+ * two shared buffers; the next step's 8-byte global loads are issued
+ * before the current step's MMAs so their latency overlaps, and one
+ * barrier per step separates the buffers.  Long segments keep more of
+ * every fetched 32-byte sector, so K a multiple of 256 takes KS = 4
+ * (144-byte rows, the shared-memory limit at 128 columns) and the K = 640
+ * down projection KS = 2; a whole-row single-buffer variant and 64-column
+ * tiles were both slower.  Warp w owns rows 16*(w/4).. and columns
+ * (COLS/4)*(w%4).. . */
+template <int KS, int COLS>
+__global__ void __launch_bounds__(256, 2) moe_gemm_kernel(
         float *out, const block_nvfp4 *W, const float *scales, const block_nvfp4 *xq, uint32_t x_per_slot,
         const int32_t *order, const uint32_t *plan, uint32_t n_expert, uint32_t n_used, uint32_t K, uint32_t M) {
-    __shared__ __align__(16) uint32_t a_qs[2][KSTEP][TILE_ROWS * 8];
-    __shared__ __align__(16) uint32_t b_qs[2][KSTEP][TILE_COLS * 8];
-    __shared__ uint32_t a_sc[2][KSTEP][TILE_ROWS];
-    __shared__ uint32_t b_sc[2][KSTEP][TILE_COLS];
+    constexpr int SEG_U2 = KS * 36 / 8;                       /* 8-byte words per row segment */
+    constexpr int ITEMS = (TILE_ROWS + COLS) * SEG_U2;        /* words staged per step */
+    constexpr int PER_THREAD = (ITEMS + 255) / 256;
+    constexpr int NT = COLS / 32;                             /* n-tiles per warp */
+    constexpr uint32_t NONE = 0xffffffffu;
+    static_assert(KS * 36 % 8 == 0, "row segments must be whole 8-byte words");
+    __shared__ __align__(16) uint32_t a_qs[2][KS][TILE_ROWS * 8];
+    __shared__ __align__(16) uint32_t b_qs[2][KS][COLS * 8];
+    __shared__ uint32_t a_sc[2][KS][TILE_ROWS];
+    __shared__ uint32_t b_sc[2][KS][COLS];
     __shared__ int32_t slot_of[TILE_ROWS];
     __shared__ int32_t xrow_of[TILE_ROWS];
     __shared__ uint32_t tiles[MAX_EXPERT + 1];
@@ -127,30 +134,29 @@ __global__ void __launch_bounds__(256, 3) moe_gemm_kernel(
         xrow_of[tid] = slot < 0 ? -1 : (x_per_slot ? slot : slot / (int32_t)n_used);
     }
     __syncthreads();
-    const uint32_t col0 = blockIdx.y * TILE_COLS;
+    const uint32_t col0 = blockIdx.y * COLS;
     const uint32_t n_super = K / QK_NVFP4;
-    const uint32_t n_steps = n_super / KSTEP;
-    const block_nvfp4 *We = W + (size_t)e * M * n_super;
+    const uint32_t n_steps = n_super / KS;
+    const uint32_t row_u2 = n_super * 36u / 8u;                /* 8-byte words per operand row */
+    const uint2 *xq2 = (const uint2 *)xq;
+    const uint2 *w2 = (const uint2 *)(W + (size_t)e * M * n_super);
 
-    /* this thread's share of a step's loads: (row segment, 8-byte word) pairs */
-    const uint2 *src[PER_THREAD];
-    uint32_t item_row[PER_THREAD], item_u[PER_THREAD];
-    bool item_a[PER_THREAD];
+    /* this thread's share of a step's loads, as word offsets into the
+     * activation rows (A items) or the expert (B items); NONE reads zero */
+    uint32_t item_off[PER_THREAD];
 #pragma unroll
     for (int p = 0; p < PER_THREAD; p++) {
         const uint32_t i = tid + 256u * p;
-        item_a[p] = i < (uint32_t)(TILE_ROWS * SEG_U2);
-        const uint32_t j = item_a[p] ? i : i - TILE_ROWS * SEG_U2;
-        const uint32_t r = j / SEG_U2;
-        item_row[p] = r;
-        item_u[p] = j % SEG_U2;
-        src[p] = NULL;
+        const bool is_a = i < (uint32_t)(TILE_ROWS * SEG_U2);
+        const uint32_t j = is_a ? i : i - TILE_ROWS * SEG_U2;
+        const uint32_t r = j / SEG_U2, u = j % SEG_U2;
+        item_off[p] = NONE;
         if (i < (uint32_t)ITEMS) {
-            if (item_a[p]) {
+            if (is_a) {
                 const int32_t xr = xrow_of[r];
-                if (xr >= 0) src[p] = (const uint2 *)(xq + (size_t)xr * n_super) + item_u[p];
+                if (xr >= 0) item_off[p] = (uint32_t)xr * row_u2 + u;
             } else if (col0 + r < M) {
-                src[p] = (const uint2 *)(We + (size_t)(col0 + r) * n_super) + item_u[p];
+                item_off[p] = (col0 + r) * row_u2 + u;
             }
         }
     }
@@ -158,39 +164,45 @@ __global__ void __launch_bounds__(256, 3) moe_gemm_kernel(
     auto fetch = [&](uint32_t step) {
 #pragma unroll
         for (int p = 0; p < PER_THREAD; p++) {
-            pre[p] = src[p] ? src[p][step * SEG_U2] : make_uint2(0u, 0u);
+            const bool is_a = tid + 256u * p < (uint32_t)(TILE_ROWS * SEG_U2);
+            const uint2 *base = is_a ? xq2 : w2;
+            pre[p] = item_off[p] != NONE ? base[item_off[p] + step * SEG_U2] : make_uint2(0u, 0u);
         }
     };
     auto stage = [&](uint32_t buf) {
 #pragma unroll
         for (int p = 0; p < PER_THREAD; p++) {
-            if (tid + 256u * p >= (uint32_t)ITEMS) continue;
+            const uint32_t i = tid + 256u * p;
+            if (i >= (uint32_t)ITEMS) continue;
+            const bool is_a = i < (uint32_t)(TILE_ROWS * SEG_U2);
+            const uint32_t j = is_a ? i : i - TILE_ROWS * SEG_U2;
+            const uint32_t r = j / SEG_U2, u = j % SEG_U2;
             const uint32_t words[2] = { pre[p].x, pre[p].y };
 #pragma unroll
             for (int h = 0; h < 2; h++) {
-                const uint32_t w = item_u[p] * 2u + h;           /* word within the segment */
+                const uint32_t w = u * 2u + h;                    /* word within the segment */
                 const uint32_t sb = w / 9u, k = w % 9u;
-                if (item_a[p]) {
-                    if (k == 0u) a_sc[buf][sb][item_row[p]] = words[h];
-                    else a_qs[buf][sb][swz(item_row[p], k - 1u)] = words[h];
+                if (is_a) {
+                    if (k == 0u) a_sc[buf][sb][r] = words[h];
+                    else a_qs[buf][sb][swz(r, k - 1u)] = words[h];
                 } else {
-                    if (k == 0u) b_sc[buf][sb][item_row[p]] = words[h];
-                    else b_qs[buf][sb][swz(item_row[p], k - 1u)] = words[h];
+                    if (k == 0u) b_sc[buf][sb][r] = words[h];
+                    else b_qs[buf][sb][swz(r, k - 1u)] = words[h];
                 }
             }
         }
     };
 
     const uint32_t wr = (warp >> 2u) * 16u;
-    const uint32_t wc = (warp & 3u) * 32u;
+    const uint32_t wc = (warp & 3u) * (COLS / 4u);
     const uint32_t tidx_a = lane / 4u + (lane % 2u) * 8u;   /* rows whose scales this lane supplies */
     const uint32_t tidx_b = lane / 4u;
     const uint32_t ar = wr + (lane & 7u) + ((lane >> 3u) & 1u) * 8u;   /* ldmatrix row addresses */
     const uint32_t ah = (lane >> 4u) * 4u;
     const uint32_t bh = ((lane >> 3u) & 1u) * 4u;
-    float C[4][4];
+    float C[NT][4];
 #pragma unroll
-    for (int f = 0; f < 4; f++) C[f][0] = C[f][1] = C[f][2] = C[f][3] = 0.0f;
+    for (int f = 0; f < NT; f++) C[f][0] = C[f][1] = C[f][2] = C[f][3] = 0.0f;
 
     fetch(0u);
     stage(0u);
@@ -199,12 +211,12 @@ __global__ void __launch_bounds__(256, 3) moe_gemm_kernel(
         const uint32_t buf = step & 1u;
         if (step + 1u < n_steps) fetch(step + 1u);
 #pragma unroll
-        for (int sb = 0; sb < KSTEP; sb++) {
+        for (int sb = 0; sb < KS; sb++) {
             uint32_t A[4];
             ldsm_x4(A, &a_qs[buf][sb][swz(ar, ah)]);
             const uint32_t sa = a_sc[buf][sb][wr + tidx_a];
 #pragma unroll
-            for (int f = 0; f < 4; f++) {
+            for (int f = 0; f < NT; f++) {
                 uint32_t B[2];
                 const uint32_t n = wc + f * 8u + (lane & 7u);
                 ldsm_x2(B, &b_qs[buf][sb][swz(n, bh)]);
@@ -216,7 +228,7 @@ __global__ void __launch_bounds__(256, 3) moe_gemm_kernel(
     }
     const float gscale = scales[e];
 #pragma unroll
-    for (int f = 0; f < 4; f++) {
+    for (int f = 0; f < NT; f++) {
 #pragma unroll
         for (int l = 0; l < 4; l++) {
             const int32_t slot = slot_of[wr + lane / 4u + (l >> 1) * 8u];
@@ -224,6 +236,19 @@ __global__ void __launch_bounds__(256, 3) moe_gemm_kernel(
             if (slot >= 0 && col < M) out[(size_t)slot * M + col] = C[f][l] * gscale;
         }
     }
+}
+
+template <int KS, int COLS>
+void launch_moe_gemm(
+        float *out, const block_nvfp4 *W, const float *scales, const block_nvfp4 *xq, int x_per_slot,
+        const int32_t *order, const uint32_t *plan, int n_expert, int n_used, int K, int M, int rows,
+        cudaStream_t stream) {
+    /* every expert adds at most one partial tile to the slots' full tiles */
+    const unsigned max_tiles = (unsigned)(((long long)rows * n_used + TILE_ROWS - 1) / TILE_ROWS) + (unsigned)n_expert;
+    const dim3 grid(max_tiles, (unsigned)((M + COLS - 1) / COLS), 1u);
+    moe_gemm_kernel<KS, COLS><<<grid, dim3(32, 8, 1), 0, stream>>>(
+        out, W, scales, xq, (uint32_t)(x_per_slot != 0), order, plan,
+        (uint32_t)n_expert, (uint32_t)n_used, (uint32_t)K, (uint32_t)M);
 }
 
 } // namespace
@@ -240,14 +265,15 @@ extern "C" int ds4_qwen_fp4_moe_gemm(
         const int32_t *order, const uint32_t *plan, int n_expert, int n_used,
         int K, int M, int rows, float *out, cudaStream_t stream) {
     if (!W || !scales || !xq || !order || !plan || !out || n_expert <= 0 || n_expert > MAX_EXPERT ||
-        n_used <= 0 || K <= 0 || K % (KSTEP * QK_NVFP4) != 0 || M <= 0 || rows <= 0) {
+        n_used <= 0 || K <= 0 || K % (2 * QK_NVFP4) != 0 || M <= 0 || rows <= 0) {
         return -1;
     }
-    /* every expert adds at most one partial tile to the slots' full tiles */
-    const unsigned max_tiles = (unsigned)(((long long)rows * n_used + TILE_ROWS - 1) / TILE_ROWS) + (unsigned)n_expert;
-    const dim3 grid(max_tiles, (unsigned)((M + TILE_COLS - 1) / TILE_COLS), 1u);
-    moe_gemm_kernel<<<grid, dim3(32, 8, 1), 0, stream>>>(
-        out, (const block_nvfp4 *)W, scales, (const block_nvfp4 *)xq, (uint32_t)(x_per_slot != 0),
-        order, plan, (uint32_t)n_expert, (uint32_t)n_used, (uint32_t)K, (uint32_t)M);
+    const block_nvfp4 *w = (const block_nvfp4 *)W;
+    const block_nvfp4 *x = (const block_nvfp4 *)xq;
+    if (K % (4 * QK_NVFP4) == 0) {
+        launch_moe_gemm<4, 128>(out, w, scales, x, x_per_slot, order, plan, n_expert, n_used, K, M, rows, stream);
+    } else {
+        launch_moe_gemm<2, 128>(out, w, scales, x, x_per_slot, order, plan, n_expert, n_used, K, M, rows, stream);
+    }
     return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }

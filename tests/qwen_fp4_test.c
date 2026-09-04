@@ -1,7 +1,9 @@
 /* Exact check of the Flash-Next FP4 expert GEMM (cuda/mmq/ds4_qwen_fp4.cu)
  * against a host reference: random NVFP4 experts, activations quantised by
  * the GPU and dequantised here, a hand-built expert plan, and the products
- * summed in double.  Built by `make cuda-regression`. */
+ * summed in double.  Run over the down projection's K (one whole-row step)
+ * and the gate/up K (several pipelined steps).  Built by `make
+ * cuda-regression`. */
 #include "cuda/mmq/ds4_qwen_fp4.h"
 
 #include <cuda_runtime.h>
@@ -11,8 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { N_EXPERT = 5, N_USED = 3, ROWS = 45, K = 640, M = 200, TILE = 32 };   /* K spans several pipeline steps */
-enum { N_SUPER = K / 64, SLOTS = ROWS * N_USED };
+enum { N_EXPERT = 5, N_USED = 3, ROWS = 45, TILE = 32, SLOTS = ROWS * N_USED };
 
 static const float e2m1[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
 
@@ -43,10 +44,11 @@ static void *dev_copy(const void *src, size_t bytes) {
     return d;
 }
 
-int main(void) {
-    uint32_t seed = 7;
+static int run(int K, int M) {
+    const int n_super = K / 64;
+    uint32_t seed = 7u + (uint32_t)K;
     /* random experts: valid UE4M3 scales (small exponents) and random nibbles */
-    const size_t w_bytes = (size_t)N_EXPERT * M * N_SUPER * 36;
+    const size_t w_bytes = (size_t)N_EXPERT * M * n_super * 36;
     uint8_t *w = malloc(w_bytes);
     for (size_t i = 0; i < w_bytes; i++) {
         const size_t in_blk = i % 36;
@@ -70,8 +72,9 @@ int main(void) {
     int32_t order[SLOTS];
     for (int s = 0; s < SLOTS; s++) order[plan[3][esel[s]]++] = s;
 
+    const size_t xq_bytes = (size_t)ROWS * n_super * 36;
     void *dw = dev_copy(w, w_bytes), *dsc = dev_copy(scales, sizeof scales);
-    void *dx = dev_copy(x, (size_t)ROWS * K * sizeof(float)), *dxq = dev_copy(NULL, (size_t)ROWS * N_SUPER * 36);
+    void *dx = dev_copy(x, (size_t)ROWS * K * sizeof(float)), *dxq = dev_copy(NULL, xq_bytes);
     void *dord = dev_copy(order, sizeof order), *dplan = dev_copy(plan, sizeof plan);
     void *dout = dev_copy(NULL, (size_t)SLOTS * M * sizeof(float));
     if (!dw || !dsc || !dx || !dxq || !dord || !dplan || !dout) return 1;
@@ -81,16 +84,16 @@ int main(void) {
         fprintf(stderr, "fp4-test: launch failed: %s\n", cudaGetErrorString(cudaGetLastError()));
         return 1;
     }
-    uint8_t *xq = malloc((size_t)ROWS * N_SUPER * 36);
+    uint8_t *xq = malloc(xq_bytes);
     float *out = malloc((size_t)SLOTS * M * sizeof(float));
-    if (cudaMemcpy(xq, dxq, (size_t)ROWS * N_SUPER * 36, cudaMemcpyDeviceToHost) != cudaSuccess ||
+    if (cudaMemcpy(xq, dxq, xq_bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||
         cudaMemcpy(out, dout, (size_t)SLOTS * M * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return 1;
 
     /* the quantiser must keep every value near its E2M1 grid point */
     double qerr = 0.0;
     for (int r = 0; r < ROWS; r++) {
         for (int k = 0; k < K; k++) {
-            const float v = block_value(xq + ((size_t)r * N_SUPER + k / 64) * 36, k % 64);
+            const float v = block_value(xq + ((size_t)r * n_super + k / 64) * 36, k % 64);
             qerr = fmax(qerr, fabs(v - x[(size_t)r * K + k]));
         }
     }
@@ -101,8 +104,8 @@ int main(void) {
         for (int c = 0; c < M; c++) {
             double ref = 0.0;
             for (int k = 0; k < K; k++) {
-                const float a = block_value(xq + ((size_t)r * N_SUPER + k / 64) * 36, k % 64);
-                const float b = block_value(w + (((size_t)e * M + c) * N_SUPER + k / 64) * 36, k % 64);
+                const float a = block_value(xq + ((size_t)r * n_super + k / 64) * 36, k % 64);
+                const float b = block_value(w + (((size_t)e * M + c) * n_super + k / 64) * 36, k % 64);
                 ref += (double)a * b;
             }
             ref *= scales[e];
@@ -110,13 +113,19 @@ int main(void) {
             const double rel = fabs(got - ref) / (fabs(ref) + 1e-3);
             if (rel > maxrel) maxrel = rel;
             if (rel > 1e-4 && bad++ < 5) {
-                fprintf(stderr, "fp4-test: slot %d (expert %d) col %d: got %.6g want %.6g\n", s, e, c, got, ref);
+                fprintf(stderr, "fp4-test: K %d slot %d (expert %d) col %d: got %.6g want %.6g\n", K, s, e, c, got, ref);
             }
         }
     }
-    printf("fp4-test: quantise max abs err %.3g (values up to 4), gemm max rel err %.3g, %d bad of %d\n",
-           qerr, maxrel, bad, SLOTS * M);
-    const int ok = bad == 0 && qerr < 1.0;
+    printf("fp4-test: K %d M %d: quantise max abs err %.3g (values up to 4), gemm max rel err %.3g, %d bad of %d\n",
+           K, M, qerr, maxrel, bad, SLOTS * M);
+    cudaFree(dw); cudaFree(dsc); cudaFree(dx); cudaFree(dxq); cudaFree(dord); cudaFree(dplan); cudaFree(dout);
+    free(w); free(x); free(xq); free(out);
+    return bad == 0 && qerr < 1.0 ? 0 : 1;
+}
+
+int main(void) {
+    const int ok = run(640, 200) == 0 && run(2560, 136) == 0;
     printf("fp4-test: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
