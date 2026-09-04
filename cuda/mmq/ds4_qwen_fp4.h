@@ -26,7 +26,8 @@ int ds4_qwen_fp4_quantize(const float *x, const float *up, void *xq, int rows, i
  * for every (token, slot) pair, with `plan`/`order` the expert grouping made
  * by ds4_gpu_qwen4exp_expert_plan (32-slot tiles).  W is the stacked
  * [n_expert][M][K] NVFP4 tensor; xq has one NVFP4 row per slot (x_per_slot)
- * or per token (row = slot / n_used).  K % 128 == 0. */
+ * or per token (row = slot / n_used).  K % 128 == 0.  The output is f32, or
+ * bf16 with out_bf16 (the checkpoint's recipe for the expert outputs). */
 int ds4_qwen_fp4_moe_gemm(
     const void     *W,
     const float    *scales,
@@ -39,7 +40,8 @@ int ds4_qwen_fp4_moe_gemm(
     int             K,
     int             M,
     int             rows,
-    float          *out,
+    void           *out,
+    int             out_bf16,
     cudaStream_t    stream);
 
 #ifdef __cplusplus

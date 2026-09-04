@@ -16557,11 +16557,12 @@ static bool qwen_graph_expert_fp4(
         ds4_gpu_tensor     *out,
         ds4_gpu_tensor     *xq,
         bool                x_per_slot,
+        bool                out_bf16,
         uint32_t            n) {
     return ds4_gpu_qwen4exp_expert_fp4(out, m->map, m->size, w->abs_offset,
                                        (uint64_t)((const uint8_t *)w->scales - m->map),
                                        xq, x_per_slot, g->eorder, g->eplan, DS4_N_EXPERT, DS4_N_EXPERT_USED,
-                                       (uint32_t)w->dim[0], (uint32_t)w->dim[1], n) != 0;
+                                       (uint32_t)w->dim[0], (uint32_t)w->dim[1], n, out_bf16) != 0;
 }
 
 /* Routed experts plus the gated shared expert into y (see qwen_moe_forward). */
@@ -16580,11 +16581,12 @@ static bool qwen_graph_moe(
          * checkpoint's recipe (see the plan's precision notes) */
         if (ok) ok = ds4_gpu_qwen4exp_expert_plan(g->eplan, g->eorder, g->esel, DS4_N_EXPERT, (uint32_t)slots) != 0;
         if (ok) ok = ds4_gpu_qwen4exp_quantize_fp4(g->hq, g->h, NULL, n, DS4_N_EMBD) != 0;
-        if (ok) ok = qwen_graph_expert_fp4(g, m, l->ffn_gate_exps, g->eg, g->hq, false, n);
-        if (ok) ok = qwen_graph_expert_fp4(g, m, l->ffn_up_exps, g->eu, g->hq, false, n);
-        /* the swiglu is folded into the quantisation of the down input */
+        if (ok) ok = qwen_graph_expert_fp4(g, m, l->ffn_gate_exps, g->eg, g->hq, false, false, n);
+        if (ok) ok = qwen_graph_expert_fp4(g, m, l->ffn_up_exps, g->eu, g->hq, false, false, n);
+        /* the swiglu is folded into the quantisation of the down input; the
+         * expert outputs are bf16, as the checkpoint's recipe has them */
         if (ok) ok = ds4_gpu_qwen4exp_quantize_fp4(g->egq, g->eg, g->eu, (uint32_t)slots, DS4_N_FF_EXP) != 0;
-        if (ok) ok = qwen_graph_expert_fp4(g, m, l->ffn_down_exps, g->ed, g->egq, true, n);
+        if (ok) ok = qwen_graph_expert_fp4(g, m, l->ffn_down_exps, g->ed, g->egq, true, true, n);
     } else {
         if (ok) ok = qwen_graph_expert_proj(g, m, l->ffn_gate_exps, g->eg, g->h, false, n);
         if (ok) ok = qwen_graph_expert_proj(g, m, l->ffn_up_exps, g->eu, g->h, false, n);
@@ -16596,7 +16598,7 @@ static bool qwen_graph_moe(
     if (ok) ok = ds4_gpu_swiglu_tensor(g->mixed, g->mixed, g->z, n * DS4_N_FF_SHEXP, 0.0f, 1.0f) != 0;
     if (ok) ok = qwen_graph_matmul(g->y, m, l->ffn_down_shexp, g->mixed, n);
     if (ok) ok = qwen_graph_matmul_h(g, g->sg, m, l->ffn_gate_inp_shexp, n);
-    if (ok) ok = ds4_gpu_qwen4exp_moe_combine(g->y, g->ed, g->selw, g->sg, DS4_N_EMBD, n_used, n) != 0;
+    if (ok) ok = ds4_gpu_qwen4exp_moe_combine(g->y, g->ed, n > 8u, g->selw, g->sg, DS4_N_EMBD, n_used, n) != 0;
     return ok;
 }
 

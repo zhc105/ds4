@@ -1793,7 +1793,8 @@ extern "C" int ds4_gpu_qwen4exp_expert_fp4(
         uint32_t              n_used,
         uint32_t              in_dim,
         uint32_t              out_dim,
-        uint32_t              rows) {
+        uint32_t              rows,
+        int                   out_bf16) {    /* outputs in bf16, the checkpoint's recipe for them */
     const uint64_t expert_bytes = qwen35_weight_bytes(QWEN35_W_NVFP4, in_dim, out_dim);
     const uint64_t slots = (uint64_t)rows * n_used;
     if (!model_map || rows == 0u || n_used == 0u || n_expert == 0u || expert_bytes == 0u ||
@@ -1810,14 +1811,14 @@ extern "C" int ds4_gpu_qwen4exp_expert_fp4(
     if (!w || !scales) return 0;
     return ds4_qwen_fp4_moe_gemm(w, scales, xq->ptr, x_per_slot, (const int32_t *)order->ptr, (const uint32_t *)plan->ptr,
                                  (int)n_expert, (int)n_used, (int)in_dim, (int)out_dim, (int)rows,
-                                 (float *)out->ptr, cuda_decode_stream()) == 0 &&
+                                 out->ptr, out_bf16, cuda_decode_stream()) == 0 &&
            cuda_ok(cudaGetLastError(), "Flash-Next FP4 expert GEMM launch");
 }
 
 /* y = sum over slots of selw * ed, plus the shared expert already in y
  * scaled by its sigmoid gate. */
 __global__ static void qwen4exp_moe_combine_kernel(
-        float *y, const float *ed, const float *selw, const float *sg, uint32_t n, uint32_t n_used, uint32_t rows) {
+        float *y, const void *ed, uint32_t ed_bf16, const float *selw, const float *sg, uint32_t n, uint32_t n_used, uint32_t rows) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (uint64_t)rows * n) return;
     const uint64_t t = i / n;
@@ -1825,7 +1826,8 @@ __global__ static void qwen4exp_moe_combine_kernel(
     float acc = 0.0f;
     for (uint32_t k = 0; k < n_used; k++) {
         const uint64_t slot = t * n_used + k;
-        acc = fmaf(selw[slot], ed[slot * n + j], acc);
+        const float e = ed_bf16 ? __bfloat162float(((const __nv_bfloat16 *)ed)[slot * n + j]) : ((const float *)ed)[slot * n + j];
+        acc = fmaf(selw[slot], e, acc);
     }
     y[i] = fmaf(qwen35_cuda_sigmoid(sg[t]), y[i], acc);
 }
@@ -1833,18 +1835,20 @@ __global__ static void qwen4exp_moe_combine_kernel(
 extern "C" int ds4_gpu_qwen4exp_moe_combine(
         ds4_gpu_tensor       *y,
         const ds4_gpu_tensor *ed,
+        int                   ed_bf16,
         const ds4_gpu_tensor *selw,
         const ds4_gpu_tensor *sg,
         uint32_t              n_embd,
         uint32_t              n_used,
         uint32_t              rows) {
     const uint64_t n = (uint64_t)rows * n_embd;
-    if (n == 0u || n_used == 0u || !qwen4exp_elems_fit(y, n) || !qwen4exp_elems_fit(ed, n * n_used) ||
+    if (n == 0u || n_used == 0u || !qwen4exp_elems_fit(y, n) || !ed ||
+        ed->bytes < n * n_used * (ed_bf16 ? sizeof(__nv_bfloat16) : sizeof(float)) ||
         !qwen4exp_elems_fit(selw, (uint64_t)rows * n_used) || !qwen4exp_elems_fit(sg, rows)) {
         return 0;
     }
     qwen4exp_moe_combine_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
-        (float *)y->ptr, (const float *)ed->ptr, (const float *)selw->ptr, (const float *)sg->ptr,
+        (float *)y->ptr, ed->ptr, ed_bf16 != 0, (const float *)selw->ptr, (const float *)sg->ptr,
         n_embd, n_used, rows);
     return cuda_ok(cudaGetLastError(), "Flash-Next MoE combine launch");
 }

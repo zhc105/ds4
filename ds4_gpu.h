@@ -3319,10 +3319,12 @@ int ds4_gpu_qwen4exp_expert_fp4(
         uint32_t              n_used,
         uint32_t              in_dim,
         uint32_t              out_dim,
-        uint32_t              rows);
+        uint32_t              rows,
+        int                   out_bf16);
 int ds4_gpu_qwen4exp_moe_combine(
         ds4_gpu_tensor       *y,
         const ds4_gpu_tensor *ed,
+        int                   ed_bf16,
         const ds4_gpu_tensor *selw,
         const ds4_gpu_tensor *sg,
         uint32_t              n_embd,
