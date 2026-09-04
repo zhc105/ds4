@@ -1490,6 +1490,69 @@ extern "C" int ds4_gpu_qwen4exp_hc_combine(
     return cuda_ok(cudaGetLastError(), "Flash-Next hc combine launch");
 }
 
+/* hc combine fused with the next sub-layer's stream norm: block per
+ * (token, stream) updates its residual row and normalises the new values
+ * while they are still in registers, so the row is read once instead of
+ * twice.  Rows up to 16 * blockDim values. */
+__global__ static void qwen4exp_hc_combine_norm_kernel(
+        float *x, float *xn, __nv_bfloat16 *xn_bf16, const float *y, const float *inject, const float *gamma,
+        uint32_t n, uint32_t n_hc, uint32_t rows, float eps) {
+    __shared__ float scratch[32];
+    const uint32_t row = blockIdx.x;                 /* token * n_hc + stream */
+    if (row >= rows * n_hc) return;
+    const uint32_t t = row / n_hc;
+    const float w = 2.0f * qwen35_cuda_sigmoid(inject[row] / (float)n_hc);
+    const float *g = gamma + (uint64_t)(row % n_hc) * n;
+    const float *yr = y + (uint64_t)t * n;
+    float *xr = x + (uint64_t)row * n;
+    float v[16];
+    float ss = 0.0f;
+    for (uint32_t j = 0; j < 16u; j++) {
+        const uint32_t i = threadIdx.x + j * blockDim.x;
+        v[j] = i < n ? fmaf(yr[i], w, xr[i]) : 0.0f;
+        if (i < n) xr[i] = v[j];
+        ss = fmaf(v[j], v[j], ss);
+    }
+    ss = qwen35_cuda_block_sum(ss, scratch);
+    const float scale = rsqrtf(ss / (float)n + eps);
+    for (uint32_t j = 0; j < 16u; j++) {
+        const uint32_t i = threadIdx.x + j * blockDim.x;
+        if (i >= n) break;
+        const float o = v[j] * scale * g[i];
+        xn[(uint64_t)row * n + i] = o;
+        if (xn_bf16) xn_bf16[(uint64_t)row * n + i] = __float2bfloat16(o);
+    }
+}
+
+extern "C" int ds4_gpu_qwen4exp_hc_combine_norm(
+        ds4_gpu_tensor       *x,
+        ds4_gpu_tensor       *xn,
+        ds4_gpu_tensor       *xn_bf16,      /* optional bf16 copy */
+        const ds4_gpu_tensor *y,
+        const ds4_gpu_tensor *inject,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gamma_offset,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows,
+        float                 eps) {
+    const uint64_t elems = (uint64_t)rows * n_hc * n_embd;
+    if (!model_map || n_embd == 0u || n_embd > 16u * 256u || n_hc == 0u || rows == 0u ||
+        !qwen4exp_elems_fit(x, elems) || !qwen4exp_elems_fit(xn, elems) ||
+        !qwen4exp_elems_fit(y, (uint64_t)rows * n_embd) || !qwen4exp_elems_fit(inject, (uint64_t)rows * n_hc) ||
+        (xn_bf16 && xn_bf16->bytes < elems * sizeof(__nv_bfloat16))) {
+        return 0;
+    }
+    const float *gamma = glm53_cuda_weight_f32(model_map, model_size, gamma_offset,
+                                               (uint64_t)n_hc * n_embd, ds4_tensor_device_idx(x), "hc norm");
+    if (!gamma) return 0;
+    qwen4exp_hc_combine_norm_kernel<<<rows * n_hc, 256, 0, cuda_decode_stream()>>>(
+        (float *)x->ptr, (float *)xn->ptr, xn_bf16 ? (__nv_bfloat16 *)xn_bf16->ptr : NULL,
+        (const float *)y->ptr, (const float *)inject->ptr, gamma, n_embd, n_hc, rows, eps);
+    return cuda_ok(cudaGetLastError(), "Flash-Next hc combine+norm launch");
+}
+
 /* The wide residual starts as n_hc copies of the embedding. */
 __global__ static void qwen4exp_replicate_kernel(
         float *x, const float *h, uint32_t n, uint32_t n_hc, uint32_t rows) {
@@ -1704,12 +1767,15 @@ extern "C" int ds4_gpu_qwen4exp_expert_plan(
  * FP4 MMA, so every weight byte is read once per chunk and nothing is
  * dequantised.  This is the checkpoint's activation recipe, the one vLLM
  * and SGLang run. */
-extern "C" int ds4_gpu_qwen4exp_quantize_fp4(ds4_gpu_tensor *xq, const ds4_gpu_tensor *x, uint32_t rows, uint32_t k) {
+extern "C" int ds4_gpu_qwen4exp_quantize_fp4(
+        ds4_gpu_tensor *xq, const ds4_gpu_tensor *x, const ds4_gpu_tensor *up, uint32_t rows, uint32_t k) {
     if (!xq || !x || rows == 0u || k == 0u || k % 64u != 0u ||
-        x->bytes < (uint64_t)rows * k * sizeof(float) || xq->bytes < (uint64_t)rows * (k / 64u) * 36u) {
+        x->bytes < (uint64_t)rows * k * sizeof(float) || xq->bytes < (uint64_t)rows * (k / 64u) * 36u ||
+        (up && up->bytes < (uint64_t)rows * k * sizeof(float))) {
         return 0;
     }
-    return ds4_qwen_fp4_quantize((const float *)x->ptr, xq->ptr, (int)rows, (int)k, cuda_decode_stream()) == 0 &&
+    return ds4_qwen_fp4_quantize((const float *)x->ptr, up ? (const float *)up->ptr : NULL, xq->ptr,
+                                 (int)rows, (int)k, cuda_decode_stream()) == 0 &&
            cuda_ok(cudaGetLastError(), "Flash-Next FP4 activation quantize launch");
 }
 

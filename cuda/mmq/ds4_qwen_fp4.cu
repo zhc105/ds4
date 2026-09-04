@@ -17,19 +17,22 @@ constexpr int MAX_EXPERT = 512;
 enum { PLAN_COUNT = 0, PLAN_START = 1, PLAN_TILE = 2 };
 
 /* One thread per 16-value sub-block: a UE4M3 scale of amax/6 and nearest
- * E2M1 codes, byte b holding values b (low nibble) and b+8 (high). */
-__global__ void quantize_kernel(const float *x, block_nvfp4 *xq, int rows, int K) {
+ * E2M1 codes, byte b holding values b (low nibble) and b+8 (high).  With
+ * `up` the value is SiLU(x) * up, as ds4's swiglu computes it. */
+__global__ void quantize_kernel(const float *x, const float *up, block_nvfp4 *xq, int rows, int K) {
     const int n_sub = K / QK_NVFP4_SUB;
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)rows * n_sub) return;
     const int row = (int)(i / n_sub);
     const int sub = (int)(i % n_sub);
-    const float *src = x + (long long)row * K + sub * QK_NVFP4_SUB;
+    const long long off = (long long)row * K + sub * QK_NVFP4_SUB;
+    const float *src = x + off;
     float v[QK_NVFP4_SUB];
     float amax = 0.0f;
 #pragma unroll
     for (int k = 0; k < QK_NVFP4_SUB; k++) {
         v[k] = src[k];
+        if (up) v[k] = v[k] / (1.0f + expf(-v[k])) * up[off + k];
         amax = fmaxf(amax, fabsf(v[k]));
     }
     /* ggml's ue4m3 decoder returns half the E4M3 value (its E2M1 tables are
@@ -254,10 +257,10 @@ void launch_moe_gemm(
 
 } // namespace
 
-extern "C" int ds4_qwen_fp4_quantize(const float *x, void *xq, int rows, int K, cudaStream_t stream) {
+extern "C" int ds4_qwen_fp4_quantize(const float *x, const float *up, void *xq, int rows, int K, cudaStream_t stream) {
     if (!x || !xq || rows <= 0 || K <= 0 || K % QK_NVFP4 != 0) return -1;
     const long long n = (long long)rows * (K / QK_NVFP4_SUB);
-    quantize_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(x, (block_nvfp4 *)xq, rows, K);
+    quantize_kernel<<<(unsigned)((n + 255) / 256), 256, 0, stream>>>(x, up, (block_nvfp4 *)xq, rows, K);
     return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }
 

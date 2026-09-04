@@ -3257,6 +3257,19 @@ int ds4_gpu_qwen4exp_hc_combine(
         uint32_t              n_embd,
         uint32_t              n_hc,
         uint32_t              rows);
+int ds4_gpu_qwen4exp_hc_combine_norm(
+        ds4_gpu_tensor       *x,
+        ds4_gpu_tensor       *xn,
+        ds4_gpu_tensor       *xn_bf16,
+        const ds4_gpu_tensor *y,
+        const ds4_gpu_tensor *inject,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gamma_offset,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows,
+        float                 eps);
 int ds4_gpu_qwen4exp_replicate(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *h,
@@ -3290,7 +3303,8 @@ int ds4_gpu_qwen4exp_expert_plan(
         const ds4_gpu_tensor *esel,
         uint32_t              n_expert,
         uint32_t              slots);
-int ds4_gpu_qwen4exp_quantize_fp4(ds4_gpu_tensor *xq, const ds4_gpu_tensor *x, uint32_t rows, uint32_t k);
+int ds4_gpu_qwen4exp_quantize_fp4(
+        ds4_gpu_tensor *xq, const ds4_gpu_tensor *x, const ds4_gpu_tensor *up, uint32_t rows, uint32_t k);
 int ds4_gpu_qwen4exp_expert_fp4(
         ds4_gpu_tensor       *out,
         const void           *model_map,

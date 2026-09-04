@@ -16235,6 +16235,7 @@ typedef struct {
     uint32_t ctx;
     uint32_t max_rows;
     uint32_t n_tokens;           /* tokens folded into the state so far */
+    bool xn_ready;               /* hc: the previous sub-layer's combine already normalised the streams */
     ds4_gpu_tensor *conv_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *ssm_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];
@@ -16479,10 +16480,13 @@ static bool qwen_graph_hc_mix(
         uint32_t                   n,
         ds4_gpu_tensor            *mixed,
         ds4_gpu_tensor            *inject) {
-    /* prefill GEMMs read the normalised streams through their bf16 copy */
+    /* prefill GEMMs read the normalised streams through their bf16 copy;
+     * the previous sub-layer's combine may have normalised them already */
     ds4_gpu_tensor *xn_bf16 = n > 8u ? g->xn_bf16 : NULL;
-    bool ok = ds4_gpu_qwen4exp_stream_norm(g->xn, xn_bf16, x, m->map, m->size, hc->norm->abs_offset,
+    bool ok = g->xn_ready ||
+              ds4_gpu_qwen4exp_stream_norm(g->xn, xn_bf16, x, m->map, m->size, hc->norm->abs_offset,
                                            DS4_N_EMBD, DS4_N_HC, n, DS4_RMS_EPS) != 0;
+    g->xn_ready = false;
     if (ok) ok = qwen_graph_matmul_bf16(g->lo, m, hc->down, g->xn, xn_bf16, n);
     if (ok) ok = ds4_gpu_qwen4exp_hc_low(g->lo, DS4_N_HC_LOW, DS4_N_HC, n) != 0;
     /* the prefill gate GEMM writes bf16 (its f32 output was its whole cost) */
@@ -16513,9 +16517,19 @@ static bool qwen_graph_sublayer_in(
     return ok && (n <= 8u || ds4_gpu_qwen35_bf16(g->h_bf16, g->h, (uint64_t)n * DS4_N_EMBD) != 0);
 }
 
-static bool qwen_graph_sublayer_out(ds4_qwen_gpu_graph *g, uint32_t n) {
-    if (ds4_qwen_has_hc()) return ds4_gpu_qwen4exp_hc_combine(g->x, g->y, g->inject, DS4_N_EMBD, DS4_N_HC, n) != 0;
-    return ds4_gpu_add_tensor(g->x, g->x, g->y, n * DS4_N_EMBD) != 0;
+/* With `next` (the hc weights of the sub-layer that follows on the same
+ * residual) the combine also does that sub-layer's stream norm. */
+static bool qwen_graph_sublayer_out(
+        ds4_qwen_gpu_graph        *g,
+        const ds4_model           *m,
+        const ds4_qwen_hc_weights *next,
+        uint32_t                   n) {
+    if (!ds4_qwen_has_hc()) return ds4_gpu_add_tensor(g->x, g->x, g->y, n * DS4_N_EMBD) != 0;
+    if (!next) return ds4_gpu_qwen4exp_hc_combine(g->x, g->y, g->inject, DS4_N_EMBD, DS4_N_HC, n) != 0;
+    g->xn_ready = ds4_gpu_qwen4exp_hc_combine_norm(g->x, g->xn, n > 8u ? g->xn_bf16 : NULL, g->y, g->inject,
+                                                   m->map, m->size, next->norm->abs_offset,
+                                                   DS4_N_EMBD, DS4_N_HC, n, DS4_RMS_EPS) != 0;
+    return g->xn_ready;
 }
 
 /* One expert projection for every (token, slot) pair of a decode-sized
@@ -16565,11 +16579,11 @@ static bool qwen_graph_moe(
          * on the FP4 tensor cores with NVFP4-quantised activations, the
          * checkpoint's recipe (see the plan's precision notes) */
         if (ok) ok = ds4_gpu_qwen4exp_expert_plan(g->eplan, g->eorder, g->esel, DS4_N_EXPERT, (uint32_t)slots) != 0;
-        if (ok) ok = ds4_gpu_qwen4exp_quantize_fp4(g->hq, g->h, n, DS4_N_EMBD) != 0;
+        if (ok) ok = ds4_gpu_qwen4exp_quantize_fp4(g->hq, g->h, NULL, n, DS4_N_EMBD) != 0;
         if (ok) ok = qwen_graph_expert_fp4(g, m, l->ffn_gate_exps, g->eg, g->hq, false, n);
         if (ok) ok = qwen_graph_expert_fp4(g, m, l->ffn_up_exps, g->eu, g->hq, false, n);
-        if (ok) ok = ds4_gpu_swiglu_tensor(g->eg, g->eg, g->eu, (uint32_t)(slots * DS4_N_FF_EXP), 0.0f, 1.0f) != 0;
-        if (ok) ok = ds4_gpu_qwen4exp_quantize_fp4(g->egq, g->eg, (uint32_t)slots, DS4_N_FF_EXP) != 0;
+        /* the swiglu is folded into the quantisation of the down input */
+        if (ok) ok = ds4_gpu_qwen4exp_quantize_fp4(g->egq, g->eg, g->eu, (uint32_t)slots, DS4_N_FF_EXP) != 0;
         if (ok) ok = qwen_graph_expert_fp4(g, m, l->ffn_down_exps, g->ed, g->egq, true, n);
     } else {
         if (ok) ok = qwen_graph_expert_proj(g, m, l->ffn_gate_exps, g->eg, g->h, false, n);
@@ -16657,10 +16671,14 @@ static bool qwen_graph_qsa_select(
     return *ok;
 }
 
+/* `next` is the following layer when its attention sub-layer reads the
+ * residual as this layer leaves it (no PLE in between), so the last
+ * combine can fold in its stream norm. */
 static bool qwen_graph_layer(
         ds4_qwen_gpu_graph    *g,
         const ds4_model         *m,
         const ds4_layer_weights *l,
+        const ds4_layer_weights *next,
         uint32_t                 il,
         uint32_t                 n,
         uint32_t                 pos0) {
@@ -16692,7 +16710,7 @@ static bool qwen_graph_layer(
                                               g->ctx, pos0, n, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) != 0;
         if (ok) ok = qwen_graph_matmul(g->y, m, l->attn_output, g->att, n);
     }
-    if (ok) ok = qwen_graph_sublayer_out(g, n);
+    if (ok) ok = qwen_graph_sublayer_out(g, m, &l->hc_mix_ffn, n);
     if (ok) ok = qwen_graph_sublayer_in(g, m, l->post_attention_norm, &l->hc_mix_ffn, n);
     if (ds4_qwen_is_moe()) {
         if (ok) ok = qwen_graph_moe(g, m, l, n);
@@ -16702,7 +16720,7 @@ static bool qwen_graph_layer(
         if (ok) ok = ds4_gpu_swiglu_tensor(g->mixed, g->mixed, g->z, n * DS4_N_FF_DENSE, 0.0f, 1.0f) != 0;
         if (ok) ok = qwen_graph_matmul(g->y, m, l->ffn_down, g->mixed, n);
     }
-    if (ok) ok = qwen_graph_sublayer_out(g, n);
+    if (ok) ok = qwen_graph_sublayer_out(g, m, next ? &next->hc_mix_attn : NULL, n);
     /* DS4_QWEN_TRACE=1: the CPU reference's per-layer norms for the chunk's
      * last row, to locate a divergence by layer and position. */
     if (ok && getenv("DS4_QWEN_TRACE")) {
@@ -16793,7 +16811,8 @@ static bool qwen_graph_forward(
         if (ok && g->emb) ok = qwen_graph_ple_rows(g, m, tokens + done, rows);
         if (ok) ok = qwen_graph_embed(g, m, w, rows);
         for (uint32_t il = 0; ok && il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
-            ok = qwen_graph_layer(g, m, &w->layer[il], il, rows, pos0);
+            const bool chain = il + 1u + DS4_N_NEXTN_PREDICT < DS4_N_LAYER && !ds4_qwen_layer_has_ple(il + 1u);
+            ok = qwen_graph_layer(g, m, &w->layer[il], chain ? &w->layer[il + 1u] : NULL, il, rows, pos0);
         }
         for (uint32_t r = 0; ok && dump && r < rows; r++) {
             ok = qwen_graph_head(g, m, w, r) &&
