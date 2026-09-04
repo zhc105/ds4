@@ -16274,6 +16274,8 @@ typedef struct {
     ds4_gpu_tensor *eu;          /* MoE: [max_rows*n_used][n_ff_exp] up */
     ds4_gpu_tensor *ed;          /* MoE: [max_rows*n_used][n_embd] expert outputs */
     ds4_gpu_tensor *sg;          /* MoE: shared expert gate logit [max_rows] */
+    ds4_gpu_tensor *eorder;      /* MoE prefill: int32 [max_rows*n_used] slots grouped by expert */
+    ds4_gpu_tensor *eplan;       /* MoE prefill: uint32 [4][n_expert+1] counts, starts, tile starts, cursors */
     /* QSA (see qwen_attention_cells): per layer the block key cache and the
      * raw keys of the block being filled; per chunk the raw keys, the
      * indexer queries, the selected cells and the select scratch. */
@@ -16304,7 +16306,7 @@ static void qwen_graph_free(ds4_qwen_gpu_graph *g) {
                                    &g->z, &g->alpha, &g->beta, &g->k, &g->v, &g->att, &g->att_part, &g->logits,
                                    &g->xn, &g->lo, &g->hgate, &g->inject, &g->emb, &g->pkey, &g->pval, &g->pnorm,
                                    &g->ple_hist, &g->router, &g->esel, &g->selw, &g->eg, &g->eu, &g->ed, &g->sg,
-                                   &g->ikraw, &g->iq, &g->sel, &g->n_sel, &g->skeys };
+                                   &g->eorder, &g->eplan, &g->ikraw, &g->iq, &g->sel, &g->n_sel, &g->skeys };
     for (size_t i = 0; i < sizeof(scratch) / sizeof(scratch[0]); i++) {
         if (*scratch[i]) ds4_gpu_tensor_free(*scratch[i]);
     }
@@ -16411,6 +16413,8 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
         g->eu = qwen_graph_tensor(slots * DS4_N_FF_EXP, &ok);
         g->ed = qwen_graph_tensor(slots * DS4_N_EMBD, &ok);
         g->sg = qwen_graph_tensor(rows, &ok);
+        g->eorder = qwen_graph_tensor(slots, &ok);
+        g->eplan = qwen_graph_tensor(4ull * (DS4_N_EXPERT + 1u), &ok);
     }
     if (ok) ok = qwen_graph_reset(g);
     if (!ok) qwen_graph_free(g);
@@ -16467,9 +16471,30 @@ static bool qwen_graph_sublayer_out(ds4_qwen_gpu_graph *g, uint32_t n) {
     return ds4_gpu_add_tensor(g->x, g->x, g->y, n * DS4_N_EMBD) != 0;
 }
 
-/* Routed experts plus the gated shared expert into y (see qwen_moe_forward).
- * Every (token, slot) pair runs its expert as a matvec; grouping rows by
- * expert is a stage-5 optimisation, not a semantic change. */
+/* One expert projection for every (token, slot) pair of the chunk.  Decode
+ * sizes run a matvec per slot; prefill groups the slots by expert first so
+ * each expert's weights are read once per chunk (the same arithmetic per
+ * output element either way). */
+static bool qwen_graph_expert_proj(
+        ds4_qwen_gpu_graph *g,
+        const ds4_model    *m,
+        const ds4_tensor   *w,
+        ds4_gpu_tensor     *out,
+        ds4_gpu_tensor     *x,
+        bool                x_per_slot,
+        uint32_t            n) {
+    const uint64_t scales_offset = (uint64_t)((const uint8_t *)w->scales - m->map);
+    if (n <= 8u) {
+        return ds4_gpu_qwen4exp_expert_matvec(out, m->map, m->size, w->abs_offset, scales_offset,
+                                              g->esel, x, x_per_slot, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                                              (uint32_t)w->dim[0], (uint32_t)w->dim[1], n) != 0;
+    }
+    return ds4_gpu_qwen4exp_expert_gemm(out, m->map, m->size, w->abs_offset, scales_offset,
+                                        g->eorder, g->eplan, x, x_per_slot, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                                        (uint32_t)w->dim[0], (uint32_t)w->dim[1], n) != 0;
+}
+
+/* Routed experts plus the gated shared expert into y (see qwen_moe_forward). */
 static bool qwen_graph_moe(
         ds4_qwen_gpu_graph      *g,
         const ds4_model         *m,
@@ -16477,22 +16502,13 @@ static bool qwen_graph_moe(
         uint32_t                 n) {
     const uint32_t n_used = DS4_N_EXPERT_USED;
     const uint64_t slots = (uint64_t)n * n_used;
-    const ds4_tensor *gate = l->ffn_gate_exps, *up = l->ffn_up_exps, *down = l->ffn_down_exps;
     bool ok = qwen_graph_matmul(g->router, m, l->ffn_gate_inp, g->h, n);
     if (ok) ok = ds4_gpu_qwen4exp_router(g->esel, g->selw, g->router, DS4_N_EXPERT, n_used, n) != 0;
-    if (ok) ok = ds4_gpu_qwen4exp_expert_matvec(g->eg, m->map, m->size, gate->abs_offset,
-                                                (uint64_t)((const uint8_t *)gate->scales - m->map),
-                                                g->esel, g->h, 0, DS4_N_EXPERT, n_used,
-                                                (uint32_t)gate->dim[0], (uint32_t)gate->dim[1], n) != 0;
-    if (ok) ok = ds4_gpu_qwen4exp_expert_matvec(g->eu, m->map, m->size, up->abs_offset,
-                                                (uint64_t)((const uint8_t *)up->scales - m->map),
-                                                g->esel, g->h, 0, DS4_N_EXPERT, n_used,
-                                                (uint32_t)up->dim[0], (uint32_t)up->dim[1], n) != 0;
+    if (ok && n > 8u) ok = ds4_gpu_qwen4exp_expert_plan(g->eplan, g->eorder, g->esel, DS4_N_EXPERT, (uint32_t)slots) != 0;
+    if (ok) ok = qwen_graph_expert_proj(g, m, l->ffn_gate_exps, g->eg, g->h, false, n);
+    if (ok) ok = qwen_graph_expert_proj(g, m, l->ffn_up_exps, g->eu, g->h, false, n);
     if (ok) ok = ds4_gpu_swiglu_tensor(g->eg, g->eg, g->eu, (uint32_t)(slots * DS4_N_FF_EXP), 0.0f, 1.0f) != 0;
-    if (ok) ok = ds4_gpu_qwen4exp_expert_matvec(g->ed, m->map, m->size, down->abs_offset,
-                                                (uint64_t)((const uint8_t *)down->scales - m->map),
-                                                g->esel, g->eg, 1, DS4_N_EXPERT, n_used,
-                                                (uint32_t)down->dim[0], (uint32_t)down->dim[1], n) != 0;
+    if (ok) ok = qwen_graph_expert_proj(g, m, l->ffn_down_exps, g->ed, g->eg, true, n);
     if (ok) ok = qwen_graph_matmul(g->mixed, m, l->ffn_gate_shexp, g->h, n);
     if (ok) ok = qwen_graph_matmul(g->z, m, l->ffn_up_shexp, g->h, n);
     if (ok) ok = ds4_gpu_swiglu_tensor(g->mixed, g->mixed, g->z, n * DS4_N_FF_SHEXP, 0.0f, 1.0f) != 0;

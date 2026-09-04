@@ -116,22 +116,21 @@ __global__ static void qwen35_nvfp4_matvec_kernel(
  * so ds4.c passes the tensor type straight through. */
 enum { QWEN35_W_F32 = 0, QWEN35_W_BF16 = 30, QWEN35_W_NVFP4 = 40 };
 
-/* Prefill: 64x64 output tile per 256-thread block, weights of any storage
- * type dequantised to shared memory 64 input columns at a time.  Plain f32
- * FMA on f32 activations: this is the correctness path the CPU reference is
- * compared against, not the tensor-core path. */
-__global__ static void qwen35_gemm_kernel(
-        float *out, const uint8_t *w, uint32_t wtype, const float *x,
-        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, float scale) {
-    __shared__ float ws[64][65];
-    __shared__ float xs[64][65];
-    const uint32_t col0 = blockIdx.x * 64u;
-    const uint32_t row0 = blockIdx.y * 64u;
+/* Prefill GEMM tile: a 256-thread block accumulates a 64x64 output tile over
+ * the full input width, weights of any storage type dequantised to shared
+ * memory 64 input columns at a time, activations gathered through 64 row
+ * pointers (NULL rows read as zero).  Thread (tx, ty) owns rows ty*4..+3
+ * and columns tx*4..+3.  Plain f32 FMA on f32 activations: this is the
+ * correctness path the CPU reference is compared against, not the
+ * tensor-core path. */
+__device__ static void qwen35_gemm_tile(
+        float acc[4][4], float ws[64][65], float xs[64][65],
+        const uint8_t *w, uint32_t wtype, const float *const *xr,
+        uint32_t in_dim, uint32_t col0, uint32_t out_dim) {
     const uint32_t tid = threadIdx.x;
     const uint32_t tx = tid & 15u;
     const uint32_t ty = tid >> 4u;
     const uint32_t n_super = in_dim / 64u;
-    float acc[4][4] = {{0.0f}};
     for (uint32_t b = 0; b < n_super; b++) {
         {
             const uint32_t c = tid >> 2u;
@@ -158,9 +157,8 @@ __global__ static void qwen35_gemm_kernel(
         {
             const uint32_t r = tid >> 2u;
             const uint32_t k0 = (tid & 3u) * 16u;
-            const uint32_t row = row0 + r;
-            const float *src = x + (uint64_t)row * in_dim + (uint64_t)b * 64u + k0;
-            for (uint32_t j = 0; j < 16u; j++) xs[r][k0 + j] = row < n_tok ? src[j] : 0.0f;
+            const float *src = xr[r];
+            for (uint32_t j = 0; j < 16u; j++) xs[r][k0 + j] = src ? src[(uint64_t)b * 64u + k0 + j] : 0.0f;
         }
         __syncthreads();
         for (uint32_t k = 0; k < 64u; k++) {
@@ -175,6 +173,23 @@ __global__ static void qwen35_gemm_kernel(
         }
         __syncthreads();
     }
+}
+
+__global__ static void qwen35_gemm_kernel(
+        float *out, const uint8_t *w, uint32_t wtype, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, float scale) {
+    __shared__ float ws[64][65];
+    __shared__ float xs[64][65];
+    __shared__ const float *xr[64];
+    const uint32_t col0 = blockIdx.x * 64u;
+    const uint32_t row0 = blockIdx.y * 64u;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t tx = tid & 15u;
+    const uint32_t ty = tid >> 4u;
+    if (tid < 64u) xr[tid] = row0 + tid < n_tok ? x + (uint64_t)(row0 + tid) * in_dim : NULL;
+    __syncthreads();
+    float acc[4][4] = {{0.0f}};
+    qwen35_gemm_tile(acc, ws, xs, w, wtype, xr, in_dim, col0, out_dim);
     for (uint32_t i = 0; i < 4u; i++) {
         const uint32_t row = row0 + ty * 4u + i;
         if (row >= n_tok) continue;
@@ -241,6 +256,9 @@ extern "C" int ds4_gpu_qwen35_matmul(
                                                              in_dim, out_dim, n_tok, scale);
         return cuda_ok(cudaGetLastError(), "Qwen NVFP4 matvec launch");
     }
+    /* The BF16 matvec (9 GiB of bypass weights per Flash-Next decode step)
+     * already runs at the memory bandwidth GLM's kernel reaches; 16-byte
+     * vectorised loads were measured to change nothing. */
     if (wtype == QWEN35_W_BF16) {
         const dim3 grid((out_dim + 7u) / 8u, n_tok, 1u);
         glm53_matvec_bf16_f32_kernel<<<grid, 256, 0, stream>>>(o, (const uint16_t *)w, xp, in_dim, out_dim);
@@ -939,6 +957,163 @@ extern "C" int ds4_gpu_qwen4exp_expert_matvec(
         (float *)out->ptr, (const uint8_t *)w, expert_bytes, scales, (const int32_t *)sel->ptr,
         (const float *)x->ptr, x_per_slot != 0, in_dim, out_dim, n_used);
     return cuda_ok(cudaGetLastError(), "Flash-Next expert matvec launch");
+}
+
+/* Prefill grouping: the (token, slot) pairs sorted by expert so each expert's
+ * weights are read once per chunk.  plan holds four [n_expert + 1] uint32
+ * arrays: counts, slot starts, 64-row tile starts, and the scatter cursors.
+ * Slots inside an expert land in atomic order, which is harmless: every
+ * output row is computed independently and written back to its own slot. */
+enum { QWEN4EXP_PLAN_COUNT = 0, QWEN4EXP_PLAN_START = 1, QWEN4EXP_PLAN_TILE = 2, QWEN4EXP_PLAN_CURSOR = 3 };
+
+__global__ static void qwen4exp_expert_count_kernel(uint32_t *count, const int32_t *esel, uint32_t slots) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < slots) atomicAdd(&count[esel[i]], 1u);
+}
+
+/* One block of n_expert threads: exclusive scans of the slot counts and of
+ * the per-expert tile counts, plus the cursors the scatter consumes. */
+__global__ static void qwen4exp_expert_plan_kernel(uint32_t *plan, uint32_t n_expert) {
+    __shared__ uint32_t scan[QWEN4EXP_MAX_EXPERT];
+    const uint32_t e = threadIdx.x;
+    uint32_t *count = plan + QWEN4EXP_PLAN_COUNT * (n_expert + 1u);
+    uint32_t *start = plan + QWEN4EXP_PLAN_START * (n_expert + 1u);
+    uint32_t *tile = plan + QWEN4EXP_PLAN_TILE * (n_expert + 1u);
+    uint32_t *cursor = plan + QWEN4EXP_PLAN_CURSOR * (n_expert + 1u);
+    for (uint32_t pass = 0; pass < 2u; pass++) {
+        const uint32_t v = e < n_expert ? (pass == 0u ? count[e] : (count[e] + 63u) / 64u) : 0u;
+        scan[e] = v;
+        __syncthreads();
+        for (uint32_t off = 1; off < n_expert; off <<= 1) {
+            const uint32_t add = e >= off ? scan[e - off] : 0u;
+            __syncthreads();
+            scan[e] += add;
+            __syncthreads();
+        }
+        uint32_t *dst = pass == 0u ? start : tile;
+        if (e < n_expert) dst[e] = scan[e] - v;
+        if (e == n_expert - 1u) dst[n_expert] = scan[e];
+        if (pass == 0u && e < n_expert) cursor[e] = scan[e] - v;
+        __syncthreads();
+    }
+}
+
+__global__ static void qwen4exp_expert_scatter_kernel(int32_t *order, uint32_t *cursor, const int32_t *esel, uint32_t slots) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < slots) order[atomicAdd(&cursor[esel[i]], 1u)] = (int32_t)i;
+}
+
+extern "C" int ds4_gpu_qwen4exp_expert_plan(
+        ds4_gpu_tensor       *plan,         /* uint32 [4][n_expert + 1] */
+        ds4_gpu_tensor       *order,        /* int32 [slots] slot ids grouped by expert */
+        const ds4_gpu_tensor *esel,         /* int32 [slots] */
+        uint32_t              n_expert,
+        uint32_t              slots) {
+    if (n_expert == 0u || n_expert > QWEN4EXP_MAX_EXPERT || slots == 0u ||
+        !plan || plan->bytes < 4ull * (n_expert + 1u) * sizeof(uint32_t) ||
+        !order || order->bytes < (uint64_t)slots * sizeof(int32_t) ||
+        !esel || esel->bytes < (uint64_t)slots * sizeof(int32_t)) {
+        return 0;
+    }
+    cudaStream_t stream = cuda_decode_stream();
+    uint32_t *p = (uint32_t *)plan->ptr;
+    if (!cuda_ok(cudaMemsetAsync(p, 0, (n_expert + 1u) * sizeof(uint32_t), stream), "Flash-Next expert count clear")) return 0;
+    qwen4exp_expert_count_kernel<<<(slots + 255u) / 256u, 256, 0, stream>>>(p, (const int32_t *)esel->ptr, slots);
+    qwen4exp_expert_plan_kernel<<<1, QWEN4EXP_MAX_EXPERT, 0, stream>>>(p, n_expert);
+    qwen4exp_expert_scatter_kernel<<<(slots + 255u) / 256u, 256, 0, stream>>>(
+        (int32_t *)order->ptr, p + QWEN4EXP_PLAN_CURSOR * (n_expert + 1u), (const int32_t *)esel->ptr, slots);
+    return cuda_ok(cudaGetLastError(), "Flash-Next expert plan launch");
+}
+
+/* Grouped expert GEMM: block (column tile, global row tile).  The row tile
+ * maps through the tile starts to one expert and up to 64 of its slots;
+ * activations are gathered by slot (or the slot's token) and results
+ * scattered back to the slot rows, scaled per expert. */
+__global__ static void qwen4exp_expert_gemm_kernel(
+        float *out, const uint8_t *w, uint64_t expert_bytes, const float *scales,
+        const int32_t *order, const uint32_t *plan, const float *x, uint32_t x_per_slot,
+        uint32_t n_expert, uint32_t n_used, uint32_t in_dim, uint32_t out_dim) {
+    __shared__ float ws[64][65];
+    __shared__ float xs[64][65];
+    __shared__ const float *xr[64];
+    __shared__ int32_t slot_of[64];
+    __shared__ uint32_t tiles[QWEN4EXP_MAX_EXPERT + 1u];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t *start = plan + QWEN4EXP_PLAN_START * (n_expert + 1u);
+    const uint32_t *tile_start = plan + QWEN4EXP_PLAN_TILE * (n_expert + 1u);
+    for (uint32_t i = tid; i <= n_expert; i += blockDim.x) tiles[i] = tile_start[i];
+    __syncthreads();
+    const uint32_t by = blockIdx.y;
+    if (by >= tiles[n_expert]) return;
+    uint32_t lo = 0, hi = n_expert;              /* last e with tiles[e] <= by */
+    while (lo + 1u < hi) {
+        const uint32_t mid = (lo + hi) / 2u;
+        if (tiles[mid] <= by) lo = mid; else hi = mid;
+    }
+    const uint32_t e = lo;
+    const uint32_t first = start[e] + (by - tiles[e]) * 64u;
+    const uint32_t end = start[e + 1u];
+    if (tid < 64u) {
+        const uint32_t idx = first + tid;
+        const int32_t slot = idx < end ? order[idx] : -1;
+        slot_of[tid] = slot;
+        xr[tid] = slot >= 0 ? x + (uint64_t)(x_per_slot ? (uint32_t)slot : (uint32_t)slot / n_used) * in_dim : NULL;
+    }
+    __syncthreads();
+    const uint32_t col0 = blockIdx.x * 64u;
+    float acc[4][4] = {{0.0f}};
+    qwen35_gemm_tile(acc, ws, xs, w + (uint64_t)e * expert_bytes, QWEN35_W_NVFP4, xr, in_dim, col0, out_dim);
+    const float scale = scales[e];
+    const uint32_t tx = tid & 15u;
+    const uint32_t ty = tid >> 4u;
+    for (uint32_t i = 0; i < 4u; i++) {
+        const int32_t slot = slot_of[ty * 4u + i];
+        if (slot < 0) continue;
+        for (uint32_t j = 0; j < 4u; j++) {
+            const uint32_t col = col0 + tx * 4u + j;
+            if (col < out_dim) out[(uint64_t)(uint32_t)slot * out_dim + col] = acc[i][j] * scale;
+        }
+    }
+}
+
+extern "C" int ds4_gpu_qwen4exp_expert_gemm(
+        ds4_gpu_tensor       *out,          /* [rows * n_used][out_dim] */
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset, /* [n_expert][out_dim][in_dim] NVFP4 */
+        uint64_t              scales_offset, /* [n_expert] f32 */
+        const ds4_gpu_tensor *order,
+        const ds4_gpu_tensor *plan,
+        const ds4_gpu_tensor *x,
+        int                   x_per_slot,
+        uint32_t              n_expert,
+        uint32_t              n_used,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              rows) {
+    const uint64_t expert_bytes = qwen35_weight_bytes(QWEN35_W_NVFP4, in_dim, out_dim);
+    const uint64_t slots = (uint64_t)rows * n_used;
+    if (!model_map || rows == 0u || n_used == 0u || n_expert == 0u || n_expert > QWEN4EXP_MAX_EXPERT ||
+        expert_bytes == 0u || weight_offset > model_size || expert_bytes * n_expert > model_size - weight_offset ||
+        !qwen4exp_elems_fit(out, slots * out_dim) ||
+        !qwen4exp_elems_fit(x, (x_per_slot ? slots : rows) * in_dim) ||
+        !order || order->bytes < slots * sizeof(int32_t) ||
+        !plan || plan->bytes < 4ull * (n_expert + 1u) * sizeof(uint32_t)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(out);
+    const char *w = cuda_resolve_weight_ptr(model_map, weight_offset, expert_bytes * n_expert, tier,
+                                            "Flash-Next experts");
+    const float *scales = glm53_cuda_weight_f32(model_map, model_size, scales_offset, n_expert, tier,
+                                                "Flash-Next expert scales");
+    if (!w || !scales) return 0;
+    /* every expert adds at most one partial tile to the slots' full tiles */
+    const uint32_t max_tiles = (uint32_t)((slots + 63u) / 64u) + n_expert;
+    const dim3 grid((out_dim + 63u) / 64u, max_tiles, 1u);
+    qwen4exp_expert_gemm_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const uint8_t *)w, expert_bytes, scales, (const int32_t *)order->ptr,
+        (const uint32_t *)plan->ptr, (const float *)x->ptr, x_per_slot != 0, n_expert, n_used, in_dim, out_dim);
+    return cuda_ok(cudaGetLastError(), "Flash-Next expert GEMM launch");
 }
 
 /* y = sum over slots of selw * ed, plus the shared expert already in y

@@ -3267,6 +3267,27 @@ int ds4_gpu_qwen4exp_expert_matvec(
         uint32_t              in_dim,
         uint32_t              out_dim,
         uint32_t              rows);
+int ds4_gpu_qwen4exp_expert_plan(
+        ds4_gpu_tensor       *plan,
+        ds4_gpu_tensor       *order,
+        const ds4_gpu_tensor *esel,
+        uint32_t              n_expert,
+        uint32_t              slots);
+int ds4_gpu_qwen4exp_expert_gemm(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              scales_offset,
+        const ds4_gpu_tensor *order,
+        const ds4_gpu_tensor *plan,
+        const ds4_gpu_tensor *x,
+        int                   x_per_slot,
+        uint32_t              n_expert,
+        uint32_t              n_used,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              rows);
 int ds4_gpu_qwen4exp_moe_combine(
         ds4_gpu_tensor       *y,
         const ds4_gpu_tensor *ed,
