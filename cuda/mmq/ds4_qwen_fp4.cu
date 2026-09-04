@@ -87,12 +87,13 @@ __device__ __forceinline__ void mma_nvfp4(float c[4], const uint32_t a[4], const
  * operands (codes for ldmatrix, the packed scales beside them) in one of
  * two shared buffers; the next step's 8-byte global loads are issued
  * before the current step's MMAs so their latency overlaps, and one
- * barrier per step separates the buffers.  Long segments keep more of
- * every fetched 32-byte sector, so K a multiple of 256 takes KS = 4
- * (144-byte rows, the shared-memory limit at 128 columns) and the K = 640
- * down projection KS = 2; a whole-row single-buffer variant and 64-column
- * tiles were both slower.  Warp w owns rows 16*(w/4).. and columns
- * (COLS/4)*(w%4).. . */
+ * barrier per step separates the buffers.  K a multiple of 256 takes
+ * KS = 4 (144-byte rows keep more of every fetched sector; the
+ * shared-memory limit at 128 columns); the K = 640 down projection has
+ * only five steps per block, so it takes 256-column tiles to amortise the
+ * block's fixed cost (KS = 5 with 64 columns, a whole-row single buffer
+ * and 64-column tiles were all slower).  Warp w owns rows 16*(w/4).. and
+ * columns (COLS/4)*(w%4).. . */
 template <int KS, int COLS>
 __global__ void __launch_bounds__(256, 2) moe_gemm_kernel(
         float *out, const block_nvfp4 *W, const float *scales, const block_nvfp4 *xq, uint32_t x_per_slot,
@@ -273,7 +274,7 @@ extern "C" int ds4_qwen_fp4_moe_gemm(
     if (K % (4 * QK_NVFP4) == 0) {
         launch_moe_gemm<4, 128>(out, w, scales, x, x_per_slot, order, plan, n_expert, n_used, K, M, rows, stream);
     } else {
-        launch_moe_gemm<2, 128>(out, w, scales, x, x_per_slot, order, plan, n_expert, n_used, K, M, rows, stream);
+        launch_moe_gemm<2, 256>(out, w, scales, x, x_per_slot, order, plan, n_expert, n_used, K, M, rows, stream);
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }

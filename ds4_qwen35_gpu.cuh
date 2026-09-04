@@ -669,13 +669,36 @@ __global__ static void qwen35_gdn_conv_state_kernel(
 
 /* Recurrent delta rule.  Block per (v head, 4 value rows); each warp owns one
  * value row of S with four key columns per lane, and walks the tokens. */
+/* Warp-sum eight values at once by halving the set at every shuffle
+ * distance: after xor 16 each lane keeps four columns (its half), after
+ * xor 8 two, then one, which the last two steps finish.  Nine shuffles
+ * instead of forty; lane l ends with the total of column (l / 4) % 8. */
+__device__ __forceinline__ float qwen35_gdn_reduce8(const float v[8], uint32_t lane) {
+    float a[4], b[2];
+    const bool hi16 = (lane & 16u) != 0u;
+    for (uint32_t i = 0; i < 4u; i++) {
+        const float send = hi16 ? v[i] : v[i + 4u];
+        a[i] = (hi16 ? v[i + 4u] : v[i]) + __shfl_xor_sync(0xffffffffu, send, 16u);
+    }
+    const bool hi8 = (lane & 8u) != 0u;
+    for (uint32_t i = 0; i < 2u; i++) {
+        const float send = hi8 ? a[i] : a[i + 2u];
+        b[i] = (hi8 ? a[i + 2u] : a[i]) + __shfl_xor_sync(0xffffffffu, send, 8u);
+    }
+    const bool hi4 = (lane & 4u) != 0u;
+    float s = (hi4 ? b[1] : b[0]) + __shfl_xor_sync(0xffffffffu, hi4 ? b[0] : b[1], 4u);
+    s += __shfl_xor_sync(0xffffffffu, s, 2u);
+    s += __shfl_xor_sync(0xffffffffu, s, 1u);
+    return s;
+}
+
 __global__ static void qwen35_gdn_recurrence_kernel(
         float *o, float *state, const float *mixed, const float *alpha, const float *beta,
         const float *a_neg, const float *dt_bias,
         uint32_t n_k, uint32_t n_v, uint32_t n_tokens, float q_scale) {
     const uint32_t hd = QWEN35_CUDA_GDN_DIM;
     const uint32_t hv = blockIdx.x;
-    const uint32_t v0 = blockIdx.y * 16u + (threadIdx.x >> 5u) * 4u;   /* this warp's four value columns */
+    const uint32_t v0 = blockIdx.y * 32u + (threadIdx.x >> 5u) * 8u;   /* this warp's eight value columns */
     const uint32_t lane = threadIdx.x & 31u;
     if (hv >= n_v || v0 >= hd) return;
     const uint32_t hk = hv % n_k;
@@ -683,50 +706,51 @@ __global__ static void qwen35_gdn_recurrence_kernel(
     const uint32_t k0 = lane * 4u;
     const float a_head = a_neg[hv];
     const float dt_head = dt_bias[hv];
-    float4 h[4];
-    for (uint32_t c = 0; c < 4u; c++) h[c] = *(const float4 *)(state + ((uint64_t)hv * hd + v0 + c) * hd + k0);
-    /* The token chain is latency-bound, so the next token's inputs are
-     * fetched a step ahead and the four columns' reductions overlap. */
+    /* after qwen35_gdn_reduce8 this lane holds the total of column `mine` */
+    const uint32_t mine = (lane >> 2u) & 7u;
+    float4 h[8];
+    for (uint32_t c = 0; c < 8u; c++) h[c] = *(const float4 *)(state + ((uint64_t)hv * hd + v0 + c) * hd + k0);
+    /* The token chain is instruction-bound, so the next token's inputs are
+     * fetched a step ahead and eight columns share every per-token cost. */
     float4 q_next = *(const float4 *)(mixed + hk * hd + k0);
     float4 k_next = *(const float4 *)(mixed + (n_k + hk) * hd + k0);
-    float4 v_next = *(const float4 *)(mixed + (2u * n_k + hv) * hd + v0);
+    float4 va_next = *(const float4 *)(mixed + (2u * n_k + hv) * hd + v0);
+    float4 vb_next = *(const float4 *)(mixed + (2u * n_k + hv) * hd + v0 + 4u);
     float alpha_next = alpha[hv];
     float beta_next = beta[hv];
     for (uint32_t t = 0; t < n_tokens; t++) {
-        const float4 q4 = q_next, k4 = k_next, v4 = v_next;
+        const float4 q4 = q_next, k4 = k_next, va = va_next, vb = vb_next;
         const float alpha_t = alpha_next, beta_t = beta_next;
         if (t + 1u < n_tokens) {
             const float *row = mixed + (uint64_t)(t + 1u) * conv_dim;
             q_next = *(const float4 *)(row + hk * hd + k0);
             k_next = *(const float4 *)(row + (n_k + hk) * hd + k0);
-            v_next = *(const float4 *)(row + (2u * n_k + hv) * hd + v0);
+            va_next = *(const float4 *)(row + (2u * n_k + hv) * hd + v0);
+            vb_next = *(const float4 *)(row + (2u * n_k + hv) * hd + v0 + 4u);
             alpha_next = alpha[(uint64_t)(t + 1u) * n_v + hv];
             beta_next = beta[(uint64_t)(t + 1u) * n_v + hv];
         }
         const float decay = expf(a_head * qwen35_cuda_softplus(alpha_t + dt_head));
         const float b = qwen35_cuda_sigmoid(beta_t);
-        const float vval[4] = { v4.x, v4.y, v4.z, v4.w };
-        float sk[4], res[4];
-        for (uint32_t c = 0; c < 4u; c++) {
+        const float vval[8] = { va.x, va.y, va.z, va.w, vb.x, vb.y, vb.z, vb.w };
+        float sk[8], res[8];
+        for (uint32_t c = 0; c < 8u; c++) {
             h[c].x *= decay; h[c].y *= decay; h[c].z *= decay; h[c].w *= decay;
             sk[c] = dot4_f32(h[c], k4);
         }
-        for (uint32_t c = 0; c < 4u; c++) sk[c] = __shfl_sync(0xffffffffu, warp_sum_f32(sk[c]), 0);
-        for (uint32_t c = 0; c < 4u; c++) {
-            const float delta = (vval[c] - sk[c]) * b;
+        const float sk_mine = qwen35_gdn_reduce8(sk, lane);
+        for (uint32_t c = 0; c < 8u; c++) {
+            const float delta = (vval[c] - __shfl_sync(0xffffffffu, sk_mine, c * 4u)) * b;
             h[c].x = fmaf(k4.x, delta, h[c].x);
             h[c].y = fmaf(k4.y, delta, h[c].y);
             h[c].z = fmaf(k4.z, delta, h[c].z);
             h[c].w = fmaf(k4.w, delta, h[c].w);
             res[c] = dot4_f32(h[c], q4);
         }
-        for (uint32_t c = 0; c < 4u; c++) res[c] = __shfl_sync(0xffffffffu, warp_sum_f32(res[c]), 0);
-        if (lane == 0u) {
-            *(float4 *)(o + (uint64_t)t * n_v * hd + hv * hd + v0) =
-                make_float4(res[0] * q_scale, res[1] * q_scale, res[2] * q_scale, res[3] * q_scale);
-        }
+        const float res_mine = qwen35_gdn_reduce8(res, lane);
+        if ((lane & 3u) == 0u) o[(uint64_t)t * n_v * hd + hv * hd + v0 + mine] = res_mine * q_scale;
     }
-    for (uint32_t c = 0; c < 4u; c++) *(float4 *)(state + ((uint64_t)hv * hd + v0 + c) * hd + k0) = h[c];
+    for (uint32_t c = 0; c < 8u; c++) *(float4 *)(state + ((uint64_t)hv * hd + v0 + c) * hd + k0) = h[c];
 }
 
 /* RMSNormGated per head: normalise, scale, then multiply by the output gate,
@@ -805,7 +829,7 @@ extern "C" int ds4_gpu_qwen35_gdn(
     qwen35_gdn_conv_state_kernel<<<(unsigned)((conv_dim + 255u) / 256u), 256, 0, stream>>>(
         (float *)conv_state->ptr, (const float *)qkv->ptr, (uint32_t)conv_dim,
         n_conv - 1u, n_tokens);
-    qwen35_gdn_recurrence_kernel<<<dim3(n_v, hd / 16u, 1u), 128, 0, stream>>>(
+    qwen35_gdn_recurrence_kernel<<<dim3(n_v, hd / 32u, 1u), 128, 0, stream>>>(
         (float *)out->ptr, (float *)ssm_state->ptr, (const float *)mixed->ptr,
         (const float *)alpha->ptr, (const float *)beta->ptr, a_neg, dt_bias,
         n_k, n_v, n_tokens, rsqrtf((float)hd));
