@@ -16702,47 +16702,18 @@ static bool qwen_graph_qsa_select(
 /* `next` is the following layer when its attention sub-layer reads the
  * residual as this layer leaves it (no PLE in between), so the last
  * combine can fold in its stream norm. */
-static bool qwen_graph_layer(
+/* The token mixer's output projection through the end of the layer:
+ * residual, then the FFN sub-layer (routed and shared experts, or the 2B's
+ * dense FFN), then the residual again with the next layer's norm folded in. */
+static bool qwen_graph_layer_tail(
         ds4_qwen_gpu_graph    *g,
         const ds4_model         *m,
         const ds4_layer_weights *l,
         const ds4_layer_weights *next,
-        uint32_t                 il,
-        uint32_t                 n,
-        uint32_t                 pos0) {
-    bool ok = true;
-    /* Flash-Next prefill keeps the token-mixer output in bf16 for its out
-     * projection (the checkpoint's recipe); decode and the 2B read it in f32 */
-    ds4_gpu_tensor *att_bf16 = n > 8u && ds4_qwen_has_hc() ? g->att_bf16 : NULL;
-    if (ds4_qwen_layer_has_ple(il)) ok = qwen_graph_ple(g, m, l, n);
-    if (ok) ok = qwen_graph_sublayer_in(g, m, l->attn_norm, &l->hc_mix_attn, n);
-    if (ds4_qwen_layer_is_gdn(il)) {
-        if (ok) ok = qwen_graph_matmul_h(g, g->proj, m, l->attn_qkv, n);
-        if (ok) ok = qwen_graph_matmul_h(g, g->z, m, l->attn_gate, n);
-        if (ok) ok = qwen_graph_matmul_h(g, g->alpha, m, l->ssm_alpha, n);
-        if (ok) ok = qwen_graph_matmul_h(g, g->beta, m, l->ssm_beta, n);
-        if (ok) ok = ds4_gpu_qwen35_gdn(g->att, att_bf16, g->mixed, g->conv_state[il], g->ssm_state[il],
-                                        g->proj, g->z, g->alpha, g->beta, m->map, m->size,
-                                        l->ssm_conv1d->abs_offset, l->ssm_a->abs_offset,
-                                        l->ssm_dt->abs_offset, l->ssm_norm->abs_offset,
-                                        DS4_N_KDA_HEAD, DS4_N_KDA_V_HEAD, DS4_N_KDA_CONV,
-                                        n, DS4_MODEL_VARIANT == DS4_VARIANT_QWEN4EXP, DS4_RMS_EPS) != 0;
-        if (ok) ok = qwen_graph_matmul_bf16(g->y, m, l->ssm_out, g->att, att_bf16, n);
-    } else {
-        const bool sparse = ok && qwen_graph_qsa_select(g, m, l, il, n, pos0, &ok);
-        if (ok) ok = qwen_graph_matmul_h(g, g->proj, m, l->attn_q, n);
-        if (ok) ok = qwen_graph_matmul_h(g, g->k, m, l->attn_k, n);
-        if (ok) ok = qwen_graph_matmul_h(g, g->v, m, l->attn_v, n);
-        /* Flash-Next attends in the checkpoint's bf16; the 2B keeps the f32-exact operands (its CPU guard) */
-        if (ok) ok = ds4_gpu_qwen35_attention(g->att, att_bf16, !ds4_qwen_has_hc(), g->att_part, g->att_split, g->proj,
-                                              g->k_cache[il], g->v_cache[il],
-                                              g->k, g->v, sparse ? g->sel : NULL, g->n_sel, g->max_sel,
-                                              m->map, m->size,
-                                              l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
-                                              DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
-                                              g->ctx, pos0, n, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) != 0;
-        if (ok) ok = qwen_graph_matmul_bf16(g->y, m, l->attn_output, g->att, att_bf16, n);
-    }
+        const ds4_tensor        *out_proj,
+        ds4_gpu_tensor          *att_bf16,
+        uint32_t                 n) {
+    bool ok = qwen_graph_matmul_bf16(g->y, m, out_proj, g->att, att_bf16, n);
     if (ok) ok = qwen_graph_sublayer_out(g, m, &l->hc_mix_ffn, n);
     if (ok) ok = qwen_graph_sublayer_in(g, m, l->post_attention_norm, &l->hc_mix_ffn, n);
     if (ds4_qwen_is_moe()) {
@@ -16753,7 +16724,110 @@ static bool qwen_graph_layer(
         if (ok) ok = ds4_gpu_swiglu_tensor(g->mixed, g->mixed, g->z, n * DS4_N_FF_DENSE, 0.0f, 1.0f) != 0;
         if (ok) ok = qwen_graph_matmul(g->y, m, l->ffn_down, g->mixed, n);
     }
-    if (ok) ok = qwen_graph_sublayer_out(g, m, next ? &next->hc_mix_attn : NULL, n);
+    return ok && qwen_graph_sublayer_out(g, m, next ? &next->hc_mix_attn : NULL, n);
+}
+
+/* One island of a layer: the runs of kernels whose launch arguments do not
+ * depend on the position, so a single-token step can replay them as a
+ * captured CUDA graph.  A GDN layer is one island (0); an attention layer
+ * splits around its position-dependent middle (RoPE, block keys, block
+ * selection and the attention itself) into island 0, the input sub-layer
+ * and the q/k/v projections, and island 1, the tail. */
+static bool qwen_graph_layer_island(
+        ds4_qwen_gpu_graph    *g,
+        const ds4_model         *m,
+        const ds4_layer_weights *l,
+        const ds4_layer_weights *next,
+        uint32_t                 il,
+        uint32_t                 island,
+        ds4_gpu_tensor          *att_bf16,
+        uint32_t                 n) {
+    bool ok = true;
+    if (island == 1u) return qwen_graph_layer_tail(g, m, l, next, l->attn_output, att_bf16, n);
+    if (ds4_qwen_layer_has_ple(il)) ok = qwen_graph_ple(g, m, l, n);
+    if (ok) ok = qwen_graph_sublayer_in(g, m, l->attn_norm, &l->hc_mix_attn, n);
+    if (!ds4_qwen_layer_is_gdn(il)) {
+        if (ok) ok = qwen_graph_matmul_h(g, g->proj, m, l->attn_q, n);
+        if (ok) ok = qwen_graph_matmul_h(g, g->k, m, l->attn_k, n);
+        if (ok) ok = qwen_graph_matmul_h(g, g->v, m, l->attn_v, n);
+        return ok;
+    }
+    if (ok) ok = qwen_graph_matmul_h(g, g->proj, m, l->attn_qkv, n);
+    if (ok) ok = qwen_graph_matmul_h(g, g->z, m, l->attn_gate, n);
+    if (ok) ok = qwen_graph_matmul_h(g, g->alpha, m, l->ssm_alpha, n);
+    if (ok) ok = qwen_graph_matmul_h(g, g->beta, m, l->ssm_beta, n);
+    if (ok) ok = ds4_gpu_qwen35_gdn(g->att, att_bf16, g->mixed, g->conv_state[il], g->ssm_state[il],
+                                    g->proj, g->z, g->alpha, g->beta, m->map, m->size,
+                                    l->ssm_conv1d->abs_offset, l->ssm_a->abs_offset,
+                                    l->ssm_dt->abs_offset, l->ssm_norm->abs_offset,
+                                    DS4_N_KDA_HEAD, DS4_N_KDA_V_HEAD, DS4_N_KDA_CONV,
+                                    n, DS4_MODEL_VARIANT == DS4_VARIANT_QWEN4EXP, DS4_RMS_EPS) != 0;
+    return ok && qwen_graph_layer_tail(g, m, l, next, l->ssm_out, att_bf16, n);
+}
+
+/* Run an island: for a single-token step through the decode graph cache
+ * (replay when captured; capture on the second visit; eager otherwise),
+ * else eagerly.  A failed capture executed nothing, so the island is then
+ * encoded eagerly. */
+static bool qwen_graph_layer_run_island(
+        ds4_qwen_gpu_graph    *g,
+        const ds4_model         *m,
+        const ds4_layer_weights *l,
+        const ds4_layer_weights *next,
+        uint32_t                 il,
+        uint32_t                 island,
+        ds4_gpu_tensor          *att_bf16,
+        uint32_t                 n,
+        bool                     graphs) {
+    if (graphs) {
+        ds4_decode_graph_key key;
+        memset(&key, 0, sizeof key);
+        key.il = il;
+        key.island = island;
+        key.cur_hc = g->x;          /* the scratch whose addresses the kernels bake in */
+        key.after_attn_hc = g->h;
+        key.after_ffn_hc = g->y;
+        key.attn_norm = g->att;
+        const int state = ds4_gpu_decode_graph_begin(&key);
+        if (state == 1) return true;
+        if (state == 0) {
+            if (!qwen_graph_layer_island(g, m, l, next, il, island, att_bf16, n)) {
+                ds4_gpu_decode_graph_abort(&key);
+                return false;
+            }
+            if (ds4_gpu_decode_graph_end(&key) == 0) return true;
+        }
+    }
+    return qwen_graph_layer_island(g, m, l, next, il, island, att_bf16, n);
+}
+
+static bool qwen_graph_layer(
+        ds4_qwen_gpu_graph    *g,
+        const ds4_model         *m,
+        const ds4_layer_weights *l,
+        const ds4_layer_weights *next,
+        uint32_t                 il,
+        uint32_t                 n,
+        uint32_t                 pos0) {
+    /* Flash-Next prefill keeps the token-mixer output in bf16 for its out
+     * projection (the checkpoint's recipe); decode and the 2B read it in f32 */
+    ds4_gpu_tensor *att_bf16 = n > 8u && ds4_qwen_has_hc() ? g->att_bf16 : NULL;
+    static int trace = -1;
+    if (trace < 0) trace = getenv("DS4_QWEN_TRACE") != NULL;
+    const bool graphs = n == 1u && !trace && ds4_gpu_decode_graphs_supported();
+    bool ok = qwen_graph_layer_run_island(g, m, l, next, il, 0u, att_bf16, n, graphs);
+    if (ok && !ds4_qwen_layer_is_gdn(il)) {
+        const bool sparse = qwen_graph_qsa_select(g, m, l, il, n, pos0, &ok);
+        /* Flash-Next attends in the checkpoint's bf16; the 2B keeps the f32-exact operands (its CPU guard) */
+        if (ok) ok = ds4_gpu_qwen35_attention(g->att, att_bf16, !ds4_qwen_has_hc(), g->att_part, g->att_split, g->proj,
+                                              g->k_cache[il], g->v_cache[il],
+                                              g->k, g->v, sparse ? g->sel : NULL, g->n_sel, g->max_sel,
+                                              m->map, m->size,
+                                              l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
+                                              DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
+                                              g->ctx, pos0, n, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) != 0;
+        if (ok) ok = qwen_graph_layer_run_island(g, m, l, next, il, 1u, att_bf16, n, graphs);
+    }
     /* DS4_QWEN_TRACE=1: the CPU reference's per-layer norms for the chunk's
      * last row, to locate a divergence by layer and position. */
     if (ok && getenv("DS4_QWEN_TRACE")) {
