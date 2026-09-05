@@ -68931,8 +68931,11 @@ static int qwen_session_eval_graph(ds4_session *s, int token, char *err, size_t 
  * sample.  The drafter then re-reads the committed rows with the target's
  * streams (its own drafts' streams are only approximations) and keeps the
  * last row pending.  Returns the number of committed tokens, or -1. */
-static int qwen_session_spec_cycle(ds4_session *s, int first_token, int *accepted, int cap, char *err, size_t errlen) {
+static int qwen_session_spec_cycle(
+        ds4_session *s, int first_token, float temperature, int top_k, float top_p, float min_p, uint64_t *rng,
+        int *accepted, int cap, char *err, size_t errlen) {
     ds4_engine *e = s->engine;
+    const bool sampling = temperature > 0.0f && rng != NULL;
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
     const uint64_t row_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * 2u;
     const uint64_t khist_bytes = (uint64_t)(g_ds4_compress_ratios[DS4_N_LAYER] - 1u) * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
@@ -68977,17 +68980,42 @@ static int qwen_session_spec_cycle(ds4_session *s, int first_token, int *accepte
         snprintf(err, errlen, "Qwen MTP verify failed");
         return -1;
     }
+    /* Greedy: a draft is accepted when it is the target's argmax.  Sampling:
+     * the drafter's guess is a point-mass proposal, accepted with the
+     * target probability of that token under the loop's sampling
+     * parameters and otherwise replaced by a sample from the target
+     * distribution without it, which keeps the output distributed exactly
+     * as the target (speculative sampling with q = 1).  The replacement is
+     * handed to the loop as a one-hot distribution, so its next sample is
+     * that token and the next cycle evaluates it. */
     int a = 0;
+    int replacement = -1;
     while (a < k) {
         const float *row = s->qwen_mtp_rows + (uint64_t)a * DS4_N_VOCAB;
-        int best = 0;
-        for (int t = 1; t < (int)DS4_N_VOCAB; t++) {
-            if (row[t] > row[best]) best = t;
+        const int d = toks[a + 1];
+        if (sampling) {
+            if (!sample_build_probabilities(row, DS4_N_VOCAB, temperature, top_k, top_p, min_p, s->sample_probs)) {
+                snprintf(err, errlen, "Qwen MTP target distribution failed");
+                return -1;
+            }
+            if (!speculative_point_accept(s->sample_probs[d], 1.0f, rng)) {
+                replacement = speculative_point_replacement(s, d, rng);
+                break;
+            }
+        } else {
+            int best = 0;
+            for (int t = 1; t < (int)DS4_N_VOCAB; t++) {
+                if (row[t] > row[best]) best = t;
+            }
+            if (best != d) break;
         }
-        if (best != toks[a + 1]) break;
         a++;
     }
     memcpy(s->logits, s->qwen_mtp_rows + (uint64_t)a * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
+    if (replacement >= 0) {
+        for (uint32_t t = 0; t < DS4_N_VOCAB; t++) s->logits[t] = -1e30f;
+        s->logits[replacement] = 0.0f;
+    }
     if (a < k && !qwen_graph_rollback(g, pos, (uint32_t)a + 1u)) {
         snprintf(err, errlen, "Qwen MTP rollback failed");
         return -1;
@@ -76669,7 +76697,7 @@ static int ds4_session_eval_speculative_argmax_impl(
     }
 #ifdef DS4_QWEN_GPU
     if (ds4_model_is_qwen() && s->qwen_graph.mtp && accepted) {
-        return qwen_session_spec_cycle(s, first_token, accepted,
+        return qwen_session_spec_cycle(s, first_token, 0.0f, 0, 1.0f, 0.0f, NULL, accepted,
                                        accepted_cap < max_tokens ? accepted_cap : max_tokens, err, errlen);
     }
 #endif
@@ -77484,6 +77512,12 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     return 1;
 #else
     ds4_engine *e = s->engine;
+#ifdef DS4_QWEN_GPU
+    if (ds4_model_is_qwen() && s->qwen_graph.mtp) {
+        return qwen_session_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng, accepted,
+                                       accepted_cap < max_tokens ? accepted_cap : max_tokens, err, errlen);
+    }
+#endif
     if (ds4_session_is_glm(s)) {
         if (!e || !e->glm_mtp || DS4_N_NEXTN_PREDICT == 0 ||
             !s->glm_graph_ready ||
