@@ -16733,7 +16733,9 @@ static bool qwen_graph_layer(
         if (ok) ok = qwen_graph_matmul_h(g, g->proj, m, l->attn_q, n);
         if (ok) ok = qwen_graph_matmul_h(g, g->k, m, l->attn_k, n);
         if (ok) ok = qwen_graph_matmul_h(g, g->v, m, l->attn_v, n);
-        if (ok) ok = ds4_gpu_qwen35_attention(g->att, att_bf16, g->att_part, g->att_split, g->proj, g->k_cache[il], g->v_cache[il],
+        /* Flash-Next attends in the checkpoint's bf16; the 2B keeps the f32-exact operands (its CPU guard) */
+        if (ok) ok = ds4_gpu_qwen35_attention(g->att, att_bf16, !ds4_qwen_has_hc(), g->att_part, g->att_split, g->proj,
+                                              g->k_cache[il], g->v_cache[il],
                                               g->k, g->v, sparse ? g->sel : NULL, g->n_sel, g->max_sel,
                                               m->map, m->size,
                                               l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,

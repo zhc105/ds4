@@ -3156,6 +3156,7 @@ int ds4_gpu_qwen35_gdn(
 int ds4_gpu_qwen35_attention(
         ds4_gpu_tensor       *att,
         ds4_gpu_tensor       *att_bf16,
+        int                   exact,
         ds4_gpu_tensor       *part,
         ds4_gpu_tensor       *split,
         ds4_gpu_tensor       *qg,
