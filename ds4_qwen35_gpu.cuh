@@ -2069,9 +2069,11 @@ __device__ __forceinline__ void qwen4exp_rope_shared(float *head, uint32_t n_rot
 }
 
 /* Block per token; only the token that completes a block writes its key,
- * summing the block's raw keys in position order like the CPU ring. */
+ * summing the block's raw keys in position order like the CPU ring.  The
+ * cache holds the keys in bf16, the scoring GEMM's operand, so a long
+ * context is never re-converted per token. */
 __global__ static void qwen4exp_block_key_kernel(
-        float *bkey, const float *raw, const float *hist, const float *k_norm,
+        __nv_bfloat16 *bkey, const float *raw, const float *hist, const float *k_norm,
         uint32_t d, uint32_t r, uint32_t n_rot, uint32_t pos0, uint32_t n_tokens, float freq_base, float eps) {
     __shared__ float scratch[32];
     __shared__ float kb[QWEN4EXP_INDEXER_MAX_DIM];
@@ -2090,7 +2092,7 @@ __global__ static void qwen4exp_block_key_kernel(
     __syncthreads();
     qwen4exp_rope_shared(kb, n_rot, pos + 1u - r, freq_base);
     __syncthreads();
-    bkey[(uint64_t)(pos / r) * d + tid] = kb[tid];
+    bkey[(uint64_t)(pos / r) * d + tid] = __float2bfloat16(kb[tid]);
 }
 
 extern "C" int ds4_gpu_qwen4exp_block_keys(
@@ -2110,7 +2112,7 @@ extern "C" int ds4_gpu_qwen4exp_block_keys(
         float                 eps) {
     if (!model_map || d == 0u || d > QWEN4EXP_INDEXER_MAX_DIM || d % 32u != 0u || r < 2u || n_rot == 0u ||
         n_rot % 2u != 0u || n_rot > d || n_tokens == 0u || pos0 + n_tokens > ctx ||
-        !qwen4exp_elems_fit(bkey, (uint64_t)(ctx / r) * d) || !qwen4exp_elems_fit(raw, (uint64_t)n_tokens * d) ||
+        !qwen4exp_bf16_fit(bkey, (uint64_t)(ctx / r) * d) || !qwen4exp_elems_fit(raw, (uint64_t)n_tokens * d) ||
         !qwen4exp_elems_fit(hist, (uint64_t)(r - 1u) * d)) {
         return 0;
     }
@@ -2119,7 +2121,7 @@ extern "C" int ds4_gpu_qwen4exp_block_keys(
     if (!k_norm) return 0;
     cudaStream_t stream = cuda_decode_stream();
     qwen4exp_block_key_kernel<<<n_tokens, d, 0, stream>>>(
-        (float *)bkey->ptr, (const float *)raw->ptr, (const float *)hist->ptr, k_norm,
+        (__nv_bfloat16 *)bkey->ptr, (const float *)raw->ptr, (const float *)hist->ptr, k_norm,
         d, r, n_rot, pos0, n_tokens, freq_base, eps);
     qwen35_gdn_conv_state_kernel<<<(d + 255u) / 256u, 256, 0, stream>>>(
         (float *)hist->ptr, (const float *)raw->ptr, d, r - 1u, n_tokens);
@@ -2325,7 +2327,7 @@ extern "C" int ds4_gpu_qwen4exp_qsa_select(
         ds4_gpu_tensor       *keys,         /* uint64 [keys_rows][ctx / r] scratch, one row per concurrent token */
         uint32_t              keys_rows,
         const ds4_gpu_tensor *q,            /* [n_tok][n_head][d] normalised, rotated */
-        const ds4_gpu_tensor *bkey,         /* [ctx / r][d] */
+        const ds4_gpu_tensor *bkey,         /* bf16 [ctx / r][d] */
         uint32_t              n_head,
         uint32_t              d,
         uint32_t              r,
@@ -2340,21 +2342,18 @@ extern "C" int ds4_gpu_qwen4exp_qsa_select(
         !sel || sel->bytes < (uint64_t)n_tokens * max_sel * sizeof(int32_t) ||
         !n_sel || n_sel->bytes < (uint64_t)n_tokens * sizeof(uint32_t) ||
         !keys || keys->bytes < (uint64_t)keys_rows * max_blocks * sizeof(uint64_t) ||
-        !qwen4exp_elems_fit(q, (uint64_t)n_tokens * n_head * d) || !qwen4exp_elems_fit(bkey, max_blocks * d)) {
+        !qwen4exp_elems_fit(q, (uint64_t)n_tokens * n_head * d) || !qwen4exp_bf16_fit(bkey, max_blocks * d)) {
         return 0;
     }
     if (d % 16u != 0u || d > QWEN4EXP_INDEXER_MAX_DIM) return 0;
     cudaStream_t stream = cuda_decode_stream();
     const int tier = ds4_tensor_device_idx(sel);
-    /* bf16 operands for the scores: the chunk's queries and every block key it can see */
-    const uint64_t n_blocks = (uint64_t)(pos0 + n_tokens) / r;
+    /* the scores' operands: the chunk's queries in bf16, the block keys as cached */
     const uint64_t qn = (uint64_t)n_tokens * n_head * d;
-    /* one temporary: the allocator hands out a single reusable scratch */
-    __nv_bfloat16 *qb = (__nv_bfloat16 *)cuda_tmp_alloc_on(tier, (qn + n_blocks * d) * sizeof(__nv_bfloat16), "indexer operands");
+    __nv_bfloat16 *qb = (__nv_bfloat16 *)cuda_tmp_alloc_on(tier, qn * sizeof(__nv_bfloat16), "indexer queries");
     if (!qb) return 0;
-    __nv_bfloat16 *kb = qb + qn;
+    const __nv_bfloat16 *kb = (const __nv_bfloat16 *)bkey->ptr;
     qwen35_to_bf16(qb, (const float *)q->ptr, qn, stream);
-    if (n_blocks) qwen35_to_bf16(kb, (const float *)bkey->ptr, n_blocks * d, stream);
     /* tokens go in groups of keys_rows, each scoring into its own scratch row */
     for (uint32_t g0 = 0; g0 < n_tokens; g0 += keys_rows) {
         const uint32_t ng = n_tokens - g0 < keys_rows ? n_tokens - g0 : keys_rows;

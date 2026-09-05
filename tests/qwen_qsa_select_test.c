@@ -70,9 +70,17 @@ static int run_case(uint32_t pos0, uint32_t n_tokens, unsigned seed,
     if (!q || !bkey || !score || !got || !got_n || !want) return 1;
     for (uint64_t i = 0; i < n_q; i++) q[i] = coarse(&seed);
     for (uint64_t i = 0; i < n_b; i++) bkey[i] = coarse(&seed);
+    /* the block key cache is bf16; these values are exact in it */
+    uint16_t *bkey_bf16 = malloc(n_b * sizeof(uint16_t));
+    if (!bkey_bf16) return 1;
+    for (uint64_t i = 0; i < n_b; i++) {
+        uint32_t bits;
+        memcpy(&bits, &bkey[i], sizeof bits);
+        bkey_bf16[i] = (uint16_t)(bits >> 16);
+    }
     int rc = 1;
     if (ds4_gpu_tensor_write(q_t, 0, q, n_q * sizeof(float)) &&
-        ds4_gpu_tensor_write(bkey_t, 0, bkey, n_b * sizeof(float)) &&
+        ds4_gpu_tensor_write(bkey_t, 0, bkey_bf16, n_b * sizeof(uint16_t)) &&
         ds4_gpu_qwen4exp_qsa_select(sel_t, n_sel_t, keys_t, ROWS, q_t, bkey_t,
                                     N_HEAD, D, R, BUDGET, MAX_SEL, CTX, pos0, n_tokens) &&
         ds4_gpu_synchronize() &&
@@ -119,7 +127,7 @@ static int run_case(uint32_t pos0, uint32_t n_tokens, unsigned seed,
         }
     }
     printf("qsa-select: pos0 %u, %u tokens: %s\n", pos0, n_tokens, rc ? "FAIL" : "ok");
-    free(q); free(bkey); free(score); free(got); free(got_n); free(want);
+    free(q); free(bkey); free(bkey_bf16); free(score); free(got); free(got_n); free(want);
     return rc;
 }
 

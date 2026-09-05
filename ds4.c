@@ -16286,7 +16286,7 @@ typedef struct {
     /* QSA (see qwen_attention_cells): per layer the block key cache and the
      * raw keys of the block being filled; per chunk the raw keys, the
      * indexer queries, the selected cells and the select scratch. */
-    ds4_gpu_tensor *bkey[DS4_MAX_LAYER];    /* [ctx / ratio][idx_dim] */
+    ds4_gpu_tensor *bkey[DS4_MAX_LAYER];    /* bf16 [ctx / ratio][idx_dim] */
     ds4_gpu_tensor *khist[DS4_MAX_LAYER];   /* [ratio - 1][idx_dim], oldest first */
     ds4_gpu_tensor *ikraw;       /* [max_rows][idx_dim] */
     ds4_gpu_tensor *iq;          /* [max_rows][n_idx_head][idx_dim] */
@@ -16367,7 +16367,7 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
             g->v_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim, &ok);
             if (ds4_qwen_layer_is_qsa(il)) {
                 const uint32_t r = g_ds4_compress_ratios[il];
-                g->bkey[il] = qwen_graph_tensor((uint64_t)(ctx / r) * DS4_N_INDEXER_HEAD_DIM, &ok);
+                g->bkey[il] = qwen_graph_tensor((uint64_t)(ctx / r) * DS4_N_INDEXER_HEAD_DIM / 2u, &ok);   /* bf16 */
                 g->khist[il] = qwen_graph_tensor((uint64_t)(r - 1u) * DS4_N_INDEXER_HEAD_DIM, &ok);
                 if (r > max_ratio) max_ratio = r;
             }
