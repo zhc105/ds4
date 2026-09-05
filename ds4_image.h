@@ -82,6 +82,17 @@ int ds4_image_preprocess_glm53(
         char              *error,
         size_t             error_cap);
 
+/* Qwen3-VL preprocessing: smart resize to a 32-pixel grid within the pixel
+ * budget, mean/std 0.5 normalization, 16x16 patches in 2x2 block order with
+ * the frame repeated for the temporal pair (1536 values per patch). */
+int ds4_image_preprocess_qwen(
+        ds4_image_patches *out,
+        const ds4_image   *image,
+        uint32_t           min_pixels,
+        uint32_t           max_pixels,
+        char              *error,
+        size_t             error_cap);
+
 void ds4_image_patches_free(ds4_image_patches *patches);
 
 int ds4_image_preprocess_deepseek4(

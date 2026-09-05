@@ -177,6 +177,7 @@ typedef struct {
 typedef struct {
     float *data;
     uint32_t token_count;
+    uint32_t dim;          /* values per token row (the model's embedding width) */
     uint32_t layout;
     uint32_t grid_width;
     uint32_t grid_height;

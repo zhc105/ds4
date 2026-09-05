@@ -32,6 +32,8 @@
 /tests/test_sampling
 /tests/test_glm53_kda
 /tests/test_deepseek4_vision_image
+/tests/test_qwen_vision_image
+/tests/test_qwen_vision_engine
 *.o
 *.dSYM/
 __pycache__/

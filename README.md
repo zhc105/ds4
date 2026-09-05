@@ -301,6 +301,31 @@ gap on the CPU so such a position can be confirmed as a tie.  The QSA
 selection kernel itself is checked exactly by `tests/qwen_qsa_select_test`
 (`make cuda-regression`).
 
+### Flash-Next vision
+
+Qwen3.8-Flash-Next ships the Qwen3-VL vision tower (27 SigLIP blocks, a 2x2
+merger to the 2560-wide language embedding).  The converter writes it as its
+own 0.84 GB GGUF and the CUDA build runs it when the sidecar is passed:
+
+```sh
+python3 gguf-tools/qwen_convert.py hf/Qwen3.8-Flash-Next-NVFP4 \
+  -o gguf/Qwen3.8-Flash-Next-Vision.gguf --vision
+./ds4-server --cuda -m gguf/Qwen3.8-Flash-Next-NVFP4.gguf \
+  --vision gguf/Qwen3.8-Flash-Next-Vision.gguf \
+  --mtp-model gguf/Qwen3.8-Flash-Next-MTP.gguf --mtp-draft 3
+```
+
+Images are resized to a 32-pixel grid within the processor's pixel budget
+(65536 to 16777216 pixels), so a 1400x900 screenshot becomes 1232 image
+tokens.  The prompt carries them as `<|vision_start|>`, one `<|image_pad|>`
+per 2x2 block and `<|vision_end|>`, at sequential positions like vLLM serves
+this checkpoint.  The CLI `/read`, `ds4-agent --vision` and the server's
+OpenAI, Responses and Anthropic image blocks work as for GLM 5.3 below.
+`tests/test_qwen_vision_engine` dumps the embeddings of one image for
+`tests/qwen_vision_ref.py` (transformers, f32) to compare: they agree to a
+cosine of 0.9999 on a losslessly decoded image, and `tests/test_qwen_vision_image`
+(`make test`) pins the resize and patch layout.
+
 ## GLM 5.3 Flash
 
 GLM 5.3 Flash uses a separate graph for its recurrent KDA layers, sparse DSA

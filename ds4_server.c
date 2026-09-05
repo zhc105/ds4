@@ -598,23 +598,12 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
     server_image_input image = {0};
     if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
         return false;
-    unsigned char nonce[12];
-    if (!random_bytes(nonce, sizeof(nonce))) {
-        uint64_t fallback = (uint64_t)time(NULL) ^
-                            ((uint64_t)getpid() << 32) ^
-                            (uint64_t)(uintptr_t)images;
-        memcpy(nonce, &fallback, sizeof(fallback));
-        memset(nonce + sizeof(fallback), 0, sizeof(nonce) - sizeof(fallback));
-    }
-    static const char hex[] = "0123456789abcdef";
-    size_t pos = (size_t)snprintf(image.marker, sizeof(image.marker),
-                                  "\036" "DS4_IMAGE_");
-    for (size_t i = 0; i < sizeof(nonce) && pos + 2 < sizeof(image.marker); i++) {
-        image.marker[pos++] = hex[nonce[i] >> 4];
-        image.marker[pos++] = hex[nonce[i] & 15];
-    }
-    image.marker[pos++] = '\x1f';
-    image.marker[pos] = '\0';
+    /* The marker names the image by content, so a conversation replayed
+     * with the same image renders byte-identical prompt text, which the
+     * visible-prefix live KV reuse compares. */
+    char digest[41];
+    ds4_kvstore_sha1_bytes_hex(image.encoded, image.encoded_len, digest);
+    snprintf(image.marker, sizeof(image.marker), "\036" "DS4_IMAGE_%.24s" "\037", digest);
     if (images->len == images->cap) {
         size_t cap = images->cap ? images->cap * 2 : 2;
         images->v = xrealloc(images->v, cap * sizeof(images->v[0]));

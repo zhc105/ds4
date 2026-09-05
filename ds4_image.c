@@ -570,6 +570,116 @@ void ds4_image_patches_free(ds4_image_patches *patches) {
     memset(patches, 0, sizeof(*patches));
 }
 
+/* transformers' smart_resize: round each side to the factor (Python's
+ * round, halves to even), then scale down (floor) past the pixel maximum or
+ * up (ceil) below the minimum. */
+static int ds4_qwen_smart_resize(
+        uint32_t height,
+        uint32_t width,
+        uint32_t min_pixels,
+        uint32_t max_pixels,
+        uint32_t *target_height,
+        uint32_t *target_width) {
+    const uint32_t factor = 32;
+    const double h = height, w = width;
+    if (fmax(h, w) / fmin(h, w) > 200.0) return 0;
+    uint32_t h_bar = (uint32_t)rint(h / factor) * factor;
+    uint32_t w_bar = (uint32_t)rint(w / factor) * factor;
+    if ((uint64_t)h_bar * w_bar > max_pixels) {
+        const double beta = sqrt(h * w / max_pixels);
+        h_bar = (uint32_t)floor(h / beta / factor) * factor;
+        w_bar = (uint32_t)floor(w / beta / factor) * factor;
+        if (h_bar < factor) h_bar = factor;
+        if (w_bar < factor) w_bar = factor;
+    } else if ((uint64_t)h_bar * w_bar < min_pixels) {
+        const double beta = sqrt((double)min_pixels / (h * w));
+        h_bar = (uint32_t)ceil(h * beta / factor) * factor;
+        w_bar = (uint32_t)ceil(w * beta / factor) * factor;
+    }
+    *target_height = h_bar;
+    *target_width = w_bar;
+    return h_bar != 0 && w_bar != 0;
+}
+
+int ds4_image_preprocess_qwen(
+        ds4_image_patches *out,
+        const ds4_image *image,
+        uint32_t min_pixels,
+        uint32_t max_pixels,
+        char *error,
+        size_t error_cap) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    if (!image || !image->rgb || image->width == 0 || image->height == 0 ||
+        min_pixels == 0 || max_pixels < min_pixels) {
+        ds4_image_error(error, error_cap, "invalid Qwen image preprocessing parameters");
+        return 0;
+    }
+    uint32_t target_height, target_width;
+    if (!ds4_qwen_smart_resize(image->height, image->width, min_pixels, max_pixels,
+                               &target_height, &target_width)) {
+        ds4_image_error(error, error_cap, "image aspect ratio exceeds 200");
+        return 0;
+    }
+
+    const size_t canvas_values = (size_t)target_height * target_width * 3;
+    float *canvas = malloc(canvas_values * sizeof(float));
+    if (!canvas) {
+        ds4_image_error(error, error_cap, "unable to allocate resized image");
+        return 0;
+    }
+    if (target_width == image->width && target_height == image->height) {
+        for (size_t i = 0; i < canvas_values; i++) canvas[i] = image->rgb[i];
+    } else {
+        ds4_resize_rgb_bicubic(image->rgb, image->width, image->height,
+                               canvas, target_width, target_height, target_width);
+    }
+    for (size_t i = 0; i < canvas_values; i++) canvas[i] = canvas[i] / 255.0f * 2.0f - 1.0f;
+
+    const uint32_t grid_height = target_height / 16;
+    const uint32_t grid_width = target_width / 16;
+    const uint32_t patch_count = grid_height * grid_width;
+    const size_t patch_values = (size_t)patch_count * 3 * 2 * 16 * 16;
+    float *patches = malloc(patch_values * sizeof(float));
+    if (!patches) {
+        free(canvas);
+        ds4_image_error(error, error_cap, "unable to allocate vision patches");
+        return 0;
+    }
+    /* The conv3d kernel is [channel][temporal][y][x]; the image is its own
+     * second frame. */
+    float *p = patches;
+    for (uint32_t block_y = 0; block_y < grid_height / 2; block_y++) {
+        for (uint32_t block_x = 0; block_x < grid_width / 2; block_x++) {
+            for (uint32_t within = 0; within < 4; within++) {
+                const uint32_t patch_y = block_y * 2 + within / 2;
+                const uint32_t patch_x = block_x * 2 + within % 2;
+                for (uint32_t channel = 0; channel < 3; channel++) {
+                    for (uint32_t temporal = 0; temporal < 2; temporal++) {
+                        for (uint32_t y = 0; y < 16; y++) {
+                            const float *row = canvas +
+                                ((size_t)(patch_y * 16 + y) * target_width + patch_x * 16) * 3;
+                            for (uint32_t x = 0; x < 16; x++) *p++ = row[x * 3 + channel];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    free(canvas);
+
+    out->content_width = target_width;
+    out->content_height = target_height;
+    out->padded_width = target_width;
+    out->padded_height = target_height;
+    out->grid_width = grid_width;
+    out->grid_height = grid_height;
+    out->patch_count = patch_count;
+    out->image_token_count = patch_count / 4;
+    out->patches = patches;
+    return 1;
+}
+
 static uint32_t ds4_deepseek4_grid_tokens(
         uint32_t height,
         uint32_t width,

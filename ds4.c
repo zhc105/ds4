@@ -6908,6 +6908,99 @@ static void vision_weights_bind(
     }
 }
 
+/* The Qwen3-VL tower of Qwen3.8-Flash-Next, converted by
+ * qwen_convert.py --vision under the checkpoint's own tensor names. */
+static void qwen_vision_weights_bind(
+        ds4_qwen_vision_weights *w,
+        const ds4_model         *m) {
+    ds4_str arch = {0};
+    if (!model_get_string(m, "general.architecture", &arch) ||
+        !ds4_streq(arch, "qwen4exp-vision")) {
+        ds4_die("--vision file is not a Qwen3.8-Flash-Next vision encoder GGUF");
+    }
+    if (m->n_tensors != 333u) {
+        fprintf(stderr,
+                "ds4: vision GGUF has %" PRIu64 " tensors, expected 333\n",
+                m->n_tensors);
+        exit(1);
+    }
+    config_expect_u32("vision block_count",
+                      required_u32(m, "qwen4exp-vision.block_count"), DS4_QWEN_VISION_LAYERS);
+    config_expect_u32("vision embedding_length",
+                      required_u32(m, "qwen4exp-vision.embedding_length"), 1152u);
+    config_expect_u32("vision feed_forward_length",
+                      required_u32(m, "qwen4exp-vision.feed_forward_length"), 4304u);
+    config_expect_u32("vision head_count",
+                      required_u32(m, "qwen4exp-vision.attention.head_count"), 16u);
+    config_expect_u32("vision projection_length",
+                      required_u32(m, "qwen4exp-vision.projection_length"), 2560u);
+    config_expect_u32("vision patch_size",
+                      required_u32(m, "qwen4exp-vision.patch_size"), 16u);
+    config_expect_u32("vision temporal_patch_size",
+                      required_u32(m, "qwen4exp-vision.temporal_patch_size"), 2u);
+    config_expect_u32("vision spatial_merge_size",
+                      required_u32(m, "qwen4exp-vision.spatial_merge_size"), 2u);
+    config_expect_u32("vision position_embedding_count",
+                      required_u32(m, "qwen4exp-vision.position_embedding_count"), 2304u);
+
+    static const uint64_t d1152[] = {1152u};
+    static const uint64_t d2560[] = {2560u};
+    static const uint64_t d3456[] = {3456u};
+    static const uint64_t d4304[] = {4304u};
+    static const uint64_t d4608[] = {4608u};
+    static const uint64_t d1152_1152[] = {1152u, 1152u};
+    static const uint64_t d1152_3456[] = {1152u, 3456u};
+    static const uint64_t d1152_4304[] = {1152u, 4304u};
+    static const uint64_t d4304_1152[] = {4304u, 1152u};
+    static const uint64_t d4608_4608[] = {4608u, 4608u};
+    static const uint64_t d4608_2560[] = {4608u, 2560u};
+    static const uint64_t d1152_2304[] = {1152u, 2304u};
+    static const uint64_t patch_dims[] = {16u, 16u, 2u, 3u, 1152u};
+
+    memset(w, 0, sizeof(*w));
+    w->patch_weight = vision_required_offset(
+            m, "model.visual.patch_embed.proj.weight", 5, patch_dims);
+    w->patch_bias = vision_required_offset(
+            m, "model.visual.patch_embed.proj.bias", 1, d1152);
+    w->pos_embed = vision_required_offset(
+            m, "model.visual.pos_embed.weight", 2, d1152_2304);
+    w->merger_norm_weight = vision_required_offset(
+            m, "model.visual.merger.norm.weight", 1, d1152);
+    w->merger_norm_bias = vision_required_offset(
+            m, "model.visual.merger.norm.bias", 1, d1152);
+    w->merger_fc1_weight = vision_required_offset(
+            m, "model.visual.merger.linear_fc1.weight", 2, d4608_4608);
+    w->merger_fc1_bias = vision_required_offset(
+            m, "model.visual.merger.linear_fc1.bias", 1, d4608);
+    w->merger_fc2_weight = vision_required_offset(
+            m, "model.visual.merger.linear_fc2.weight", 2, d4608_2560);
+    w->merger_fc2_bias = vision_required_offset(
+            m, "model.visual.merger.linear_fc2.bias", 1, d2560);
+
+    for (uint32_t il = 0; il < DS4_QWEN_VISION_LAYERS; il++) {
+        char name[160];
+#define VISION_LAYER_OFFSET(field_, suffix_, rank_, dims_) do { \
+            int n = snprintf(name, sizeof(name), \
+                    "model.visual.blocks.%u.%s", il, suffix_); \
+            if (n < 0 || (size_t)n >= sizeof(name)) ds4_die("vision tensor name overflow"); \
+            w->layer[il].field_ = vision_required_offset(m, name, rank_, dims_); \
+        } while (0)
+        VISION_LAYER_OFFSET(norm1_weight, "norm1.weight", 1, d1152);
+        VISION_LAYER_OFFSET(norm1_bias, "norm1.bias", 1, d1152);
+        VISION_LAYER_OFFSET(qkv_weight, "attn.qkv.weight", 2, d1152_3456);
+        VISION_LAYER_OFFSET(qkv_bias, "attn.qkv.bias", 1, d3456);
+        VISION_LAYER_OFFSET(attn_proj_weight, "attn.proj.weight", 2, d1152_1152);
+        VISION_LAYER_OFFSET(attn_proj_bias, "attn.proj.bias", 1, d1152);
+        VISION_LAYER_OFFSET(norm2_weight, "norm2.weight", 1, d1152);
+        VISION_LAYER_OFFSET(norm2_bias, "norm2.bias", 1, d1152);
+        VISION_LAYER_OFFSET(fc1_weight, "mlp.linear_fc1.weight", 2, d1152_4304);
+        VISION_LAYER_OFFSET(fc1_bias, "mlp.linear_fc1.bias", 1, d4304);
+        VISION_LAYER_OFFSET(fc2_weight, "mlp.linear_fc2.weight", 2, d4304_1152);
+        VISION_LAYER_OFFSET(fc2_bias, "mlp.linear_fc2.bias", 1, d1152);
+#undef VISION_LAYER_OFFSET
+    }
+}
+
 static ds4_tensor *deepseek4_vision_required_tensor(
         const ds4_model *m,
         const char *name,
@@ -16352,6 +16445,10 @@ typedef struct {
     ds4_gpu_tensor *n_sel;       /* uint32 [max_rows] */
     ds4_gpu_tensor *skeys;       /* uint64 select scratch, QWEN_QSA_SELECT_ROWS rows of ctx / ratio keys */
     uint32_t max_sel;            /* budget cells plus the tail block */
+    /* Images of the prompt being synced: spans by absolute token offset,
+     * whose rows replace the token embeddings (qwen_graph_overlay_images). */
+    const ds4_vision_span *images;
+    size_t image_count;
 } ds4_qwen_gpu_graph;
 
 /* Tokens the QSA select kernel scores concurrently, each with its own row
@@ -16977,6 +17074,9 @@ static bool qwen_graph_embed(
            ds4_gpu_qwen4exp_replicate(g->x, g->h, DS4_N_EMBD, DS4_N_HC, n) != 0;
 }
 
+static bool qwen_graph_overlay_images(const ds4_qwen_gpu_graph *g, ds4_gpu_tensor *dst,
+                                      uint32_t n_hc, uint32_t pos0, uint32_t rows);
+
 /* One drafter pass over n rows: row i pairs the token that follows
  * position pos0 + i with the main model's streams at pos0 + i (bf16 rows
  * of g->mtp_hid), and the drafter attends at positions pos0 + i.  The
@@ -16996,6 +17096,7 @@ static bool qwen_graph_mtp_forward(
     bool ok = n > 0u && n <= g->max_rows &&
               ds4_gpu_tensor_write(g->tokens, 0, tokens, (uint64_t)n * sizeof(int32_t)) != 0 &&
               qwen_graph_embed_rows(g, m, w, g->h, n) &&
+              (g->image_count == 0 || qwen_graph_overlay_images(g, g->h, 1u, pos0 + 1u, n)) &&
               ds4_gpu_rms_norm_weight_rows_tensor(g->y, g->h, mm->map, mm->size, mw->enorm->abs_offset,
                                                   DS4_N_EMBD, n, DS4_RMS_EPS) != 0 &&
               qwen_graph_matmul(g->proj, mm, mw->fc_embedding, g->y, n) &&
@@ -17061,6 +17162,39 @@ static bool qwen_graph_head_rows(
  * receives the distribution after the last token; dump, when set, receives
  * the distribution after every token as f32 rows (DS4_QWEN_DUMP_LOGITS),
  * which costs one head evaluation per row. */
+/* Image rows of a prefill chunk: the projected embeddings replace the
+ * token rows of `dst` (the bf16 hc streams, or the drafter's f32 rows)
+ * whose absolute positions [pos0, pos0 + rows) fall inside a span.  Image
+ * tokens keep sequential positions, as vLLM serves this model. */
+static bool qwen_graph_overlay_images(
+        const ds4_qwen_gpu_graph *g,
+        ds4_gpu_tensor           *dst,
+        uint32_t                  n_hc,
+        uint32_t                  pos0,
+        uint32_t                  rows) {
+    const uint64_t chunk_end = (uint64_t)pos0 + rows;
+    for (size_t i = 0; i < g->image_count; i++) {
+        const ds4_vision_span *span = &g->images[i];
+        const uint64_t span_end = (uint64_t)span->token_start + span->embedding.token_count;
+        const uint64_t begin = span->token_start > pos0 ? span->token_start : pos0;
+        const uint64_t end = span_end < chunk_end ? span_end : chunk_end;
+        if (begin >= end) continue;
+        if (span->embedding.dim != DS4_N_EMBD) return false;
+        const uint32_t count = (uint32_t)(end - begin);
+        const uint64_t bytes = (uint64_t)count * DS4_N_EMBD * sizeof(float);
+        ds4_gpu_tensor *staged = ds4_gpu_tensor_alloc(bytes);
+        const bool ok = staged &&
+            ds4_gpu_tensor_write(staged, 0,
+                                 span->embedding.data + (begin - span->token_start) * DS4_N_EMBD,
+                                 bytes) != 0 &&
+            ds4_gpu_qwen4exp_scatter_image(dst, staged, (uint32_t)(begin - pos0), 0, count,
+                                           rows, DS4_N_EMBD, n_hc) != 0;
+        ds4_gpu_tensor_free(staged);
+        if (!ok) return false;
+    }
+    return true;
+}
+
 static bool qwen_graph_forward(
         ds4_qwen_gpu_graph *g,
         const ds4_model      *m,
@@ -17080,6 +17214,9 @@ static bool qwen_graph_forward(
         ok = ds4_gpu_tensor_write(g->tokens, 0, tokens + done, (uint64_t)rows * sizeof(int32_t)) != 0;
         if (ok && g->emb) ok = qwen_graph_ple_rows(g, m, tokens + done, rows);
         if (ok) ok = qwen_graph_embed(g, m, w, rows);
+        if (ok && g->image_count) {
+            ok = qwen_graph_overlay_images(g, g->x, ds4_qwen_has_hc() ? DS4_N_HC : 1u, pos0, rows);
+        }
         for (uint32_t il = 0; ok && il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
             const bool chain = il + 1u + DS4_N_NEXTN_PREDICT < DS4_N_LAYER && !ds4_qwen_layer_has_ple(il + 1u);
             ok = qwen_graph_layer(g, m, &w->layer[il], chain ? &w->layer[il + 1u] : NULL, il, rows, pos0);
@@ -40914,6 +41051,7 @@ typedef enum {
     DS4_VISION_NONE = 0,
     DS4_VISION_GLM53,
     DS4_VISION_DEEPSEEK4,
+    DS4_VISION_QWEN,
 } ds4_vision_kind;
 
 struct ds4_engine {
@@ -40928,11 +41066,14 @@ struct ds4_engine {
 #ifndef DS4_NO_GPU
     ds4_glm53_vision_weights vision_weights;
     ds4_deepseek4_vision_weights deepseek4_vision_weights;
+    ds4_qwen_vision_weights qwen_vision_weights;
 #endif
     ds4_vision_kind vision_kind;
     int vision_image_token;
     int vision_start_token;
     int vision_end_token;
+    uint32_t vision_min_pixels;   /* Qwen: the processor's smart-resize budget */
+    uint32_t vision_max_pixels;
     ds4_backend backend;
     ds4_support_kind support_kind;
     int dspark_exec_tier;
@@ -65118,7 +65259,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (opt->backend != DS4_BACKEND_METAL &&
             opt->backend != DS4_BACKEND_CUDA) {
             fprintf(stderr,
-                    "ds4: GLM-5.3 vision requires --metal, --cuda, or --rocm\n");
+                    "ds4: vision requires --metal, --cuda, or --rocm\n");
             free(e);
             *out = NULL;
             return 1;
@@ -65227,10 +65368,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         qwen_ngram_open(&e->model, opt->model_path);
     }
     if (opt->vision_path && opt->vision_path[0]) {
-        if (!ds4_model_is_glm53() && !g_ds4_flash_vision_exp) {
+        const bool qwen_vision = ds4_model_is_qwen() && ds4_qwen_has_hc();
+        if (!ds4_model_is_glm53() && !g_ds4_flash_vision_exp && !qwen_vision) {
             fprintf(stderr,
-                    "ds4: --vision requires GLM-5.3 or the pinned "
-                    "DeepSeek V4 Flash Vision-Exp model\n");
+                    "ds4: --vision requires GLM-5.3, Qwen3.8-Flash-Next or the "
+                    "pinned DeepSeek V4 Flash Vision-Exp model\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -65242,7 +65384,30 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
 #else
         model_open(&e->vision_model, opt->vision_path, true, false);
-        if (ds4_model_is_glm53()) {
+        if (qwen_vision) {
+#ifndef DS4_QWEN_GPU
+            fprintf(stderr, "ds4: Qwen vision requires the CUDA build\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+#else
+            qwen_vision_weights_bind(&e->qwen_vision_weights, &e->vision_model);
+            e->vision_image_token = (int)required_u32(
+                    &e->vision_model, "qwen4exp-vision.image_token_id");
+            e->vision_start_token = (int)required_u32(
+                    &e->vision_model, "qwen4exp-vision.vision_start_token_id");
+            e->vision_end_token = (int)required_u32(
+                    &e->vision_model, "qwen4exp-vision.vision_end_token_id");
+            /* <|vision_start|>, <|image_pad|>, <|vision_end|> of the checkpoint */
+            if (e->vision_start_token != 248053 || e->vision_image_token != 248056 ||
+                e->vision_end_token != 248054) {
+                ds4_die("unexpected Qwen3.8-Flash-Next vision token IDs");
+            }
+            e->vision_min_pixels = required_u32(&e->vision_model, "qwen4exp-vision.image.min_pixels");
+            e->vision_max_pixels = required_u32(&e->vision_model, "qwen4exp-vision.image.max_pixels");
+            e->vision_kind = DS4_VISION_QWEN;
+#endif
+        } else if (ds4_model_is_glm53()) {
             vision_weights_bind(&e->vision_weights, &e->vision_model);
             e->vision_image_token = (int)required_u32(
                     &e->vision_model, "glm5-next-vision.image_token_id");
@@ -66557,8 +66722,9 @@ int ds4_chat_append_multimodal_message(
     }
     const bool tool = !strcmp(role, "tool") || !strcmp(role, "function");
     const bool user = !strcmp(role, "user");
+    const bool qwen = e->vision_kind == DS4_VISION_QWEN;
     if ((DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
-         e->vision_kind != DS4_VISION_DEEPSEEK4) || (!tool && !user)) {
+         e->vision_kind != DS4_VISION_DEEPSEEK4 && !qwen) || (!tool && !user)) {
         if (error && error_cap)
             snprintf(error, error_cap,
                      "multimodal messages require a supported user or tool role");
@@ -66573,7 +66739,12 @@ int ds4_chat_append_multimodal_message(
 
     const int old_len = tokens->len;
     ds4_vocab *vocab = &e->vocab;
-    if (tool) {
+    if (qwen) {
+        /* ChatML: tool output is a user turn wrapped in <tool_response> */
+        token_vec_push(tokens, vocab->im_start_id);
+        bpe_tokenize_text(vocab, "user\n", tokens);
+        if (tool) tokenize_rendered_chat_vocab(vocab, "<tool_response>\n", tokens);
+    } else if (tool) {
         if (vocab->observation_id >= 0) token_vec_push(tokens, vocab->observation_id);
         tokenize_rendered_chat_vocab(vocab, "<tool_response>", tokens);
     } else {
@@ -66599,8 +66770,13 @@ int ds4_chat_append_multimodal_message(
         }
         moved++;
     }
-    if (tool)
+    if (qwen) {
+        if (tool) tokenize_rendered_chat_vocab(vocab, "\n</tool_response>", tokens);
+        token_vec_push(tokens, vocab->im_end_id);
+        bpe_tokenize_text(vocab, "\n", tokens);
+    } else if (tool) {
         tokenize_rendered_chat_vocab(vocab, "</tool_response>", tokens);
+    }
     return 1;
 }
 
@@ -66670,6 +66846,26 @@ static int ds4_engine_vision_encode_image(
         grid_height = patches.llm_grid_height;
         layout = DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL;
         ds4_deepseek4_image_patches_free(&patches);
+    } else if (e->vision_kind == DS4_VISION_QWEN) {
+        ds4_image_patches patches = {0};
+        if (!ds4_image_preprocess_qwen(&patches, image, e->vision_min_pixels,
+                                       e->vision_max_pixels, error, error_cap)) return 0;
+        token_count = patches.image_token_count;
+        embedding = malloc((size_t)token_count * DS4_N_EMBD * sizeof(float));
+        if (embedding) {
+#ifdef DS4_QWEN_GPU
+            ok = ds4_gpu_qwen_vision_encode(
+                    embedding, patches.patches,
+                    patches.grid_height, patches.grid_width,
+                    e->vision_model.map, e->vision_model.size,
+                    &e->qwen_vision_weights);
+#endif
+        }
+        content_width = patches.content_width;
+        content_height = patches.content_height;
+        grid_width = patches.grid_width / 2u;
+        grid_height = patches.grid_height / 2u;
+        ds4_image_patches_free(&patches);
     } else {
         ds4_image_patches patches = {0};
         if (!ds4_image_preprocess_glm53(&patches, image, 16u, 8000u,
@@ -66698,12 +66894,13 @@ static int ds4_engine_vision_encode_image(
         free(embedding);
         if (error && error_cap)
             snprintf(error, error_cap, "%s vision inference failed",
-                     e->vision_kind == DS4_VISION_DEEPSEEK4
-                         ? "DeepSeek V4" : "GLM-5.3");
+                     e->vision_kind == DS4_VISION_DEEPSEEK4 ? "DeepSeek V4" :
+                     e->vision_kind == DS4_VISION_QWEN ? "Qwen" : "GLM-5.3");
         return 0;
     }
     out->data = embedding;
     out->token_count = token_count;
+    out->dim = DS4_N_EMBD;
     out->layout = layout;
     out->grid_width = grid_width;
     out->grid_height = grid_height;
@@ -68770,7 +68967,19 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
  * folded into the graph, otherwise start over. */
 static bool qwen_session_mtp_prefill(ds4_session *s, const int *tokens, uint32_t rows, uint32_t pos0);
 
+static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+
 static int qwen_session_sync_graph(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    ds4_qwen_gpu_graph *g = &s->qwen_graph;
+    g->images = s->sync_images;
+    g->image_count = s->sync_image_count;
+    const int rc = qwen_session_sync_chunks(s, prompt, err, errlen);
+    g->images = NULL;
+    g->image_count = 0;
+    return rc;
+}
+
+static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
     if (prompt->len > s->ctx_size) {

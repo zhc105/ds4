@@ -3112,6 +3112,66 @@ int ds4_gpu_glm53_scatter_image_hc(
         uint32_t              n_embd,
         uint32_t              n_hc);
 
+#ifndef DS4_QWEN_VISION_TYPES_DEFINED
+#define DS4_QWEN_VISION_TYPES_DEFINED
+#define DS4_QWEN_VISION_LAYERS 27u
+
+/* The Qwen3-VL tower that Qwen3.8-Flash-Next ships: offsets of the BF16
+ * tensors in the vision GGUF. */
+typedef struct {
+    uint64_t norm1_weight;
+    uint64_t norm1_bias;
+    uint64_t qkv_weight;
+    uint64_t qkv_bias;
+    uint64_t attn_proj_weight;
+    uint64_t attn_proj_bias;
+    uint64_t norm2_weight;
+    uint64_t norm2_bias;
+    uint64_t fc1_weight;
+    uint64_t fc1_bias;
+    uint64_t fc2_weight;
+    uint64_t fc2_bias;
+} ds4_qwen_vision_layer_weights;
+
+typedef struct {
+    uint64_t patch_weight;
+    uint64_t patch_bias;
+    uint64_t pos_embed;
+    uint64_t merger_norm_weight;
+    uint64_t merger_norm_bias;
+    uint64_t merger_fc1_weight;
+    uint64_t merger_fc1_bias;
+    uint64_t merger_fc2_weight;
+    uint64_t merger_fc2_bias;
+    ds4_qwen_vision_layer_weights layer[DS4_QWEN_VISION_LAYERS];
+} ds4_qwen_vision_weights;
+#endif
+
+/* Encode normalized, block-major 16x16x2 image patches into 2560-wide
+ * language-model embeddings, one per 2x2 patch block (CUDA only). */
+int ds4_gpu_qwen_vision_encode(
+        float                         *out,
+        const float                   *patches,
+        uint32_t                       grid_h,
+        uint32_t                       grid_w,
+        const void                    *model_map,
+        uint64_t                       model_size,
+        const ds4_qwen_vision_weights *weights);
+
+/* Replace token rows of the Flash-Next residual with image embeddings: the
+ * bf16 hc streams get every stream overwritten (n_hc > 1), a plain f32 row
+ * buffer gets its rows replaced (n_hc == 1).  Rows past total_rows are
+ * ignored.  Must be called in an active command batch. */
+int ds4_gpu_qwen4exp_scatter_image(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *image,
+        uint32_t              dst_row,
+        uint32_t              image_row,
+        uint32_t              rows,
+        uint32_t              total_rows,
+        uint32_t              n_embd,
+        uint32_t              n_hc);
+
 /* GLM-5.3 Kimi Delta Attention. Recurrent and convolution state stay FP32. */
 /* Qwen family (CUDA only): f32-activation matmul over NVFP4/BF16/F32
  * weights (wtype is the GGUF type id), Gated DeltaNet, gated GQA attention,

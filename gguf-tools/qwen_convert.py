@@ -15,6 +15,10 @@ RadixArk/Qwen3.8-Flash-Next-NVFP4).  Output follows llama.cpp's `qwen35` /
   blk.N.ple_key / ple_value / ple_norm_* / ple_conv1d      PLE projections (Flash-Next, one layer)
   blk.L.nextn.*                                    MTP block (Qwen3.5 only; Flash-Next drops it)
 
+`--vision` writes the Flash-Next vision tower (the stock Qwen3-VL ViT) as its
+own GGUF for ds4 --vision: raw BF16 copies under their HF names plus the
+vision config and image preprocessing constants.
+
 The Flash-Next n-gram table (47.7 GiB of E4M3 rows) is not a GGUF tensor: it is
 written beside the GGUF as a ds4 .ngram file (see hf_gguf.ngram_header), and the
 hash constants go into the GGUF metadata.
@@ -436,6 +440,56 @@ class Converter:
         # quarter of the bytes per draft, the drafter only proposing tokens.
         self.linear_nvfp4("output", "lm_head")
 
+    def add_tensors_vision(self):
+        """The vision tower as its own GGUF (ds4 --vision): every model.visual.*
+        tensor copied raw in BF16, 27 blocks plus patch embedding, learned
+        position grid and the 2x2 merger."""
+        st = self.st
+        names = sorted(n for n in st.names() if n.startswith("model.visual."))
+        if len(names) != 333:
+            fail(f"--vision expects the 333 Qwen3-VL tower tensors, found {len(names)}")
+        for name in names:
+            if st.dtype(name) != "BF16":
+                fail(f"{name}: expected a BF16 vision tensor, got {st.dtype(name)}")
+            shape = st.shape(name)
+            self.writer.add_tensor(name, shape, T_BF16, 2 * int(np.prod(shape)), lambda n=name: st.read(n))
+
+    def add_metadata_vision(self):
+        with open(os.path.join(self.hf_dir, "config.json"), encoding="utf-8") as fp:
+            config = json.load(fp)
+        with open(os.path.join(self.hf_dir, "preprocessor_config.json"), encoding="utf-8") as fp:
+            processor = json.load(fp)
+        vision = config["vision_config"]
+        expected = {"depth": 27, "hidden_size": 1152, "intermediate_size": 4304, "num_heads": 16,
+                    "out_hidden_size": 2560, "patch_size": 16, "spatial_merge_size": 2,
+                    "temporal_patch_size": 2, "num_position_embeddings": 2304,
+                    "hidden_act": "gelu_pytorch_tanh", "deepstack_visual_indexes": []}
+        for key, value in expected.items():
+            if vision.get(key) != value:
+                fail(f"unexpected vision_config.{key}: {vision.get(key)!r}")
+        if processor.get("image_mean") != [0.5, 0.5, 0.5] or processor.get("image_std") != [0.5, 0.5, 0.5]:
+            fail("unexpected image normalization constants")
+        w, a = self.writer, "qwen4exp-vision"
+        w.add_string("general.architecture", a)
+        w.add_string("general.type", "model")
+        w.add_string("general.name", self.name + " Vision Encoder")
+        w.add_u32("general.quantization_version", 2)
+        w.add_u32("general.file_type", FILE_TYPE_MOSTLY_BF16)
+        w.add_u32(f"{a}.block_count", vision["depth"])
+        w.add_u32(f"{a}.embedding_length", vision["hidden_size"])
+        w.add_u32(f"{a}.feed_forward_length", vision["intermediate_size"])
+        w.add_u32(f"{a}.attention.head_count", vision["num_heads"])
+        w.add_u32(f"{a}.projection_length", vision["out_hidden_size"])
+        w.add_u32(f"{a}.patch_size", vision["patch_size"])
+        w.add_u32(f"{a}.temporal_patch_size", vision["temporal_patch_size"])
+        w.add_u32(f"{a}.spatial_merge_size", vision["spatial_merge_size"])
+        w.add_u32(f"{a}.position_embedding_count", vision["num_position_embeddings"])
+        w.add_u32(f"{a}.image_token_id", config["image_token_id"])
+        w.add_u32(f"{a}.vision_start_token_id", config["vision_start_token_id"])
+        w.add_u32(f"{a}.vision_end_token_id", config["vision_end_token_id"])
+        w.add_u32(f"{a}.image.min_pixels", processor["size"]["shortest_edge"])
+        w.add_u32(f"{a}.image.max_pixels", processor["size"]["longest_edge"])
+
     def linear_nvfp4(self, gguf_base, hf_base):
         """A bf16 projection quantized to NVFP4 in row chunks with one global scale."""
         st = self.st
@@ -484,16 +538,23 @@ class Converter:
 
     # -- driver -----------------------------------------------------------
 
-    def run(self, dry_run, verbose, mtp=False):
+    def run(self, dry_run, verbose, mtp=False, vision=False):
         if mtp:
             if not self.moe or "mtp.fc_hidden.weight" not in self.st:
                 fail("--mtp needs a Flash-Next checkpoint with an mtp.* drafter")
             self.add_tensors_mtp()
+        elif vision:
+            if not self.moe:
+                fail("--vision needs a Flash-Next checkpoint")
+            self.add_tensors_vision()
         else:
             if self.ple_layers and not dry_run:
                 self.ngram_path = os.path.splitext(self.writer.path)[0] + ".ngram"
             self.add_tensors()
-        self.add_metadata()   # after tensors: file_type depends on what was emitted
+        if vision:
+            self.add_metadata_vision()
+        else:
+            self.add_metadata()   # after tensors: file_type depends on what was emitted
         if mtp:
             self.writer.add_bool(f"{self.arch}.mtp_model", True)   # the main model's shape keys, one drafter block
         totals = {}
@@ -528,12 +589,14 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="print the tensor plan and exit")
     parser.add_argument("--mtp", action="store_true",
                         help="write the Flash-Next MTP drafter alone (for ds4 --mtp-model), experts quantized to NVFP4")
+    parser.add_argument("--vision", action="store_true",
+                        help="write the Flash-Next vision tower alone (for ds4 --vision)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
     if os.path.exists(args.out) and not args.dry_run:
         fail(f"output exists: {args.out}")
     name = args.name or os.path.basename(os.path.normpath(args.hf_dir))
-    Converter(args.hf_dir, args.out, name).run(args.dry_run, args.verbose, mtp=args.mtp)
+    Converter(args.hf_dir, args.out, name).run(args.dry_run, args.verbose, mtp=args.mtp, vision=args.vision)
 
 
 if __name__ == "__main__":
