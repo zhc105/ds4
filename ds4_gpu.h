@@ -3152,7 +3152,9 @@ int ds4_gpu_qwen35_gdn(
         uint32_t              n_conv,
         uint32_t              n_tokens,
         int                   sigmoid_gate,
-        float                 eps);
+        float                 eps,
+        const ds4_gpu_tensor *snap_ssm,
+        const ds4_gpu_tensor *snap_conv);
 int ds4_gpu_qwen35_attention(
         ds4_gpu_tensor       *att,
         ds4_gpu_tensor       *att_bf16,
@@ -3194,7 +3196,8 @@ int ds4_gpu_qwen4exp_block_keys(
         uint32_t              pos0,
         uint32_t              n_tokens,
         float                 freq_base,
-        float                 eps);
+        float                 eps,
+        const ds4_gpu_tensor *snap_hist);
 int ds4_gpu_qwen4exp_indexer_query(
         ds4_gpu_tensor       *q,
         const void           *model_map,
@@ -3273,6 +3276,22 @@ int ds4_gpu_qwen4exp_hc_combine_norm(
         uint32_t              n_hc,
         uint32_t              rows,
         float                 eps);
+int ds4_gpu_qwen4exp_mtp_norm(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gamma_offset,
+        uint32_t              dim,
+        uint32_t              rows,
+        float                 eps);
+int ds4_gpu_qwen4exp_mtp_fuse(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *hidden,
+        const ds4_gpu_tensor *emb,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows);
 int ds4_gpu_qwen4exp_replicate(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *h,
@@ -3359,7 +3378,8 @@ int ds4_gpu_qwen4exp_ple_conv(
         uint32_t              hc_dim,
         uint32_t              kern,
         uint32_t              dil,
-        uint32_t              rows);
+        uint32_t              rows,
+        const ds4_gpu_tensor *snap_hist);
 
 int ds4_gpu_glm53_kda_decode(
         ds4_gpu_tensor       *out,

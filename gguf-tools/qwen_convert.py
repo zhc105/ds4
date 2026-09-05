@@ -34,8 +34,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hf_gguf import (  # noqa: E402
-    GGUFWriter, SafeTensors, T_BF16, T_F16, T_F32, T_NVFP4, TYPE_NAMES,
-    export_tokenizer, fail, ngram_header, nvfp4_repack, nvfp4_stack_experts,
+    GGUFWriter, SafeTensors, T_BF16, T_F16, T_F32, T_NVFP4, TYPE_NAMES, bf16_to_f32,
+    export_tokenizer, fail, ngram_header, nvfp4_quantize, nvfp4_repack, nvfp4_stack_experts,
     reorder_heads, v_head_perm,
 )
 
@@ -260,6 +260,30 @@ class Converter:
         NVFP4 experts carry per-expert global scales as `.scale` [n_expert]."""
         st = self.st
         name = lambda e, suffix: f"{hf_layer}.mlp.experts.{e}.{proj}.{suffix}"
+        fused = f"{hf_layer}.mlp.experts.gate_up_proj"
+        if fused in st:
+            # The MTP drafter keeps its experts in bf16, stacked and with gate
+            # and up fused: quantize them to NVFP4 so the expert kernels apply.
+            self.uses_nvfp4 = True
+            stacked = fused if proj != "down_proj" else f"{hf_layer}.mlp.experts.down_proj"
+            e_count, rows, cols = st.shape(stacked)
+            if e_count != n_expert:
+                fail(f"{stacked}: {e_count} experts, expected {n_expert}")
+            half = rows // 2 if proj != "down_proj" else rows
+            row0 = half if proj == "up_proj" else 0
+            scales = np.zeros(n_expert, dtype=np.float32)
+
+            def produce():
+                out = np.empty((n_expert, half, cols // 64 * 36), dtype=np.uint8)
+                for e in range(n_expert):
+                    w = bf16_to_f32(st.read(stacked)[e][row0:row0 + half])   # one expert's rows off the mmap
+                    out[e], scales[e] = nvfp4_quantize(w)
+                return out
+
+            self.writer.add_tensor(gguf_base + ".weight", [n_expert, half, cols], T_NVFP4,
+                                   n_expert * half * (cols // 64 * 36), produce)
+            self.writer.add_tensor(gguf_base + ".scale", [n_expert], T_F32, 4 * n_expert, lambda: scales)
+            return
         if name(0, "weight_scale") in st:
             self.uses_nvfp4 = True
             out_features, half = st.shape(name(0, "weight"))
@@ -393,6 +417,22 @@ class Converter:
             self.norm(f"blk.{il}.nextn.hnorm.weight", "mtp.pre_fc_norm_hidden.weight")
             self.norm(f"blk.{il}.nextn.shared_head_norm.weight", "mtp.norm.weight")
 
+    def add_tensors_mtp(self):
+        """The Flash-Next MTP drafter as its own GGUF (ds4 --mtp-model): one
+        full-attention block as blk.0 (no PLE), the embedding/hidden fusion
+        in front of it and the output mixer behind it.  Token embedding and
+        lm_head are the main model's."""
+        hf = "mtp.layers.0"
+        self.add_hc("blk.0.hc_attn", f"{hf}.attn_hyper_connection")
+        self.add_attention(0, f"{hf}.self_attn")
+        self.add_hc("blk.0.hc_ffn", f"{hf}.mlp_hyper_connection")
+        self.add_ffn(0, hf)
+        self.linear("nextn.fc_embedding", "mtp.fc_embedding")
+        self.linear("nextn.fc_hidden", "mtp.fc_hidden")
+        self.norm("nextn.enorm.weight", "mtp.pre_fc_norm_embedding.weight")
+        self.norm("nextn.hnorm.weight", "mtp.pre_fc_norm_hidden.weight")
+        self.add_hc("output_hc", "mtp.hyper_connection_mixer")
+
     # -- n-gram sidecar ---------------------------------------------------
 
     def write_ngram_table(self, verbose):
@@ -419,11 +459,18 @@ class Converter:
 
     # -- driver -----------------------------------------------------------
 
-    def run(self, dry_run, verbose):
-        if self.ple_layers and not dry_run:
-            self.ngram_path = os.path.splitext(self.writer.path)[0] + ".ngram"
-        self.add_tensors()
+    def run(self, dry_run, verbose, mtp=False):
+        if mtp:
+            if not self.moe or "mtp.fc_hidden.weight" not in self.st:
+                fail("--mtp needs a Flash-Next checkpoint with an mtp.* drafter")
+            self.add_tensors_mtp()
+        else:
+            if self.ple_layers and not dry_run:
+                self.ngram_path = os.path.splitext(self.writer.path)[0] + ".ngram"
+            self.add_tensors()
         self.add_metadata()   # after tensors: file_type depends on what was emitted
+        if mtp:
+            self.writer.add_bool(f"{self.arch}.mtp_model", True)   # the main model's shape keys, one drafter block
         totals = {}
         for _, _, qtype, nbytes, _ in self.writer.tensors:
             count, size = totals.get(qtype, (0, 0))
@@ -454,12 +501,14 @@ def main():
     parser.add_argument("-o", "--out", required=True, help="output GGUF path (the .ngram sidecar goes beside it)")
     parser.add_argument("--name", help="general.name (default: directory basename)")
     parser.add_argument("--dry-run", action="store_true", help="print the tensor plan and exit")
+    parser.add_argument("--mtp", action="store_true",
+                        help="write the Flash-Next MTP drafter alone (for ds4 --mtp-model), experts quantized to NVFP4")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
     if os.path.exists(args.out) and not args.dry_run:
         fail(f"output exists: {args.out}")
     name = args.name or os.path.basename(os.path.normpath(args.hf_dir))
-    Converter(args.hf_dir, args.out, name).run(args.dry_run, args.verbose)
+    Converter(args.hf_dir, args.out, name).run(args.dry_run, args.verbose, mtp=args.mtp)
 
 
 if __name__ == "__main__":

@@ -185,6 +185,46 @@ def nvfp4_repack(weight, scale):
 
 
 _E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=np.float32)
+_E2M1_MID = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=np.float32)   # decision points
+
+
+def f32_to_ue4m3(x):
+    """Nearest E4M3 code (no sign) for non-negative float32, saturating at 448."""
+    x = np.minimum(np.asarray(x, dtype=np.float32), np.float32(448.0))
+    exp = np.floor(np.log2(np.maximum(x, np.float32(2.0 ** -9)))).astype(np.int32)
+    exp = np.clip(exp, -6, 8)
+    man = np.rint(x / np.exp2(exp).astype(np.float32) * 8.0 - 8.0).astype(np.int32)   # normal: 1.m * 2^exp
+    carry = man >= 8
+    exp = np.where(carry, exp + 1, exp)
+    man = np.where(carry, 0, man)
+    sub = np.rint(x / np.float32(2.0 ** -9)).astype(np.int32)                         # subnormal: m * 2^-9
+    code = np.where(x < np.float32(2.0 ** -6), np.clip(sub, 0, 7), np.clip(exp + 7, 1, 15) * 8 + man)
+    return np.minimum(code, 0x7E).astype(np.uint8)
+
+
+def nvfp4_quantize(weight):
+    """Quantize a float32 [out, in] matrix the ModelOpt way: one global scale
+    (amax / (6 * 448)), an E4M3 scale per 16 values (block amax / 6 over the
+    global scale) and nearest E2M1 codes, packed as GGML super-blocks.
+    Returns (raw uint8 [out, nsuper*36], global scale)."""
+    out_features, n_cols = weight.shape
+    if n_cols % NVFP4_SUPER != 0:
+        fail(f"NVFP4 row length {n_cols} is not a multiple of {NVFP4_SUPER}")
+    w = np.asarray(weight, dtype=np.float32)
+    amax = float(np.max(np.abs(w))) if w.size else 0.0
+    scale2 = np.float32(amax / (6.0 * 448.0)) if amax > 0 else np.float32(1.0)
+    blocks = w.reshape(out_features, n_cols // NVFP4_BLOCK, NVFP4_BLOCK)
+    bmax = np.max(np.abs(blocks), axis=-1)
+    d = f32_to_ue4m3(bmax / 6.0 / scale2)                                            # [out, n_blocks]
+    step = ue4m3_to_f32(d) * scale2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        q = np.where(step[..., None] > 0, blocks / step[..., None], 0.0).astype(np.float32)
+    mag = np.searchsorted(_E2M1_MID, np.abs(q), side="right").astype(np.uint8)       # 0..7
+    vals = np.where(q < 0, mag | 8, mag).astype(np.uint8)
+    qs = (vals[:, :, :8] | (vals[:, :, 8:] << 4)).astype(np.uint8)                   # element j low, j+8 high
+    n_super = n_cols // NVFP4_SUPER
+    raw = np.concatenate([d.reshape(out_features, n_super, 4), qs.reshape(out_features, n_super, 32)], axis=-1)
+    return np.ascontiguousarray(raw.reshape(out_features, n_super * NVFP4_SUPER_BYTES)), scale2
 
 
 def ue4m3_to_f32(bits):

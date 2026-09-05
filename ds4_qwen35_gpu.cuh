@@ -419,6 +419,48 @@ __global__ static void qwen35_gemm_mma_kernel(
     qwen35_mma_tile(out, out_dim, scale, orow, xr, w, wtype, in_dim, col0, smem);
 }
 
+/* Decode-sized BF16 matvec: a warp per output column walks the weight row
+ * once and dots it with every activation row (up to 8, a speculative
+ * batch), so the bandwidth-bound weight read is not repeated per token. */
+template <int N>
+__global__ static void qwen35_matvec_bf16_rows_kernel(
+        float *out, const uint16_t *weights, const float *x, uint32_t in_dim, uint32_t out_dim) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = blockIdx.x * 8u + warp;
+    if (col >= out_dim) return;
+    float sum[N];
+#pragma unroll
+    for (int r = 0; r < N; r++) sum[r] = 0.0f;
+    const uint16_t *wrow = weights + (uint64_t)col * in_dim;
+    for (uint32_t i = lane; i < in_dim; i += 32u) {
+        const float w = __uint_as_float((uint32_t)wrow[i] << 16);
+#pragma unroll
+        for (int r = 0; r < N; r++) sum[r] = fmaf(w, x[(uint64_t)r * in_dim + i], sum[r]);
+    }
+#pragma unroll
+    for (int r = 0; r < N; r++) {
+        const float total = warp_sum_f32(sum[r]);
+        if (lane == 0u) out[(uint64_t)r * out_dim + col] = total;
+    }
+}
+
+static void qwen35_matvec_bf16_rows(
+        float *out, const uint16_t *w, const float *x, uint32_t in_dim, uint32_t out_dim, uint32_t n_tok,
+        cudaStream_t stream) {
+    const dim3 grid((out_dim + 7u) / 8u, 1u, 1u);
+    switch (n_tok) {
+    case 1: qwen35_matvec_bf16_rows_kernel<1><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 2: qwen35_matvec_bf16_rows_kernel<2><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 3: qwen35_matvec_bf16_rows_kernel<3><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 4: qwen35_matvec_bf16_rows_kernel<4><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 5: qwen35_matvec_bf16_rows_kernel<5><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 6: qwen35_matvec_bf16_rows_kernel<6><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 7: qwen35_matvec_bf16_rows_kernel<7><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    default: qwen35_matvec_bf16_rows_kernel<8><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    }
+}
+
 /* Split f32 activations into a bf16 high part and a bf16 remainder (the
  * exact operands of the tensor-core attention), or round them to bf16
  * alone (the operands of the bypass GEMMs). */
@@ -604,11 +646,10 @@ extern "C" int ds4_gpu_qwen35_matmul(
         return cuda_ok(cudaGetLastError(), "Qwen NVFP4 matvec launch");
     }
     /* The BF16 matvec (9 GiB of bypass weights per Flash-Next decode step)
-     * already runs at the memory bandwidth GLM's kernel reaches; 16-byte
-     * vectorised loads were measured to change nothing. */
+     * runs at the memory bandwidth; every weight is read once for all the
+     * rows of a speculative batch. */
     if (wtype == QWEN35_W_BF16) {
-        const dim3 grid((out_dim + 7u) / 8u, n_tok, 1u);
-        glm53_matvec_bf16_f32_kernel<<<grid, 256, 0, stream>>>(o, (const uint16_t *)w, xp, in_dim, out_dim);
+        qwen35_matvec_bf16_rows(o, (const uint16_t *)w, xp, in_dim, out_dim, n_tok, stream);
     } else {
         matmul_f32_kernel<<<dim3(out_dim, n_tok, 1u), 256, 0, stream>>>(o, (const float *)w, xp,
                                                                         in_dim, out_dim, n_tok);
@@ -667,6 +708,34 @@ __global__ static void qwen35_gdn_conv_state_kernel(
     }
 }
 
+/* The history a batch leaves after each of its tokens (for speculative
+ * verification, whose rejected tail must be undone): snap[t] is the last
+ * n_hist rows of hist followed by rows 0..t, the state qwen35_gdn_conv_state
+ * would leave after t + 1 tokens. */
+__global__ static void qwen35_history_snapshots_kernel(
+        float *snap, const float *hist, const float *rows, uint32_t dim, uint32_t n_hist, uint32_t n_tokens) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (c >= dim || t >= n_tokens) return;
+    float *dst = snap + (uint64_t)t * n_hist * dim;
+    for (uint32_t w = 0; w < n_hist; w++) {
+        const int32_t src = (int32_t)t + 1 - (int32_t)n_hist + (int32_t)w;
+        dst[(uint64_t)w * dim + c] = src >= 0
+            ? rows[(uint64_t)src * dim + c]
+            : hist[(uint64_t)(uint32_t)(src + (int32_t)n_hist) * dim + c];
+    }
+}
+
+static int qwen35_history_snapshots(
+        const ds4_gpu_tensor *snap, const float *hist, const float *rows, uint32_t dim, uint32_t n_hist,
+        uint32_t n_tokens, cudaStream_t stream) {
+    if (!snap) return 1;
+    if (snap->bytes < (uint64_t)n_tokens * n_hist * dim * sizeof(float)) return 0;
+    qwen35_history_snapshots_kernel<<<dim3((dim + 255u) / 256u, n_tokens, 1u), 256, 0, stream>>>(
+        (float *)snap->ptr, hist, rows, dim, n_hist, n_tokens);
+    return 1;
+}
+
 /* Recurrent delta rule.  Block per (v head, 4 value rows); each warp owns one
  * value row of S with four key columns per lane, and walks the tokens. */
 /* Warp-sum eight values at once by halving the set at every shuffle
@@ -693,7 +762,7 @@ __device__ __forceinline__ float qwen35_gdn_reduce8(const float v[8], uint32_t l
 }
 
 __global__ static void qwen35_gdn_recurrence_kernel(
-        float *o, float *state, const float *mixed, const float *alpha, const float *beta,
+        float *o, float *state, float *snap, const float *mixed, const float *alpha, const float *beta,
         const float *a_neg, const float *dt_bias,
         uint32_t n_k, uint32_t n_v, uint32_t n_tokens, float q_scale) {
     const uint32_t hd = QWEN35_CUDA_GDN_DIM;
@@ -749,6 +818,10 @@ __global__ static void qwen35_gdn_recurrence_kernel(
         }
         const float res_mine = qwen35_gdn_reduce8(res, lane);
         if ((lane & 3u) == 0u) o[(uint64_t)t * n_v * hd + hv * hd + v0 + mine] = res_mine * q_scale;
+        if (snap) {   /* the state after this token, for speculative rollback */
+            float4 *dst = (float4 *)(snap + (uint64_t)t * n_v * hd * hd);
+            for (uint32_t c = 0; c < 8u; c++) dst[(((uint64_t)hv * hd + v0 + c) * hd + k0) / 4u] = h[c];
+        }
     }
     for (uint32_t c = 0; c < 8u; c++) *(float4 *)(state + ((uint64_t)hv * hd + v0 + c) * hd + k0) = h[c];
 }
@@ -795,7 +868,9 @@ extern "C" int ds4_gpu_qwen35_gdn(
         uint32_t              n_conv,
         uint32_t              n_tokens,
         int                   sigmoid_gate,
-        float                 eps) {
+        float                 eps,
+        const ds4_gpu_tensor *snap_ssm,     /* optional: the state after each token, [n_tok][n_v][hd][hd] */
+        const ds4_gpu_tensor *snap_conv) {  /* optional: the conv history after each token */
     const uint32_t hd = QWEN35_CUDA_GDN_DIM;
     if (!out || !mixed || !conv_state || !ssm_state || !qkv || !z || !alpha || !beta ||
         !model_map || n_k == 0u || n_v == 0u || n_v % n_k != 0u || n_conv < 2u ||
@@ -829,11 +904,14 @@ extern "C" int ds4_gpu_qwen35_gdn(
     qwen35_gdn_conv_kernel<<<dim3(n_tokens, 2u * n_k + n_v, 1u), hd, 0, stream>>>(
         (float *)mixed->ptr, (const float *)qkv->ptr, (const float *)conv_state->ptr,
         conv_w, n_k, n_v, n_conv, n_tokens, eps);
+    if (!qwen35_history_snapshots(snap_conv, (const float *)conv_state->ptr, (const float *)qkv->ptr,
+                                  (uint32_t)conv_dim, n_conv - 1u, n_tokens, stream)) return 0;
+    if (snap_ssm && snap_ssm->bytes < (uint64_t)n_tokens * v_dim * hd * sizeof(float)) return 0;
     qwen35_gdn_conv_state_kernel<<<(unsigned)((conv_dim + 255u) / 256u), 256, 0, stream>>>(
         (float *)conv_state->ptr, (const float *)qkv->ptr, (uint32_t)conv_dim,
         n_conv - 1u, n_tokens);
     qwen35_gdn_recurrence_kernel<<<dim3(n_v, hd / 32u, 1u), 128, 0, stream>>>(
-        (float *)out->ptr, (float *)ssm_state->ptr, (const float *)mixed->ptr,
+        (float *)out->ptr, (float *)ssm_state->ptr, snap_ssm ? (float *)snap_ssm->ptr : NULL, (const float *)mixed->ptr,
         (const float *)alpha->ptr, (const float *)beta->ptr, a_neg, dt_bias,
         n_k, n_v, n_tokens, rsqrtf((float)hd));
     if (out_bf16 && out_bf16->bytes < (uint64_t)n_tokens * n_v * hd * sizeof(__nv_bfloat16)) return 0;
@@ -1605,6 +1683,71 @@ extern "C" int ds4_gpu_qwen4exp_hc_combine_norm(
     return cuda_ok(cudaGetLastError(), "Flash-Next hc combine+norm launch");
 }
 
+/* MTP drafter input.  The main model's residual streams (bf16 [rows][dim])
+ * take one RMSNorm over the whole widened row (gamma [dim]) into f32, the
+ * operand of the shared per-stream projection; the projected streams then
+ * receive the projected token embedding and become the drafter's residual. */
+__global__ static void qwen4exp_mtp_norm_kernel(
+        float *out, const __nv_bfloat16 *x, const float *gamma, uint32_t dim, uint32_t rows, float eps) {
+    __shared__ float scratch[32];
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const __nv_bfloat16 *xr = x + (uint64_t)row * dim;
+    float ss = 0.0f;
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float v = __bfloat162float(xr[i]);
+        ss = fmaf(v, v, ss);
+    }
+    ss = qwen35_cuda_block_sum(ss, scratch);
+    const float scale = rsqrtf(ss / (float)dim + eps);
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+        out[(uint64_t)row * dim + i] = __bfloat162float(xr[i]) * scale * gamma[i];
+    }
+}
+
+extern "C" int ds4_gpu_qwen4exp_mtp_norm(
+        ds4_gpu_tensor       *out,          /* f32 [rows][dim] */
+        const ds4_gpu_tensor *x,            /* bf16 [rows][dim] */
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gamma_offset,
+        uint32_t              dim,
+        uint32_t              rows,
+        float                 eps) {
+    const uint64_t n = (uint64_t)rows * dim;
+    if (!model_map || n == 0u || !qwen4exp_elems_fit(out, n) || !qwen4exp_bf16_fit(x, n)) return 0;
+    const float *gamma = glm53_cuda_weight_f32(model_map, model_size, gamma_offset, dim, ds4_tensor_device_idx(out), "mtp norm");
+    if (!gamma) return 0;
+    qwen4exp_mtp_norm_kernel<<<rows, 256, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const __nv_bfloat16 *)x->ptr, gamma, dim, rows, eps);
+    return cuda_ok(cudaGetLastError(), "Flash-Next MTP norm launch");
+}
+
+__global__ static void qwen4exp_mtp_fuse_kernel(
+        __nv_bfloat16 *x, const float *hidden, const float *emb, uint32_t n, uint32_t n_hc, uint32_t rows) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (uint64_t)rows * n_hc * n) return;
+    const uint64_t t = i / ((uint64_t)n_hc * n);
+    x[i] = __float2bfloat16(hidden[i] + emb[t * n + i % n]);
+}
+
+extern "C" int ds4_gpu_qwen4exp_mtp_fuse(
+        ds4_gpu_tensor       *x,            /* bf16 [rows][n_hc][n_embd] out */
+        const ds4_gpu_tensor *hidden,       /* f32 [rows * n_hc][n_embd], the projected streams */
+        const ds4_gpu_tensor *emb,          /* f32 [rows][n_embd], the projected embedding */
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows) {
+    const uint64_t n = (uint64_t)rows * n_hc * n_embd;
+    if (n == 0u || !qwen4exp_bf16_fit(x, n) || !qwen4exp_elems_fit(hidden, n) ||
+        !qwen4exp_elems_fit(emb, (uint64_t)rows * n_embd)) {
+        return 0;
+    }
+    qwen4exp_mtp_fuse_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+        (__nv_bfloat16 *)x->ptr, (const float *)hidden->ptr, (const float *)emb->ptr, n_embd, n_hc, rows);
+    return cuda_ok(cudaGetLastError(), "Flash-Next MTP fuse launch");
+}
+
 /* The wide residual starts as n_hc copies of the embedding. */
 __global__ static void qwen4exp_replicate_kernel(
         __nv_bfloat16 *x, const float *h, uint32_t n, uint32_t n_hc, uint32_t rows) {
@@ -2018,7 +2161,8 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv(
         uint32_t              hc_dim,
         uint32_t              kern,
         uint32_t              dil,
-        uint32_t              rows) {
+        uint32_t              rows,
+        const ds4_gpu_tensor *snap_hist) {  /* optional: the conv history after each token */
     const uint64_t n = (uint64_t)rows * hc_dim;
     const uint32_t hist_rows = (kern - 1u) * dil;
     if (!model_map || n == 0u || kern < 2u || dil == 0u || !qwen4exp_bf16_fit(x, n) ||
@@ -2033,6 +2177,7 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv(
     qwen4exp_ple_conv_kernel<<<dim3((hc_dim + 255u) / 256u, rows, 1u), 256, 0, stream>>>(
         (__nv_bfloat16 *)x->ptr, (const float *)gated->ptr, (const float *)pnorm->ptr, (const float *)hist->ptr,
         taps, hc_dim, kern, dil, rows);
+    if (!qwen35_history_snapshots(snap_hist, (const float *)hist->ptr, (const float *)pnorm->ptr, hc_dim, hist_rows, rows, stream)) return 0;
     qwen35_gdn_conv_state_kernel<<<(hc_dim + 255u) / 256u, 256, 0, stream>>>(
         (float *)hist->ptr, (const float *)pnorm->ptr, hc_dim, hist_rows, rows);
     return cuda_ok(cudaGetLastError(), "Flash-Next PLE conv launch");
@@ -2109,7 +2254,8 @@ extern "C" int ds4_gpu_qwen4exp_block_keys(
         uint32_t              pos0,
         uint32_t              n_tokens,
         float                 freq_base,
-        float                 eps) {
+        float                 eps,
+        const ds4_gpu_tensor *snap_hist) {  /* optional: the raw-key history after each token */
     if (!model_map || d == 0u || d > QWEN4EXP_INDEXER_MAX_DIM || d % 32u != 0u || r < 2u || n_rot == 0u ||
         n_rot % 2u != 0u || n_rot > d || n_tokens == 0u || pos0 + n_tokens > ctx ||
         !qwen4exp_bf16_fit(bkey, (uint64_t)(ctx / r) * d) || !qwen4exp_elems_fit(raw, (uint64_t)n_tokens * d) ||
@@ -2123,6 +2269,7 @@ extern "C" int ds4_gpu_qwen4exp_block_keys(
     qwen4exp_block_key_kernel<<<n_tokens, d, 0, stream>>>(
         (__nv_bfloat16 *)bkey->ptr, (const float *)raw->ptr, (const float *)hist->ptr, k_norm,
         d, r, n_rot, pos0, n_tokens, freq_base, eps);
+    if (!qwen35_history_snapshots(snap_hist, (const float *)hist->ptr, (const float *)raw->ptr, d, r - 1u, n_tokens, stream)) return 0;
     qwen35_gdn_conv_state_kernel<<<(d + 255u) / 256u, 256, 0, stream>>>(
         (float *)hist->ptr, (const float *)raw->ptr, d, r - 1u, n_tokens);
     return cuda_ok(cudaGetLastError(), "Flash-Next block key launch");
