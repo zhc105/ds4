@@ -62,6 +62,7 @@ typedef struct {
     const char *prompt;
     const char *system;
     bool raw_prompt;
+    const char *prompt_ids_path;   /* diagnostic: the prompt as token ids, bypassing the tokenizer */
     int n_predict;
     int ctx_size;
     float temperature;
@@ -498,8 +499,28 @@ static void print_generated_token(void *ud, int token) {
     free(text);
 }
 
+/* --prompt-ids: integers separated by anything else (a JSON list works),
+ * so a prompt tokenized elsewhere, template and all, can be replayed. */
+static void read_prompt_ids(const char *path, ds4_tokens *out) {
+    char *text = read_prompt_file(path, true);
+    const char *p = text;
+    while (*p) {
+        if (*p >= '0' && *p <= '9') {
+            char *end;
+            const long v = strtol(p, &end, 10);
+            ds4_tokens_push(out, (int)v);
+            p = end;
+        } else {
+            p++;
+        }
+    }
+    free(text);
+}
+
 static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, ds4_tokens *out) {
-    if (gen->raw_prompt) {
+    if (gen->prompt_ids_path) {
+        read_prompt_ids(gen->prompt_ids_path, out);
+    } else if (gen->raw_prompt) {
         ds4_tokenize_text(engine, gen->prompt ? gen->prompt : "", out);
     } else if (is_rendered_chat_prompt(gen->prompt)) {
         ds4_tokenize_rendered_chat(engine, gen->prompt, out);
@@ -1948,6 +1969,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
             c.gen.raw_prompt = true;
+        } else if (!strcmp(arg, "--prompt-ids")) {
+            c.gen.prompt_ids_path = need_arg(&i, argc, argv, arg);
+            if (!c.gen.prompt) c.gen.prompt = "";
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--vision")) {

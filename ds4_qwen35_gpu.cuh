@@ -2171,49 +2171,102 @@ extern "C" int ds4_gpu_qwen4exp_indexer_query(
     return cuda_ok(cudaGetLastError(), "Flash-Next indexer query launch");
 }
 
-/* Block selection, one 1024-thread block per token (blocks stride over the
- * tokens and own one row of key scratch).  Tokens that see no more than
- * `budget` completed blocks attend to every cell.  Otherwise every block's
- * score becomes a 64-bit key (score bits above the negated block index, so
- * keys are unique and order by score first, older block first), an 8-pass
- * radix select finds the budget-th largest key exactly, and the blocks at
- * or above it are emitted in position order and expanded to cells, then
- * the tail cells.  Deterministic, and the same choice as the CPU's repeated
- * argmax with ties to the older block. */
+/* Block scores on the tensor cores: a 32-token x 128-block tile per block,
+ * one head at a time (its 128 dims staged in shared memory for ldmatrix,
+ * the query fragments read from global), ReLU applied per head to the f32
+ * accumulator and summed.  Each score becomes the token's 64-bit key for
+ * the select below (score bits above the negated block index, so keys are
+ * unique and order by score first, older block first), written to that
+ * token's row of the key scratch.  bf16 operands, the checkpoint's own
+ * indexer precision, and 200x the scalar loop's rate at 93K context. */
+#define QWEN4EXP_SCORE_ROWS 32u
+#define QWEN4EXP_SCORE_COLS 128u
+#define QWEN4EXP_SCORE_LD (QWEN4EXP_INDEXER_MAX_DIM + 8u)   /* bf16 per staged key row */
+
+__global__ static void __launch_bounds__(256, 2) qwen4exp_indexer_score_kernel(
+        uint64_t *keys, uint64_t keys_stride, const __nv_bfloat16 *q, const __nv_bfloat16 *bkey,
+        uint32_t n_head, uint32_t d, uint32_t n_tokens, uint32_t n_blocks) {
+    __shared__ __align__(16) __nv_bfloat16 bs[QWEN4EXP_SCORE_COLS][QWEN4EXP_SCORE_LD];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t t0 = blockIdx.y * QWEN4EXP_SCORE_ROWS;
+    const uint32_t b0 = blockIdx.x * QWEN4EXP_SCORE_COLS;
+    const uint32_t wr = (warp >> 2u) * 16u;
+    const uint32_t wc = (warp & 3u) * 32u;
+    const uint32_t qd = n_head * d;                      /* query row length */
+    float sum[4][4];
+    for (uint32_t f = 0; f < 4u; f++) sum[f][0] = sum[f][1] = sum[f][2] = sum[f][3] = 0.0f;
+    for (uint32_t h = 0; h < n_head; h++) {
+        /* stage this head's 128 key rows: 2 threads per row, 8 x 16 bytes each */
+        {
+            const uint32_t row = tid >> 1u;
+            const uint32_t half = (tid & 1u) * (d / 2u);
+            const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+            const bool valid = b0 + row < n_blocks;
+            const uint4 *src = (const uint4 *)(bkey + (uint64_t)(b0 + row) * d + half);
+            uint4 *dst = (uint4 *)&bs[row][half];
+            for (uint32_t i = 0; i < d / 16u; i++) dst[i] = valid ? src[i] : zero;
+        }
+        __syncthreads();
+        float acc[4][4];
+        for (uint32_t f = 0; f < 4u; f++) acc[f][0] = acc[f][1] = acc[f][2] = acc[f][3] = 0.0f;
+        for (uint32_t ks = 0; ks < d / 16u; ks++) {
+            uint32_t a[4];
+            for (uint32_t reg = 0; reg < 4u; reg++) {
+                const uint32_t row = t0 + wr + (lane >> 2u) + (reg & 1u) * 8u;
+                const uint32_t col = h * d + ks * 16u + (reg >> 1u) * 8u + (lane & 3u) * 2u;
+                a[reg] = row < n_tokens ? *(const uint32_t *)(q + (uint64_t)row * qd + col) : 0u;
+            }
+            const uint32_t kcol = ks * 16u + ((lane >> 3u) & 1u) * 8u;
+            for (uint32_t f = 0; f < 4u; f++) {
+                uint32_t b[2];
+                qwen35_ldsm_x2(b, &bs[wc + f * 8u + (lane & 7u)][kcol]);
+                qwen35_mma_bf16(acc[f], a, b[0], b[1]);
+            }
+        }
+        for (uint32_t f = 0; f < 4u; f++) {
+            for (uint32_t l = 0; l < 4u; l++) sum[f][l] += fmaxf(acc[f][l], 0.0f);
+        }
+        __syncthreads();   /* the next head overwrites the stage */
+    }
+    for (uint32_t f = 0; f < 4u; f++) {
+        for (uint32_t l = 0; l < 4u; l++) {
+            const uint32_t row = t0 + wr + (lane >> 2u) + (l >> 1u) * 8u;
+            const uint32_t col = b0 + wc + f * 8u + (lane & 3u) * 2u + (l & 1u);
+            if (row < n_tokens && col < n_blocks) {
+                keys[row * keys_stride + col] = ((uint64_t)__float_as_uint(sum[f][l]) << 32) | (uint64_t)(0xFFFFFFFFu - col);
+            }
+        }
+    }
+}
+
+/* Block selection, one 1024-thread block per token over its row of scored
+ * keys.  Tokens that see no more than `budget` completed blocks attend to
+ * every cell.  Otherwise an 8-pass radix select finds the budget-th largest
+ * key exactly, and the blocks at or above it are emitted in position order
+ * and expanded to cells, then the tail cells.  Deterministic, and the same
+ * choice as the CPU's repeated argmax with ties to the older block. */
 __global__ static void qwen4exp_qsa_select_kernel(
-        int32_t *sel, uint32_t *n_sel, uint64_t *keys_scratch, uint64_t keys_stride,
-        const float *q, const float *bkey, uint32_t n_head, uint32_t d, uint32_t r,
-        uint32_t budget, uint32_t max_sel, uint32_t pos0, uint32_t n_tokens) {
-    __shared__ float qs[QWEN4EXP_INDEXER_MAX_Q];
+        int32_t *sel, uint32_t *n_sel, const uint64_t *keys_scratch, uint64_t keys_stride,
+        uint32_t r, uint32_t budget, uint32_t max_sel, uint32_t pos0, uint32_t n_tokens) {
     __shared__ uint32_t hist[256];
     __shared__ uint32_t scan[QWEN4EXP_SELECT_THREADS];
     __shared__ uint32_t s_bin, s_k;
     const uint32_t tid = threadIdx.x;
     const uint32_t nthreads = blockDim.x;
-    uint64_t *keys = keys_scratch + (uint64_t)blockIdx.x * keys_stride;
-    for (uint32_t t = blockIdx.x; t < n_tokens; t += gridDim.x) {
+    const uint32_t t = blockIdx.x;
+    if (t >= n_tokens) return;
+    const uint64_t *keys = keys_scratch + (uint64_t)t * keys_stride;
+    {
         const uint32_t pos = pos0 + t;
         const uint32_t n_blocks = (pos + 1u) / r;
         int32_t *out = sel + (uint64_t)t * max_sel;
         if (n_blocks <= budget) {
             for (uint32_t c = tid; c <= pos; c += nthreads) out[c] = (int32_t)c;
             if (tid == 0u) n_sel[t] = pos + 1u;
-            continue;
+            return;
         }
-        __syncthreads();
-        for (uint32_t i = tid; i < n_head * d; i += nthreads) qs[i] = q[(uint64_t)t * n_head * d + i];
-        __syncthreads();
-        for (uint32_t b = tid; b < n_blocks; b += nthreads) {
-            const float *kb = bkey + (uint64_t)b * d;
-            float s = 0.0f;
-            for (uint32_t h = 0; h < n_head; h++) {
-                float dot = 0.0f;
-                for (uint32_t i = 0; i < d; i++) dot = fmaf(qs[h * d + i], kb[i], dot);
-                if (dot > 0.0f) s += dot;
-            }
-            keys[b] = ((uint64_t)__float_as_uint(s) << 32) | (uint64_t)(0xFFFFFFFFu - b);
-        }
-        __syncthreads();
         uint64_t prefix = 0, mask = 0;
         uint32_t k = budget;
         for (int pass = 7; pass >= 0; pass--) {
@@ -2290,9 +2343,30 @@ extern "C" int ds4_gpu_qwen4exp_qsa_select(
         !qwen4exp_elems_fit(q, (uint64_t)n_tokens * n_head * d) || !qwen4exp_elems_fit(bkey, max_blocks * d)) {
         return 0;
     }
-    const uint32_t grid = n_tokens < keys_rows ? n_tokens : keys_rows;
-    qwen4exp_qsa_select_kernel<<<grid, QWEN4EXP_SELECT_THREADS, 0, cuda_decode_stream()>>>(
-        (int32_t *)sel->ptr, (uint32_t *)n_sel->ptr, (uint64_t *)keys->ptr, max_blocks,
-        (const float *)q->ptr, (const float *)bkey->ptr, n_head, d, r, budget, max_sel, pos0, n_tokens);
+    if (d % 16u != 0u || d > QWEN4EXP_INDEXER_MAX_DIM) return 0;
+    cudaStream_t stream = cuda_decode_stream();
+    const int tier = ds4_tensor_device_idx(sel);
+    /* bf16 operands for the scores: the chunk's queries and every block key it can see */
+    const uint64_t n_blocks = (uint64_t)(pos0 + n_tokens) / r;
+    const uint64_t qn = (uint64_t)n_tokens * n_head * d;
+    /* one temporary: the allocator hands out a single reusable scratch */
+    __nv_bfloat16 *qb = (__nv_bfloat16 *)cuda_tmp_alloc_on(tier, (qn + n_blocks * d) * sizeof(__nv_bfloat16), "indexer operands");
+    if (!qb) return 0;
+    __nv_bfloat16 *kb = qb + qn;
+    qwen35_to_bf16(qb, (const float *)q->ptr, qn, stream);
+    if (n_blocks) qwen35_to_bf16(kb, (const float *)bkey->ptr, n_blocks * d, stream);
+    /* tokens go in groups of keys_rows, each scoring into its own scratch row */
+    for (uint32_t g0 = 0; g0 < n_tokens; g0 += keys_rows) {
+        const uint32_t ng = n_tokens - g0 < keys_rows ? n_tokens - g0 : keys_rows;
+        const uint32_t nb = (pos0 + g0 + ng) / r;              /* blocks the group's last token sees */
+        if (nb) {
+            const dim3 grid((nb + QWEN4EXP_SCORE_COLS - 1u) / QWEN4EXP_SCORE_COLS, (ng + QWEN4EXP_SCORE_ROWS - 1u) / QWEN4EXP_SCORE_ROWS, 1u);
+            qwen4exp_indexer_score_kernel<<<grid, 256, 0, stream>>>(
+                (uint64_t *)keys->ptr, max_blocks, qb + (uint64_t)g0 * n_head * d, kb, n_head, d, ng, nb);
+        }
+        qwen4exp_qsa_select_kernel<<<ng, QWEN4EXP_SELECT_THREADS, 0, stream>>>(
+            (int32_t *)sel->ptr + (uint64_t)g0 * max_sel, (uint32_t *)n_sel->ptr + g0, (const uint64_t *)keys->ptr, max_blocks,
+            r, budget, max_sel, pos0 + g0, ng);
+    }
     return cuda_ok(cudaGetLastError(), "Flash-Next QSA select launch");
 }

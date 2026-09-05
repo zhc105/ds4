@@ -79,6 +79,30 @@ static int run_case(uint32_t pos0, uint32_t n_tokens, unsigned seed,
         ds4_gpu_tensor_read(sel_t, 0, got, (uint64_t)n_tokens * MAX_SEL * sizeof(int32_t)) &&
         ds4_gpu_tensor_read(n_sel_t, 0, got_n, n_tokens * sizeof(uint32_t))) {
         rc = 0;
+        /* the scored keys of the first token, straight from the scratch */
+        {
+            const uint32_t n_blocks = (pos0 + 1u) / R;
+            uint64_t *keys = malloc((CTX / R) * sizeof(uint64_t));
+            if (keys && n_blocks > BUDGET && ds4_gpu_tensor_read(keys_t, 0, keys, (CTX / R) * sizeof(uint64_t))) {
+                uint32_t bad = 0;
+                for (uint32_t b = 0; b < n_blocks; b++) {
+                    float s = 0.0f;
+                    for (uint32_t h = 0; h < N_HEAD; h++) {
+                        float dot = 0.0f;
+                        for (uint32_t i = 0; i < D; i++) dot += q[h * D + i] * bkey[(uint64_t)b * D + i];
+                        if (dot > 0.0f) s += dot;
+                    }
+                    float g;
+                    const uint32_t bits = (uint32_t)(keys[b] >> 32);
+                    memcpy(&g, &bits, sizeof g);
+                    if (g != s || (uint32_t)keys[b] != 0xFFFFFFFFu - b) {
+                        if (bad++ < 3) fprintf(stderr, "  score block %u: gpu %g ref %g (low %u)\n", b, g, s, (uint32_t)keys[b]);
+                    }
+                }
+                if (bad) fprintf(stderr, "qsa-select: pos %u: %u of %u block scores differ\n", pos0, bad, n_blocks);
+            }
+            free(keys);
+        }
         for (uint32_t t = 0; t < n_tokens && rc == 0; t++) {
             const uint32_t n = ref_select(want, q + (uint64_t)t * N_HEAD * D, bkey, score, pos0 + t);
             if (n != got_n[t] || memcmp(want, got + (uint64_t)t * MAX_SEL, n * sizeof(int32_t)) != 0) {
