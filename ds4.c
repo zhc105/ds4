@@ -67281,7 +67281,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
     if (ds4_model_is_qwen()) {
 #ifdef DS4_QWEN_GPU
-        uint32_t rows = e->prefill_chunk ? e->prefill_chunk : 512u;
+        /* Prefill rows per graph pass: the expert GEMMs need thousands of
+         * rows to run at full rate (a 32K prompt is 1.7x faster at 4096 rows
+         * than at 512), and the per-row scratch costs about 0.5 MB a row. */
+        uint32_t rows = e->prefill_chunk ? e->prefill_chunk : 4096u;
         if (rows > (uint32_t)ctx_size) rows = (uint32_t)ctx_size;
         if (!qwen_graph_alloc(&s->qwen_graph, (uint32_t)ctx_size, rows,
                               e->mtp_ready ? (uint32_t)e->mtp_draft_tokens + 1u : 0u)) {
