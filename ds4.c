@@ -16483,7 +16483,7 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
     g->att_part = qwen_graph_tensor(8ull * DS4_N_HEAD * 64ull * (DS4_N_HEAD_DIM + 2u), &ok);
     /* prefill: bf16 hi/lo copies of the K and V caches and of the chunk's queries */
     g->att_split = qwen_graph_tensor((4ull * ctx * kv_dim + 2ull * rows * attn_dim) / 2u, &ok);
-    g->logits = qwen_graph_tensor(DS4_N_VOCAB, &ok);
+    g->logits = qwen_graph_tensor((uint64_t)(spec_rows ? spec_rows : 1u) * DS4_N_VOCAB, &ok);   /* rows of a speculative batch */
     if (ds4_qwen_has_hc()) {
         g->xn = qwen_graph_tensor(rows * x_dim, &ok);
         g->xn_bf16 = qwen_graph_tensor(rows * x_dim / 2u, &ok);
@@ -16868,6 +16868,7 @@ static bool qwen_graph_layer_run_island(
         memset(&key, 0, sizeof key);
         key.il = il;
         key.island = island;
+        key.variant = n | (g->snapshot ? 0x100u : 0u);
         key.cur_hc = g->x;          /* the scratch whose addresses the kernels bake in */
         key.after_attn_hc = g->h;
         key.after_ffn_hc = g->y;
@@ -16898,7 +16899,9 @@ static bool qwen_graph_layer(
     ds4_gpu_tensor *att_bf16 = n > 8u && ds4_qwen_has_hc() ? g->att_bf16 : NULL;
     static int trace = -1;
     if (trace < 0) trace = getenv("DS4_QWEN_TRACE") != NULL;
-    const bool graphs = n == 1u && !trace && ds4_gpu_decode_graphs_supported();
+    /* decode-sized passes replay captured graphs: one variant per row count
+     * and snapshot mode, since both are baked into the launches */
+    const bool graphs = n <= 8u && !trace && ds4_gpu_decode_graphs_supported();
     bool ok = qwen_graph_layer_run_island(g, m, l, next, il, 0u, att_bf16, n, graphs);
     if (ok && !ds4_qwen_layer_is_gdn(il)) {
         const bool sparse = qwen_graph_qsa_select(g, m, l, il, n, pos0, &ok);
@@ -17037,6 +17040,20 @@ static bool qwen_graph_head(
     return ok;
 }
 
+/* The output head over the first n rows at once (a speculative batch: the
+ * 1.2 GiB lm_head is read once for all of them), into g->logits rows. */
+static bool qwen_graph_head_rows(
+        ds4_qwen_gpu_graph *g,
+        const ds4_model      *m,
+        const ds4_weights    *w,
+        uint32_t              n) {
+    const bool ok = ds4_qwen_has_hc()
+        ? qwen_graph_hc_mix(g, m, &w->output_hc_mix, g->x, n, g->h, NULL)
+        : ds4_gpu_rms_norm_weight_rows_tensor(g->h, g->x, m->map, m->size, w->output_norm->abs_offset,
+                                              DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
+    return ok && qwen_graph_matmul(g->logits, m, w->output, g->h, n);
+}
+
 /* Fold n tokens into the state, in max_rows chunks.  logits_out, when set,
  * receives the distribution after the last token; dump, when set, receives
  * the distribution after every token as f32 rows (DS4_QWEN_DUMP_LOGITS),
@@ -17064,11 +17081,18 @@ static bool qwen_graph_forward(
             const bool chain = il + 1u + DS4_N_NEXTN_PREDICT < DS4_N_LAYER && !ds4_qwen_layer_has_ple(il + 1u);
             ok = qwen_graph_layer(g, m, &w->layer[il], chain ? &w->layer[il + 1u] : NULL, il, rows, pos0);
         }
-        for (uint32_t r = 0; ok && (dump || row_logits) && r < rows; r++) {
-            float *dst = row_logits ? row_logits + (uint64_t)(done + r) * DS4_N_VOCAB : logits_out;
-            ok = qwen_graph_head(g, m, w, r) &&
-                 ds4_gpu_tensor_read(g->logits, 0, dst, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0 &&
-                 (!dump || fwrite(dst, sizeof(float), DS4_N_VOCAB, dump) == DS4_N_VOCAB);
+        if (ok && row_logits && !dump && rows <= g->spec_rows) {
+            /* a speculative batch: one head pass over its rows */
+            ok = qwen_graph_head_rows(g, m, w, rows) &&
+                 ds4_gpu_tensor_read(g->logits, 0, row_logits + (uint64_t)done * DS4_N_VOCAB,
+                                     (uint64_t)rows * DS4_N_VOCAB * sizeof(float)) != 0;
+        } else {
+            for (uint32_t r = 0; ok && (dump || row_logits) && r < rows; r++) {
+                float *dst = row_logits ? row_logits + (uint64_t)(done + r) * DS4_N_VOCAB : logits_out;
+                ok = qwen_graph_head(g, m, w, r) &&
+                     ds4_gpu_tensor_read(g->logits, 0, dst, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0 &&
+                     (!dump || fwrite(dst, sizeof(float), DS4_N_VOCAB, dump) == DS4_N_VOCAB);
+            }
         }
         g->n_tokens += rows;
         done += rows;
