@@ -202,17 +202,20 @@ def f32_to_ue4m3(x):
     return np.minimum(code, 0x7E).astype(np.uint8)
 
 
-def nvfp4_quantize(weight):
+def nvfp4_quantize(weight, scale2=None):
     """Quantize a float32 [out, in] matrix the ModelOpt way: one global scale
-    (amax / (6 * 448)), an E4M3 scale per 16 values (block amax / 6 over the
-    global scale) and nearest E2M1 codes, packed as GGML super-blocks.
+    (amax / (6 * 448), or the given one when the matrix comes in row chunks),
+    an E4M3 scale per 16 values (block amax / 6 over the global scale) and
+    nearest E2M1 codes, packed as GGML super-blocks.
     Returns (raw uint8 [out, nsuper*36], global scale)."""
     out_features, n_cols = weight.shape
     if n_cols % NVFP4_SUPER != 0:
         fail(f"NVFP4 row length {n_cols} is not a multiple of {NVFP4_SUPER}")
     w = np.asarray(weight, dtype=np.float32)
-    amax = float(np.max(np.abs(w))) if w.size else 0.0
-    scale2 = np.float32(amax / (6.0 * 448.0)) if amax > 0 else np.float32(1.0)
+    if scale2 is None:
+        amax = float(np.max(np.abs(w))) if w.size else 0.0
+        scale2 = np.float32(amax / (6.0 * 448.0)) if amax > 0 else np.float32(1.0)
+    scale2 = np.float32(scale2)
     blocks = w.reshape(out_features, n_cols // NVFP4_BLOCK, NVFP4_BLOCK)
     bmax = np.max(np.abs(blocks), axis=-1)
     d = f32_to_ue4m3(bmax / 6.0 / scale2)                                            # [out, n_blocks]

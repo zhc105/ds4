@@ -432,11 +432,20 @@ __global__ static void qwen35_matvec_bf16_rows_kernel(
     float sum[N];
 #pragma unroll
     for (int r = 0; r < N; r++) sum[r] = 0.0f;
-    const uint16_t *wrow = weights + (uint64_t)col * in_dim;
-    for (uint32_t i = lane; i < in_dim; i += 32u) {
-        const float w = __uint_as_float((uint32_t)wrow[i] << 16);
+    /* four weights (8 bytes) and four activations (16 bytes) per lane per step */
+    const uint2 *wrow = (const uint2 *)(weights + (uint64_t)col * in_dim);
+    for (uint32_t i = lane; i < in_dim / 4u; i += 32u) {
+        const uint2 wq = wrow[i];
+        const float w0 = __uint_as_float(wq.x << 16), w1 = __uint_as_float(wq.x & 0xffff0000u);
+        const float w2 = __uint_as_float(wq.y << 16), w3 = __uint_as_float(wq.y & 0xffff0000u);
 #pragma unroll
-        for (int r = 0; r < N; r++) sum[r] = fmaf(w, x[(uint64_t)r * in_dim + i], sum[r]);
+        for (int r = 0; r < N; r++) {
+            const float4 xv = *(const float4 *)(x + (uint64_t)r * in_dim + i * 4u);
+            sum[r] = fmaf(w0, xv.x, sum[r]);
+            sum[r] = fmaf(w1, xv.y, sum[r]);
+            sum[r] = fmaf(w2, xv.z, sum[r]);
+            sum[r] = fmaf(w3, xv.w, sum[r]);
+        }
     }
 #pragma unroll
     for (int r = 0; r < N; r++) {
@@ -648,8 +657,11 @@ extern "C" int ds4_gpu_qwen35_matmul(
     /* The BF16 matvec (9 GiB of bypass weights per Flash-Next decode step)
      * runs at the memory bandwidth; every weight is read once for all the
      * rows of a speculative batch. */
-    if (wtype == QWEN35_W_BF16) {
+    if (wtype == QWEN35_W_BF16 && in_dim % 4u == 0u) {
         qwen35_matvec_bf16_rows(o, (const uint16_t *)w, xp, in_dim, out_dim, n_tok, stream);
+    } else if (wtype == QWEN35_W_BF16) {
+        const dim3 grid((out_dim + 7u) / 8u, n_tok, 1u);
+        glm53_matvec_bf16_f32_kernel<<<grid, 256, 0, stream>>>(o, (const uint16_t *)w, xp, in_dim, out_dim);
     } else {
         matmul_f32_kernel<<<dim3(out_dim, n_tok, 1u), 256, 0, stream>>>(o, (const float *)w, xp,
                                                                         in_dim, out_dim, n_tok);

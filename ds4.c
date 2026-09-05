@@ -4490,6 +4490,7 @@ typedef struct {
     ds4_tensor         *enorm;          /* [n_embd] */
     ds4_tensor         *hnorm;          /* [n_hc * n_embd], one RMS over the widened row */
     ds4_qwen_hc_weights mixer;
+    ds4_tensor         *output;         /* optional NVFP4 copy of the lm_head for scoring drafts */
 } ds4_qwen_mtp_weights;
 
 typedef struct {
@@ -7180,6 +7181,7 @@ static void weights_bind_qwen_mtp(ds4_qwen_mtp_weights *w, const ds4_model *m) {
     w->mixer.down   = required_tensor(m, "output_hc_down.weight");
     w->mixer.up     = required_tensor(m, "output_hc_up.weight");
     w->mixer.inject = NULL;
+    w->output       = model_find_tensor(m, "output.weight");
 }
 
 static void weights_bind_qwen_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
@@ -17007,7 +17009,8 @@ static bool qwen_graph_mtp_forward(
         ds4_gpu_tensor *x = ds4_gpu_tensor_view(g->x, (uint64_t)(n - 1u) * x_dim * 2u, x_dim * 2u);
         ds4_gpu_tensor *h = ds4_gpu_tensor_view(g->h, 0, (uint64_t)DS4_N_EMBD * sizeof(float));
         ok = x && h && qwen_graph_hc_mix(g, mm, &mw->mixer, x, 1, h, NULL) &&
-             qwen_graph_matmul(g->logits, m, w->output, h, 1) &&
+             (mw->output ? qwen_graph_matmul(g->logits, mm, mw->output, h, 1)
+                         : qwen_graph_matmul(g->logits, m, w->output, h, 1)) &&
              ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         if (x) ds4_gpu_tensor_free(x);
         if (h) ds4_gpu_tensor_free(h);

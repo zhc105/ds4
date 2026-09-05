@@ -432,6 +432,31 @@ class Converter:
         self.norm("nextn.enorm.weight", "mtp.pre_fc_norm_embedding.weight")
         self.norm("nextn.hnorm.weight", "mtp.pre_fc_norm_hidden.weight")
         self.add_hc("output_hc", "mtp.hyper_connection_mixer")
+        # The drafter scores through the main lm_head; a NVFP4 copy reads a
+        # quarter of the bytes per draft, the drafter only proposing tokens.
+        self.linear_nvfp4("output", "lm_head")
+
+    def linear_nvfp4(self, gguf_base, hf_base):
+        """A bf16 projection quantized to NVFP4 in row chunks with one global scale."""
+        st = self.st
+        name = hf_base + ".weight"
+        rows, cols = st.shape(name)
+        chunk = 8192
+        scale = np.zeros(1, dtype=np.float32)
+
+        def produce():
+            amax = 0.0
+            for r0 in range(0, rows, chunk):
+                amax = max(amax, float(np.max(np.abs(bf16_to_f32(st.read(name)[r0:r0 + chunk])))))
+            scale[0] = amax / (6.0 * 448.0) if amax > 0 else 1.0
+            out = np.empty((rows, cols // 64 * 36), dtype=np.uint8)
+            for r0 in range(0, rows, chunk):
+                out[r0:r0 + chunk], _ = nvfp4_quantize(bf16_to_f32(st.read(name)[r0:r0 + chunk]), scale[0])
+            return out
+
+        self.uses_nvfp4 = True
+        self.writer.add_tensor(gguf_base + ".weight", [rows, cols], T_NVFP4, rows * (cols // 64 * 36), produce)
+        self.writer.add_tensor(gguf_base + ".scale", [1], T_F32, 4, lambda: scale)
 
     # -- n-gram sidecar ---------------------------------------------------
 
