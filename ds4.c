@@ -3135,6 +3135,22 @@ static bool accelerator_span_filter_contains(uint64_t off,
     return false;
 }
 
+/* The next cache range: sorted spans from *i merged while they are nearly
+ * contiguous and the range stays within max_span. */
+static void accelerator_merge_spans(const accelerator_tensor_span *spans,
+                                    uint64_t nspan, uint64_t *i, uint64_t max_span,
+                                    uint64_t *off, uint64_t *end) {
+    *off = spans[*i].off;
+    *end = spans[*i].end;
+    (*i)++;
+    while (*i < nspan &&
+           spans[*i].off <= *end + 65536u &&
+           spans[*i].end - *off <= max_span) {
+        if (spans[*i].end > *end) *end = spans[*i].end;
+        (*i)++;
+    }
+}
+
 static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
                                                    const uint64_t *span_offsets,
                                                    const uint64_t *span_sizes,
@@ -3205,16 +3221,20 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             tty ? ": 0.00 GiB" : "\n");
     fflush(stderr);
 
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    /* The cache can size one arena for everything that follows. */
+    uint64_t total = 0;
     for (uint64_t i = 0; i < nspan;) {
-        uint64_t off = spans[i].off;
-        uint64_t end = spans[i].end;
-        i++;
-        while (i < nspan &&
-               spans[i].off <= end + 65536u &&
-               spans[i].end - off <= max_span) {
-            if (spans[i].end > end) end = spans[i].end;
-            i++;
-        }
+        uint64_t off, end;
+        accelerator_merge_spans(spans, nspan, &i, max_span, &off, &end);
+        total += (end - off + 255u) & ~(uint64_t)255u;
+    }
+    ds4_gpu_reserve_model_cache(total);
+#endif
+
+    for (uint64_t i = 0; i < nspan;) {
+        uint64_t off, end;
+        accelerator_merge_spans(spans, nspan, &i, max_span, &off, &end);
         char label[96];
         snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
         if (ds4_gpu_cache_model_range(m->map, m->size, off, end - off, label) == 0) {

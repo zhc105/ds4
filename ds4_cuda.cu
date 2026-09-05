@@ -2352,6 +2352,26 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     return (char *)dev;
 }
 
+/* One arena for the whole resident model.  Per-chunk arenas hold whole
+ * ranges only, so every 1 GiB tensor span left up to 0.75 GiB of its
+ * 1.75 GiB chunk unused: 17 GB on Qwen3.8-Flash-Next.  The gates mirror
+ * cuda_model_range_ptr: only the fd-backed cache places weights here. */
+extern "C" int ds4_gpu_reserve_model_cache(uint64_t bytes) {
+    if (bytes == 0 || g_model_fd < 0 || g_model_device_owned || g_model_registered ||
+        g_model_cache_full || !g_model_arenas.empty() ||
+        getenv("DS4_CUDA_NO_FD_CACHE") != NULL || getenv("DS4_CUDA_DIRECT_MODEL") != NULL ||
+        (g_model_hmm_direct && getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
+         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) ||
+        bytes > cuda_model_cache_limit_bytes()) return 0;
+    void *dev = NULL;
+    if (cudaMalloc(&dev, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_model_arenas.push_back({(char *)dev, bytes, 0});
+    return 1;
+}
+
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
