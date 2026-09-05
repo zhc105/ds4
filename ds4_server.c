@@ -6874,8 +6874,12 @@ static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
+    /* DeepSeek and GLM may open a second reasoning block before a tool
+     * call, so their answer text is held until it is clearly an answer;
+     * Qwen closes <think> exactly once and streams its answer directly. */
     st->guard_second_reasoning =
-        ds4_think_mode_enabled(r->think_mode) && r->has_tools;
+        ds4_think_mode_enabled(r->think_mode) && r->has_tools &&
+        r->model_syntax != SERVER_MODEL_SYNTAX_QWEN;
 }
 
 static void openai_tool_stream_free(openai_tool_stream *ts) {
@@ -8870,8 +8874,12 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     memset(st, 0, sizeof(*st));
     st->active = ok;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
+    /* DeepSeek and GLM may open a second reasoning block before a tool
+     * call, so their answer text is held until it is clearly an answer;
+     * Qwen closes <think> exactly once and streams its answer directly. */
     st->guard_second_reasoning =
-        ds4_think_mode_enabled(r->think_mode) && r->has_tools;
+        ds4_think_mode_enabled(r->think_mode) && r->has_tools &&
+        r->model_syntax != SERVER_MODEL_SYNTAX_QWEN;
     return ok;
 }
 
@@ -16132,6 +16140,39 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     close(sv[1]);
 }
 
+/* With tools and thinking on, Qwen's answer streams as it is generated
+ * instead of waiting for the end of the response. */
+static void test_openai_qwen_tool_stream_answers_incrementally(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw = "a greeting\n</think>\n\nHello there";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_qwen", &st,
+                                         raw, strlen(raw), false));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"a greeting\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"Hello there\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\n") == NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -20351,6 +20392,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
+    test_openai_qwen_tool_stream_answers_incrementally();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
     test_openai_tool_stream_holds_partial_dsml_entities();
