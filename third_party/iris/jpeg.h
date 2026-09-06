@@ -872,87 +872,73 @@ static int jpeg_prog_decode_ac_first(jpeg_decoder *dec, int comp_idx, int16_t *c
     return 0;
 }
 
-/* Decode AC coefficient refinement for progressive (Ah != 0) */
+/* Decode AC coefficient refinement for progressive (Ah != 0).
+ *
+ * DS4 fix: this follows libjpeg's decode_mcu_AC_refine.  A ZRL symbol skips
+ * exactly sixteen zero coefficients and the next symbol is decoded before
+ * the correction bits of any non-zero coefficients that follow; the
+ * original kept refining past the sixteenth zero, reading those bits
+ * early, so every progressive image with a ZRL in a refinement scan failed
+ * to decode. */
 static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *coef) {
     jpeg_huff_table *ac_huff = &dec->huff[dec->comp[comp_idx].ac_idx + 2];
-    int p1 = 1 << dec->al;    /* Bit to add for positive refinement */
-    int m1 = -p1;             /* Bit to add for negative refinement */
-
+    const int p1 = 1 << dec->al;    /* Bit to add for positive refinement */
+    const int m1 = -p1;             /* Bit to add for negative refinement */
     int k = dec->ss;
 
     if (dec->eobrun == 0) {
-        while (k <= dec->se) {
+        for (; k <= dec->se; k++) {
             int rs = jpeg_decode_huffman(&dec->bs, ac_huff);
             if (rs < 0) {
                 /* At EOF, treat as implicit EOB for remaining blocks */
                 if (dec->bs.eof) break;
                 return -1;
             }
-
             int run = rs >> 4;
-            int size = rs & 0x0F;
-
-            if (size == 0) {
-                if (run != 15) {
-                    /* EOBn */
-                    dec->eobrun = (1 << run);
-                    if (run > 0) {
-                        int extra = jpeg_get_bits(&dec->bs, run);
-                        if (extra < 0) {
-                            if (dec->bs.eof) break;
-                            return -1;
-                        }
-                        dec->eobrun += extra;
-                    }
-                    break;
-                }
-                /* ZRL: skip 16 zeros while refining non-zeros */
-                run = 16;
-            } else if (size != 1) {
-                if (dec->bs.eof) break;
-                return -1;  /* Invalid: size must be 1 for refinement */
-            }
-
-            /* Skip 'run' zero coefficients, refining any non-zero ones along the way */
-            int new_val = 0;
-            if (size == 1) {
+            int value = rs & 0x0F;
+            if (value != 0) {
+                if (value != 1) return -1;  /* Invalid: size must be 1 for refinement */
                 int bit = jpeg_get_bits(&dec->bs, 1);
                 if (bit < 0) {
                     if (dec->bs.eof) break;
                     return -1;
                 }
-                new_val = bit ? p1 : m1;
+                value = bit ? p1 : m1;
+            } else if (run != 15) {
+                /* EOBn */
+                dec->eobrun = (1 << run);
+                if (run > 0) {
+                    int extra = jpeg_get_bits(&dec->bs, run);
+                    if (extra < 0) {
+                        if (dec->bs.eof) break;
+                        return -1;
+                    }
+                    dec->eobrun += extra;
+                }
+                break;
             }
 
-            while (k <= dec->se) {
+            /* Advance over 'run' zero coefficients (sixteen for ZRL),
+             * refining the non-zero ones passed on the way. */
+            do {
                 int zk = jpeg_zigzag[k];
                 if (coef[zk] != 0) {
-                    /* Refine existing non-zero coefficient */
                     int bit = jpeg_get_bits(&dec->bs, 1);
                     if (bit < 0) {
                         if (dec->bs.eof) goto refine_done;
                         return -1;
                     }
                     if (bit && (coef[zk] & p1) == 0) {
-                        if (coef[zk] > 0) {
-                            coef[zk] += p1;
-                        } else {
-                            coef[zk] += m1;
-                        }
+                        coef[zk] = (int16_t)(coef[zk] + (coef[zk] >= 0 ? p1 : m1));
                     }
-                    k++;
-                } else if (run > 0) {
-                    run--;
-                    k++;
-                } else {
+                } else if (--run < 0) {
                     break;
                 }
-            }
-
-            if (dec->bs.eof) goto refine_done;
-            if (size == 1 && k <= dec->se) {
-                coef[jpeg_zigzag[k]] = (int16_t)new_val;
                 k++;
+            } while (k <= dec->se);
+
+            if (value != 0 && k <= dec->se) {
+                coef[jpeg_zigzag[k]] = (int16_t)value;
             }
         }
     }
@@ -960,7 +946,7 @@ static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *
 refine_done:
     /* Process remaining coefficients if in EOBRUN */
     if (dec->eobrun > 0) {
-        while (k <= dec->se) {
+        for (; k <= dec->se; k++) {
             int zk = jpeg_zigzag[k];
             if (coef[zk] != 0) {
                 int bit = jpeg_get_bits(&dec->bs, 1);
@@ -969,14 +955,9 @@ refine_done:
                     return -1;
                 }
                 if (bit && (coef[zk] & p1) == 0) {
-                    if (coef[zk] > 0) {
-                        coef[zk] += p1;
-                    } else {
-                        coef[zk] += m1;
-                    }
+                    coef[zk] = (int16_t)(coef[zk] + (coef[zk] >= 0 ? p1 : m1));
                 }
             }
-            k++;
         }
         dec->eobrun--;
     }
