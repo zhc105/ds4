@@ -13318,7 +13318,13 @@ decode_again:
                 break;
             }
 
-            if (j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_end) {
+            /* DeepSeek closes one block around all of its calls, so its end
+             * marker ends the turn.  Qwen closes every call separately and
+             * may open another, so its turn ends at <|im_end|>; stopping at
+             * the first close would also leave the speculative batch's
+             * extra tokens in the live KV, breaking the next turn's prefix. */
+            if (j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_end &&
+                j->req.model_syntax != SERVER_MODEL_SYNTAX_QWEN) {
                 finish = "tool_calls";
                 stop_decode = true;
                 break;
