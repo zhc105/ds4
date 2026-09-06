@@ -1601,8 +1601,10 @@ rewound to an earlier position, so the session saves a copy of it (about
 of the history, such as an agent dropping an old image or a tool result,
 resumes from the latest saved prompt that is still its prefix instead of
 re-prefilling from token zero; the usage reports it as `cached_tokens` and
-the trace as `cache_source: memory-state`. Returning to the previous branch
-of the conversation is equally cheap while its prompt is among the five.
+the trace as `cache_source: memory-state`. The K/V rows are reused in
+place, so a copy stays usable only while the rows still hold its history:
+returning to an earlier branch of the conversation resumes from the last
+saved prompt before the two branches fork.
 
 Enable it with:
 
