@@ -1089,23 +1089,28 @@ static void request_free(request *r) {
 
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
     if (!enabled || effort == DS4_THINK_NONE) return DS4_THINK_NONE;
-    return effort == DS4_THINK_MAX ? DS4_THINK_MAX : DS4_THINK_HIGH;
+    return effort;
 }
 
+/* Every level above "none" thinks; DeepSeek and GLM render low and medium
+ * like high, Qwen's template distinguishes them.  Callers that need no
+ * reasoning must say "none". */
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
     if (!s) return false;
     if (!strcmp(s, "max")) {
         *out = DS4_THINK_MAX;
         return true;
     }
-    if (!strcmp(s, "xhigh") || !strcmp(s, "high") ||
-        !strcmp(s, "medium") || !strcmp(s, "low") ||
-        !strcmp(s, "minimal"))
-    {
-        /* DS4 only exposes HIGH and MAX above zero, so "minimal" collapses to
-         * the smallest non-zero level (HIGH). Callers that need *no* reasoning
-         * must use "none" instead. */
+    if (!strcmp(s, "xhigh") || !strcmp(s, "high")) {
         *out = DS4_THINK_HIGH;
+        return true;
+    }
+    if (!strcmp(s, "medium")) {
+        *out = DS4_THINK_MEDIUM;
+        return true;
+    }
+    if (!strcmp(s, "low") || !strcmp(s, "minimal")) {
+        *out = DS4_THINK_LOW;
         return true;
     }
     if (!strcmp(s, "none")) {
@@ -2779,13 +2784,24 @@ static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
         "...</tool_call>");
 }
 
-/* The Qwen3.8 template's only reasoning switch is this system line; the
- * server's HIGH and MAX both map onto the template's default "xhigh". */
+/* The Qwen3.8 template's reasoning switch is one system line: "xhigh" (its
+ * default, also the server's HIGH and MAX) and "low" each have a sentence,
+ * "medium" says nothing and leaves the model to its habit. */
 static const char *qwen_reasoning_effort_text(ds4_think_mode think_mode) {
-    if (!ds4_think_mode_enabled(think_mode)) return NULL;
-    return "Reasoning effort is set to xhigh. Please think carefully through the task, "
-           "validate key assumptions, consider plausible alternatives, and prioritize "
-           "correctness, consistency, and clarity in the final answer.";
+    switch (think_mode) {
+    case DS4_THINK_HIGH:
+    case DS4_THINK_MAX:
+        return "Reasoning effort is set to xhigh. Please think carefully through the task, "
+               "validate key assumptions, consider plausible alternatives, and prioritize "
+               "correctness, consistency, and clarity in the final answer.";
+    case DS4_THINK_LOW:
+        return "Reasoning effort is set to low. Keep your thinking brief and focused, "
+               "moving directly to the conclusion without unnecessary elaboration.";
+    case DS4_THINK_MEDIUM:
+    case DS4_THINK_NONE:
+        return NULL;
+    }
+    return NULL;
 }
 
 static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
@@ -16615,8 +16631,10 @@ static void test_chat_ignore_eos_contract(void) {
 
 static void test_reasoning_effort_mapping(void) {
     ds4_think_mode mode = DS4_THINK_NONE;
-    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_HIGH);
-    TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == DS4_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_LOW);
+    TEST_ASSERT(parse_reasoning_effort_name("minimal", &mode) && mode == DS4_THINK_LOW);
+    TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == DS4_THINK_MEDIUM);
+    TEST_ASSERT(ds4_think_mode_enabled(DS4_THINK_LOW) && ds4_think_mode_enabled(DS4_THINK_MEDIUM));
     TEST_ASSERT(parse_reasoning_effort_name("high", &mode) && mode == DS4_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == DS4_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("max", &mode) && mode == DS4_THINK_MAX);
@@ -16847,6 +16865,17 @@ static void test_render_qwen_reference_cases(void) {
     TEST_ASSERT(!strcmp(prompt,
         "<|im_start|>user\nhi<|im_end|>\n"
         "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    free(prompt);
+
+    /* medium has no system line but still thinks; low has its own line */
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_MEDIUM);
+    TEST_ASSERT(!strcmp(prompt,
+        "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"));
+    free(prompt);
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(!strncmp(prompt, "<|im_start|>system\nReasoning effort is set to low. ", 50));
     free(prompt);
 
     prompt = render_chat_prompt_text_for_syntax(

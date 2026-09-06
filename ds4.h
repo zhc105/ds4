@@ -22,8 +22,12 @@ typedef enum {
     DS4_BACKEND_CPU,
 } ds4_backend;
 
+/* Reasoning effort.  Every level above NONE thinks; DeepSeek and GLM treat
+ * LOW and MEDIUM as HIGH, the Qwen template renders each its own way. */
 typedef enum {
     DS4_THINK_NONE,
+    DS4_THINK_LOW,
+    DS4_THINK_MEDIUM,
     DS4_THINK_HIGH,
     DS4_THINK_MAX,
 } ds4_think_mode;
