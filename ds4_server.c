@@ -12794,6 +12794,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    if (cached == 0) {
+        /* The engine resumes an edited history from the state it saved after
+         * an earlier prompt; only the accounting happens here. */
+        const int resumable = ds4_session_resumable_prefix(slot->session, prompt_for_sync);
+        if (resumable > 0) {
+            cached = resumable;
+            cache_source = "memory-state";
+        }
+    }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d vision=%s reason=%s",

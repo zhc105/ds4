@@ -17293,6 +17293,46 @@ static bool qwen_graph_rollback(ds4_qwen_gpu_graph *g, uint32_t pos, uint32_t ke
     return ok;
 }
 
+/* The recurrent state that a prefix rewind cannot recover: the GDN ssm and
+ * conv histories, the raw keys of every QSA layer's unfinished block, the
+ * PLE conv window, and the drafter's block keys plus the streams row it
+ * has not consumed.  K/V rows, block keys and the drafter's rows are
+ * positional and need no copy.  Visits the tensors in a fixed order: mode 1
+ * copies them into store, -1 copies store back, 0 only measures.  Returns
+ * the byte total, 0 after a failed copy. */
+static uint64_t qwen_graph_state_walk(ds4_qwen_gpu_graph *g, ds4_gpu_tensor *store, int mode) {
+    ds4_gpu_tensor *pieces[2u * DS4_MAX_LAYER + 3u];
+    size_t n = 0;
+    for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
+        if (g->ssm_state[il]) pieces[n++] = g->ssm_state[il];
+        if (g->conv_state[il]) pieces[n++] = g->conv_state[il];
+        if (g->khist[il]) pieces[n++] = g->khist[il];
+    }
+    if (g->ple_hist) pieces[n++] = g->ple_hist;
+    if (g->mtp) {
+        pieces[n++] = g->khist[DS4_N_LAYER];
+        pieces[n++] = g->mtp_pend;
+    }
+    uint64_t off = 0;
+    for (size_t i = 0; i < n; i++) {
+        const uint64_t bytes = ds4_gpu_tensor_bytes(pieces[i]);
+        if (mode > 0 && ds4_gpu_tensor_copy(store, off, pieces[i], 0, bytes) == 0) return 0;
+        if (mode < 0 && ds4_gpu_tensor_copy(pieces[i], 0, store, off, bytes) == 0) return 0;
+        off += bytes;
+    }
+    return off;
+}
+
+/* One saved copy of that state together with the history folded into it;
+ * the session keeps a pool of them (qwen_session_state_save). */
+typedef struct {
+    ds4_gpu_tensor *state;
+    token_vec tokens;
+    float *logits;           /* of the last token, so the same prompt again costs nothing */
+    bool mtp_pending;
+} qwen_state_copy;
+enum { QWEN_STATE_COPIES = 5 };
+
 #endif /* DS4_QWEN_GPU */
 
 /* CPU prefill in layer-major order.  All prompt tokens pass through layer 0,
@@ -56726,6 +56766,9 @@ struct ds4_session {
     float *qwen_mtp_rows;      /* the verify batch's distributions, spec_rows x vocab */
     uint64_t qwen_mtp_probe_n, qwen_mtp_probe_hit;
     uint64_t qwen_mtp_cycles, qwen_mtp_committed;   /* speculative statistics */
+    /* The recurrent state after the last prompts' prefills (qwen_session_state_save). */
+    qwen_state_copy qwen_states[QWEN_STATE_COPIES];
+    uint32_t qwen_state_next;
 #endif
     token_vec checkpoint;
     ds4_vision_identity *checkpoint_images;
@@ -67647,6 +67690,11 @@ void ds4_session_free(ds4_session *s) {
     else {
 #ifdef DS4_QWEN_GPU
         if (ds4_model_is_qwen()) {
+            for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
+                if (s->qwen_states[i].state) ds4_gpu_tensor_free(s->qwen_states[i].state);
+                free(s->qwen_states[i].logits);
+                token_vec_free(&s->qwen_states[i].tokens);
+            }
             qwen_graph_free(&s->qwen_graph);
             free(s->qwen_mtp_logits);
             free(s->qwen_mtp_rows);
@@ -69006,6 +69054,67 @@ static int qwen_session_sync_graph(ds4_session *s, const ds4_tokens *prompt, cha
     return rc;
 }
 
+/* The host-side n-gram window follows the live history's tail. */
+static void qwen_session_ple_prev(ds4_session *s) {
+    ds4_qwen_gpu_graph *g = &s->qwen_graph;
+    for (uint32_t w = 0; w + 1u < s->engine->model.ngram.n_mult; w++) {
+        const int idx = s->checkpoint.len - 1 - (int)w;
+        g->ple_prev[w] = idx >= 0 ? s->checkpoint.v[idx] : DS4_PLE_RESET_TOKEN;
+    }
+}
+
+/* Saved states.  The live history can only be extended: a prompt that
+ * edits it (an agent dropping an image or a tool result, the template
+ * clearing the previous turn's reasoning) would otherwise start over,
+ * 150 s for a 150K history.  So the session copies the recurrent state
+ * (qwen_graph_state_walk, 112 MB for Flash-Next) at the end of every
+ * prompt's prefill, keeping the last QWEN_STATE_COPIES prompts in a ring,
+ * and a prompt that diverges resumes from the longest copy that is still
+ * its prefix.  The generated answer is not worth a copy of its own: it is a
+ * few hundred tokens, re-prefilled in well under a second.  Each copy keeps
+ * its own token list, so copies on abandoned branches stay usable. */
+static bool qwen_session_state_save(ds4_session *s) {
+    ds4_qwen_gpu_graph *g = &s->qwen_graph;
+    if (!s->checkpoint_valid || s->checkpoint.len <= 0 || (uint32_t)s->checkpoint.len != g->n_tokens) return true;
+    for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {   /* the same prompt again */
+        const qwen_state_copy *c = &s->qwen_states[i];
+        if (c->tokens.len == s->checkpoint.len && ds4_tokens_starts_with(&s->checkpoint, &c->tokens)) return true;
+    }
+    qwen_state_copy *c = &s->qwen_states[s->qwen_state_next];
+    if (!c->state) {
+        c->state = ds4_gpu_tensor_alloc(qwen_graph_state_walk(g, NULL, 0));
+        if (!c->state) return false;
+        c->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    s->qwen_state_next = (s->qwen_state_next + 1u) % QWEN_STATE_COPIES;
+    c->tokens.len = 0;   /* an empty copy is never a usable prefix */
+    if (!qwen_graph_state_walk(g, c->state, 1)) return false;
+    for (int i = 0; i < s->checkpoint.len; i++) token_vec_push(&c->tokens, s->checkpoint.v[i]);
+    memcpy(c->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    c->mtp_pending = s->qwen_mtp_pending;
+    return true;
+}
+
+/* Make the longest copy that is a prefix of prompt the live state; returns
+ * its length, 0 when there is none. */
+static int qwen_session_state_restore(ds4_session *s, const ds4_tokens *prompt) {
+    ds4_qwen_gpu_graph *g = &s->qwen_graph;
+    qwen_state_copy *c = NULL;
+    for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
+        qwen_state_copy *v = &s->qwen_states[i];
+        if (v->tokens.len > 0 && (!c || v->tokens.len > c->tokens.len) && ds4_tokens_starts_with(prompt, &v->tokens)) c = v;
+    }
+    if (!c || !qwen_graph_state_walk(g, c->state, -1)) return 0;
+    s->checkpoint.len = 0;
+    for (int i = 0; i < c->tokens.len; i++) token_vec_push(&s->checkpoint, c->tokens.v[i]);
+    memcpy(s->logits, c->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    g->n_tokens = (uint32_t)c->tokens.len;
+    qwen_session_ple_prev(s);
+    s->qwen_mtp_pending = c->mtp_pending;
+    s->qwen_mtp_draft = -1;
+    return c->tokens.len;
+}
+
 static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
@@ -69019,7 +69128,7 @@ static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, ch
         prompt->len >= s->checkpoint.len &&
         ds4_tokens_starts_with(prompt, &s->checkpoint)) {
         start = s->checkpoint.len;
-    } else {
+    } else if ((start = qwen_session_state_restore(s, prompt)) == 0) {
         if (!qwen_graph_reset(g)) {
             snprintf(err, errlen, "Qwen3.5 graph reset failed");
             return 1;
@@ -69062,6 +69171,10 @@ static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, ch
     s->mtp_draft_valid = false;
     s->greedy_splitkv_segment.len = 0;
     s->greedy_splitkv_anchor_valid = false;
+    if (!qwen_session_state_save(s)) {
+        snprintf(err, errlen, "Qwen state save failed");
+        return 1;
+    }
     return 0;
 }
 
@@ -69274,10 +69387,7 @@ static int qwen_session_spec_cycle(
         accepted[i] = toks[i];
     }
     /* the host-side n-gram window advanced over the rejected tail too */
-    for (uint32_t w = 0; w + 1u < e->model.ngram.n_mult; w++) {
-        const int idx = s->checkpoint.len - 1 - (int)w;
-        g->ple_prev[w] = idx >= 0 ? s->checkpoint.v[idx] : DS4_PLE_RESET_TOKEN;
-    }
+    qwen_session_ple_prev(s);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     s->qwen_mtp_cycles++;
@@ -70508,6 +70618,22 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     int i = 0;
     while (i < n && s->checkpoint.v[i] == prompt->v[i]) i++;
     return i;
+}
+
+int ds4_session_resumable_prefix(ds4_session *s, const ds4_tokens *prompt) {
+    int best = 0;
+#ifdef DS4_QWEN_GPU
+    if (ds4_model_is_qwen() && !ds4_session_is_cpu(s)) {
+        for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
+            const qwen_state_copy *c = &s->qwen_states[i];
+            if (c->tokens.len > best && ds4_tokens_starts_with(prompt, &c->tokens)) best = c->tokens.len;
+        }
+    }
+#else
+    (void)s;
+    (void)prompt;
+#endif
+    return best;
 }
 
 int ds4_session_argmax(ds4_session *s) {

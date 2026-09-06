@@ -447,6 +447,10 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
+/* Tokens of prompt that ds4_session_sync() would take from a saved
+ * turn-boundary state instead of the live prefix (Qwen sessions keep the
+ * state after the last few prompts; 0 elsewhere). */
+int ds4_session_resumable_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,

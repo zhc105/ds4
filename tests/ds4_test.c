@@ -6423,6 +6423,7 @@ static bool test_generate_chat_turn(ds4_engine *engine, ds4_session *session,
     bool recovered = false;
     bool parsed = parse_generated_message_for_response_for_syntax(
         r->model_syntax,
+        &r->tool_orders,
         turn->raw ? turn->raw : "",
         r->has_tools,
         saw_tool_start,

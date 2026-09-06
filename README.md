@@ -1594,6 +1594,16 @@ re-processing if it was written to the disk KV cache. In other words, memory
 cache handles the active session; disk cache is the resume mechanism for
 different sessions.
 
+Qwen3.8-Flash-Next sessions add one more layer between the two: the recurrent
+state (GDN, PLE window, sparse-attention block keys, MTP drafter) cannot be
+rewound to an earlier position, so the session saves a copy of it (about
+112 MB) after each of the last five prompts. A request that edits the middle
+of the history, such as an agent dropping an old image or a tool result,
+resumes from the latest saved prompt that is still its prefix instead of
+re-prefilling from token zero; the usage reports it as `cached_tokens` and
+the trace as `cache_source: memory-state`. Returning to the previous branch
+of the conversation is equally cheap while its prompt is among the five.
+
 Enable it with:
 
 ```sh
