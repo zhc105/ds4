@@ -2134,7 +2134,10 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
-        if (msg.images.len && strcmp(msg.role, "user")) goto fail;
+        /* Images arrive in user turns and in tool results (an agent's file
+         * reader returning a picture); the model sees both as user input. */
+        if (msg.images.len && strcmp(msg.role, "user") &&
+            strcmp(msg.role, "tool") && strcmp(msg.role, "function")) goto fail;
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -2199,6 +2202,61 @@ static bool parse_anthropic_image_source(const char **p,
  * chat_msg per role.  Parsing collapses text/thinking into strings, converts
  * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
  * escaped text because DS4 sees tool results in its chat template. */
+/* A tool_result's content: a string, or blocks of text and images.  Image
+ * blocks become markers in the text like images in user content. */
+static bool parse_anthropic_tool_result_content(const char **p, chat_msg *msg, char **out) {
+    json_ws(p);
+    if (**p != '[') return json_content_replace(p, out);
+    (*p)++;
+    buf b = {0};
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p != '{') goto fail;
+        (*p)++;
+        char *type = NULL, *text = NULL, *source_type = NULL, *media_type = NULL, *data = NULL;
+        bool ok = true;
+        json_ws(p);
+        while (ok && **p && **p != '}') {
+            char *key = NULL;
+            if (!json_string(p, &key)) { ok = false; break; }
+            json_ws(p);
+            if (**p != ':') { free(key); ok = false; break; }
+            (*p)++;
+            if (!strcmp(key, "type")) ok = json_string_replace(p, &type);
+            else if (!strcmp(key, "text")) ok = json_content_replace(p, &text);
+            else if (!strcmp(key, "source")) ok = parse_anthropic_image_source(p, &source_type, &media_type, &data);
+            else ok = json_skip_value(p);
+            free(key);
+            json_ws(p);
+            if (**p == ',') (*p)++;
+            json_ws(p);
+        }
+        if (ok && **p == '}') (*p)++;
+        else ok = false;
+        if (ok && type && !strcmp(type, "image")) {
+            char marker[SERVER_IMAGE_MARKER_BYTES];
+            ok = source_type && !strcmp(source_type, "base64") &&
+                 server_image_inputs_push_base64(&msg->images, media_type, data, marker);
+            if (ok) buf_puts(&b, marker);
+        } else if (ok && text) {
+            buf_puts(&b, text);
+        }
+        free(type); free(text); free(source_type); free(media_type); free(data);
+        if (!ok) goto fail;
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') goto fail;
+    (*p)++;
+    free(*out);
+    *out = b.ptr ? buf_take(&b) : xstrdup("");
+    return true;
+fail:
+    buf_free(&b);
+    return false;
+}
+
 static bool parse_anthropic_content_block(const char **p, const char *role, chat_msg *msg) {
     (void)role;
     if (**p != '{') return false;
@@ -2255,7 +2313,7 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
                 goto bad;
             }
         } else if (!strcmp(key, "content")) {
-            if (!json_content_replace(p, &tool_result)) {
+            if (!parse_anthropic_tool_result_content(p, msg, &tool_result)) {
                 free(key);
                 goto bad;
             }
@@ -2426,7 +2484,10 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
-        if (msg.images.len && strcmp(msg.role, "user")) goto fail;
+        /* Images arrive in user turns and in tool results (an agent's file
+         * reader returning a picture); the model sees both as user input. */
+        if (msg.images.len && strcmp(msg.role, "user") &&
+            strcmp(msg.role, "tool") && strcmp(msg.role, "function")) goto fail;
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -20313,6 +20374,41 @@ static void test_http_image_paths_and_urls_are_rejected(void) {
     }
 }
 
+/* An agent's file reader returns pictures as tool results: OpenAI tool
+ * messages with image parts and Anthropic tool_result blocks with image
+ * blocks both keep the image and mark its place in the text. */
+static void test_tool_result_image_content(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":[{\"type\":\"text\","
+        "\"text\":\"loaded\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1 && msgs.v[0].images.len == 1);
+    TEST_ASSERT(strstr(msgs.v[0].content, "loaded") == msgs.v[0].content);
+    TEST_ASSERT(strstr(msgs.v[0].content, msgs.v[0].images.v[0].marker) != NULL);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\","
+        "\"content\":[{\"type\":\"text\",\"text\":\"loaded\"},{\"type\":\"image\","
+        "\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}}]}]}]");
+    p = json.ptr;
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1 && msgs.v[0].images.len == 1);
+    TEST_ASSERT(msgs.v[0].tool_call_ids_len == 1);
+    TEST_ASSERT(strstr(msgs.v[0].content, "<tool_result>loaded") != NULL);
+    TEST_ASSERT(strstr(msgs.v[0].content, msgs.v[0].images.v[0].marker) != NULL);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+}
+
 static void test_anthropic_inline_image_content(void) {
     buf json = {0};
     buf_puts(&json,
@@ -20441,6 +20537,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_inline_image_content();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
+    test_tool_result_image_content();
     test_responses_inline_image_content();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
