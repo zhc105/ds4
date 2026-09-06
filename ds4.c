@@ -56769,6 +56769,9 @@ struct ds4_session {
     /* The recurrent state after the last prompts' prefills (qwen_session_state_save). */
     qwen_state_copy qwen_states[QWEN_STATE_COPIES];
     uint32_t qwen_state_next;
+    /* The history the K/V rows currently hold, row by row (-1: a rejected
+     * draft); a copy is usable only while its history is still in the rows. */
+    token_vec qwen_kv_tokens;
 #endif
     token_vec checkpoint;
     ds4_vision_identity *checkpoint_images;
@@ -67695,6 +67698,7 @@ void ds4_session_free(ds4_session *s) {
                 free(s->qwen_states[i].logits);
                 token_vec_free(&s->qwen_states[i].tokens);
             }
+            token_vec_free(&s->qwen_kv_tokens);
             qwen_graph_free(&s->qwen_graph);
             free(s->qwen_mtp_logits);
             free(s->qwen_mtp_rows);
@@ -69071,8 +69075,21 @@ static void qwen_session_ple_prev(ds4_session *s) {
  * prompt's prefill, keeping the last QWEN_STATE_COPIES prompts in a ring,
  * and a prompt that diverges resumes from the longest copy that is still
  * its prefix.  The generated answer is not worth a copy of its own: it is a
- * few hundred tokens, re-prefilled in well under a second.  Each copy keeps
- * its own token list, so copies on abandoned branches stay usable. */
+ * few hundred tokens, re-prefilled in well under a second.  A copy holds
+ * only the recurrent state; the K/V rows, block keys and drafter rows up to
+ * its length are used in place, so it is valid only while those rows still
+ * hold its history (qwen_kv_tokens): resuming another branch overwrites
+ * the rows past the fork and retires the copies beyond it. */
+static void qwen_session_kv_note(ds4_session *s, int pos, const int *tokens, int n) {
+    token_vec *kv = &s->qwen_kv_tokens;
+    while (kv->len < pos + n) token_vec_push(kv, -1);
+    for (int i = 0; i < n; i++) kv->v[pos + i] = tokens ? tokens[i] : -1;
+}
+
+static bool qwen_session_kv_holds(const ds4_session *s, const ds4_tokens *history) {
+    return ds4_tokens_starts_with(&s->qwen_kv_tokens, history);
+}
+
 static bool qwen_session_state_save(ds4_session *s) {
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
     if (!s->checkpoint_valid || s->checkpoint.len <= 0 || (uint32_t)s->checkpoint.len != g->n_tokens) return true;
@@ -69102,7 +69119,10 @@ static int qwen_session_state_restore(ds4_session *s, const ds4_tokens *prompt) 
     qwen_state_copy *c = NULL;
     for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
         qwen_state_copy *v = &s->qwen_states[i];
-        if (v->tokens.len > 0 && (!c || v->tokens.len > c->tokens.len) && ds4_tokens_starts_with(prompt, &v->tokens)) c = v;
+        if (v->tokens.len > 0 && (!c || v->tokens.len > c->tokens.len) &&
+            ds4_tokens_starts_with(prompt, &v->tokens) && qwen_session_kv_holds(s, &v->tokens)) {
+            c = v;
+        }
     }
     if (!c || !qwen_graph_state_walk(g, c->state, -1)) return 0;
     s->checkpoint.len = 0;
@@ -69162,6 +69182,7 @@ static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, ch
             snprintf(err, errlen, "Qwen MTP drafter prefill failed");
             return 1;
         }
+        qwen_session_kv_note(s, i, prompt->v + i, (int)rows);
         for (uint32_t j = 0; j < rows; j++) token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
         i += (int)rows;
         if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
@@ -69263,6 +69284,7 @@ static int qwen_session_eval_graph(ds4_session *s, int token, char *err, size_t 
         snprintf(err, errlen, "Qwen MTP streams copy failed");
         return 1;
     }
+    qwen_session_kv_note(s, s->checkpoint.len, &token, 1);
     token_vec_push(&s->checkpoint, token);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
@@ -69382,6 +69404,8 @@ static int qwen_session_spec_cycle(
         return -1;
     }
     s->qwen_mtp_pending = true;
+    qwen_session_kv_note(s, (int)pos, toks, a + 1);
+    qwen_session_kv_note(s, (int)pos + a + 1, NULL, k - a);   /* rows of the rejected drafts */
     for (int i = 0; i <= a; i++) {
         token_vec_push(&s->checkpoint, toks[i]);
         accepted[i] = toks[i];
@@ -70626,7 +70650,9 @@ int ds4_session_resumable_prefix(ds4_session *s, const ds4_tokens *prompt) {
     if (ds4_model_is_qwen() && !ds4_session_is_cpu(s)) {
         for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
             const qwen_state_copy *c = &s->qwen_states[i];
-            if (c->tokens.len > best && ds4_tokens_starts_with(prompt, &c->tokens)) best = c->tokens.len;
+            if (c->tokens.len > best && ds4_tokens_starts_with(prompt, &c->tokens) && qwen_session_kv_holds(s, &c->tokens)) {
+                best = c->tokens.len;
+            }
         }
     }
 #else

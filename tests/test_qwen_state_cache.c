@@ -186,25 +186,39 @@ int main(int argc, char **argv) {
         fprintf(stderr, "FAIL: logits after B differ\n");
         fails++;
     }
-    /* an unrelated prompt has no usable copy and starts over */
-    ds4_tokens u = {0};
-    append(&u, all.v + 1, n1);
-    ok = sync_prompt(a, &pa, &u, "A unrelated");
-    if (!ok) return 1;
-    if (pa.first > 4096) {
-        fprintf(stderr, "FAIL: unrelated prompt resumed from a copy (first prefill position %d)\n", pa.first);
-        fails++;
-    }
-    /* P3 again is its own copy: no prefill, the copy's logits */
-    ok = sync_prompt(a, &pa, &p, "A P3 again");
+    /* Back to P3: its own copy is retired because B overwrote the K/V rows
+     * past P2, so both sessions resume from P2's copy and must agree. */
+    ok = sync_prompt(a, &pa, &p, "A P3 again") && sync_prompt(r, &pr, &p, "R P3");
     if (!ok) return 1;
     ds4_session_copy_logits(a, logits_a, 248320);
-    if (pa.first != -1) {
-        fprintf(stderr, "FAIL: P3 again prefilled from %d\n", pa.first);
+    ds4_session_copy_logits(r, logits_r, 248320);
+    if (pa.first <= p2_len || pa.first > p2_len + 4096 || pr.first != pa.first) {
+        fprintf(stderr, "FAIL: P3 again did not resume from P2's copy (first prefill positions %d and %d, P2 ends at %d)\n",
+                pa.first, pr.first, p2_len);
         fails++;
     }
-    if (argmax(logits_a) != g3[0]) {
-        fprintf(stderr, "FAIL: P3 again does not restore P3's logits (argmax %d, answer began %d)\n", argmax(logits_a), g3[0]);
+    if (memcmp(logits_a, logits_r, 248320 * sizeof(float))) {
+        fprintf(stderr, "FAIL: logits of P3 again differ between the sessions\n");
+        fails++;
+    }
+    /* the same prompt once more is its own copy: no prefill, the copy's logits */
+    ok = sync_prompt(a, &pa, &p, "A P3 once more");
+    if (!ok) return 1;
+    ds4_session_copy_logits(a, logits_r, 248320);
+    if (pa.first != -1 || memcmp(logits_a, logits_r, 248320 * sizeof(float))) {
+        fprintf(stderr, "FAIL: P3 once more prefilled from %d or changed the logits\n", pa.first);
+        fails++;
+    }
+    /* an unrelated prompt has no usable copy, starts over, and overwrites
+     * the rows every copy relies on: P3 after it starts over too */
+    ds4_tokens u = {0};
+    append(&u, all.v + 1, n1);
+    ok = sync_prompt(a, &pa, &u, "A unrelated") && (pa.first <= 4096 || (fails++, 1)) &&
+         sync_prompt(a, &pa, &p, "A P3 after unrelated");
+    if (!ok) return 1;
+    if (pa.first > 4096) {
+        fprintf(stderr, "FAIL: P3 after an unrelated prompt resumed from a copy whose rows are gone (first prefill position %d)\n",
+                pa.first);
         fails++;
     }
     printf("%s\n", fails ? "FAILED" : "PASS");
