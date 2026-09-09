@@ -10448,6 +10448,25 @@ static char *path_join(const char *dir, const char *name) {
 
 
 
+/* A Qwen tool turn is a run of <tool_call> blocks and its raw text spans
+ * the first to the last, so the map block does too: the end of the run
+ * that starts at `start`, or NULL when its first block is not closed. */
+static const char *qwen_tool_run_end(const char *start) {
+    static const char tool_start[] = "<tool_call>";
+    static const char tool_end[] = "</tool_call>";
+    const char *run_end = NULL;
+    const char *p = start;
+    for (;;) {
+        const char *e = strstr(p, tool_end);
+        if (!e) return run_end;
+        run_end = e + strlen(tool_end);
+        p = skip_ascii_ws(run_end);
+        if (strncmp(p, tool_start, strlen(tool_start)) != 0) return run_end;
+    }
+}
+
+/* The next tool-call block of any syntax at or after p, with the blank
+ * line the templates put before a call after content. */
 static const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
     struct block_form {
         const char *start;
@@ -10471,8 +10490,28 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
         best = s;
         best_end = e + strlen(forms[i].end);
     }
+    const char *q = strstr(p, "<tool_call>");
+    if (q && (!best || q < best)) {
+        const char *e = qwen_tool_run_end(q);
+        if (e) {
+            best = q >= p + 2 && q[-2] == '\n' && q[-1] == '\n' ? q - 2 : q;
+            best_end = e;
+        }
+    }
     if (end_out) *end_out = best_end;
     return best;
+}
+
+/* The remembered block at a text span.  The span may carry the template's
+ * blank line that the raw text does not: a Qwen call after an empty
+ * answer follows </think> and its blank line, which the parser leaves out
+ * of the raw text. */
+static tool_memory_block *kv_tool_map_block_at(server *s, const char *start, const char *end) {
+    tool_memory_block *b = tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+    if (!b && end - start > 2 && start[0] == '\n' && start[1] == '\n') {
+        b = tool_memory_find_block_locked(&s->tool_mem, start + 2, (size_t)(end - start - 2));
+    }
+    return b;
 }
 
 
@@ -10487,8 +10526,7 @@ static bool kv_tool_map_measure_locked(server *s, const char *text,
         const char *end = NULL;
         const char *start = find_next_dsml_tool_block(p, &end);
         if (!start || !end) break;
-        tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+        tool_memory_block *b = kv_tool_map_block_at(s, start, end);
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; e; e = e->block_next) {
@@ -10555,8 +10593,7 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
         const char *end = NULL;
         const char *start = find_next_dsml_tool_block(p, &end);
         if (!start || !end || !ok) break;
-        tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+        tool_memory_block *b = kv_tool_map_block_at(s, start, end);
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; ok && e; e = e->block_next) {
@@ -12264,16 +12301,20 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
     free(visible);
 }
 
-/* After a successful tool-call finish, make the live checkpoint match what the
- * next request will render.  Usually that is just the exact DSML remembered by
- * tool id.  If a client sends a tool call without an id we know, the fallback
- * renderer still builds valid DSML from JSON, and this function either rewrites
- * the short suffix in place or reloads an older disk checkpoint before replay. */
+/* After a successful finish, make the live checkpoint match what the next
+ * request will render.  For a tool call that is usually the exact DSML
+ * remembered by tool id; if a client sends a tool call without an id we
+ * know, the fallback renderer still builds valid DSML from JSON, and this
+ * function either rewrites the short suffix in place or reloads an older
+ * disk checkpoint before replay.  A Qwen answer is canonicalized too: the
+ * client replays its trimmed content, so a sampled trailing newline would
+ * otherwise put the live text and its disk key one token past every future
+ * prompt. */
 static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                                          job *j, const char *ctx,
                                          uint64_t trace_id, const char *content,
                                          const char *reasoning, const tool_calls *calls) {
-    if (!calls || calls->len == 0 || !j->req.prompt_text) return;
+    if (!j->req.prompt_text) return;
 
     char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
 
@@ -13749,6 +13790,14 @@ decode_again:
                                      parsed_content ? parsed_content : "");
     } else if (!parsed_calls.len) {
         thinking_live_clear(s, slot);
+        if (j->req.model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
+            j->req.kind == REQ_CHAT && j->req.api != API_RESPONSES &&
+            !strcmp(final_finish, "stop"))
+        {
+            canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
+                                         parsed_content ? parsed_content : "",
+                                         parsed_reasoning, &parsed_calls);
+        }
     }
 
     bool response_ok = !job_cancelled(j);
@@ -17086,6 +17135,38 @@ static void test_qwen_tool_checkpoint_suffix_is_canonical(void) {
     TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
     free(future_prompt);
 
+    /* A plain answer sampled with a trailing newline: its canonical suffix
+     * is what the next request renders from the trimmed content. */
+    {
+        char *pc = NULL, *pr = NULL;
+        tool_calls none = {0};
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(
+            SERVER_MODEL_SYNTAX_QWEN, "plan\n</think>\n\ndone.\n", true, &r.tool_orders,
+            &pc, &pr, &none));
+        TEST_ASSERT(none.len == 0 && !strncmp(pc, "done.", 5));   /* the renderer trims the sampled newline */
+        char *answer_suffix = build_tool_checkpoint_suffix(&r, pc, pr, &none);
+        buf answer = {0};
+        buf_puts(&answer, prompt_text);
+        buf_puts(&answer, answer_suffix);
+        chat_msgs answer_msgs = {0};
+        chat_msgs_push_text(&answer_msgs, "user", "inspect");
+        chat_msg plain = {0};
+        plain.role = xstrdup("assistant");
+        plain.reasoning = xstrdup(pr);
+        plain.content = xstrdup(pc);
+        chat_msgs_push(&answer_msgs, plain);
+        char *answer_prompt = render_chat_prompt_text_for_syntax(
+            SERVER_MODEL_SYNTAX_QWEN, &answer_msgs, tool_schemas, &r.tool_orders, DS4_THINK_HIGH);
+        TEST_ASSERT(!strcmp(answer.ptr, answer_prompt));
+        TEST_ASSERT(strstr(answer.ptr, "\n</think>\n\ndone.<|im_end|>\n") != NULL);
+        free(answer_prompt);
+        chat_msgs_free(&answer_msgs);
+        buf_free(&answer);
+        free(answer_suffix);
+        free(pc);
+        free(pr);
+    }
+
     /* Anthropic/Responses continuations append only the tool turn. */
     chat_msgs_push_text(&history_msgs, "tool", "total 0\n");
     char *tail = render_live_tool_tail_for_syntax(
@@ -19713,6 +19794,63 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
     pthread_mutex_destroy(&dst.tool_mu);
 }
 
+/* Qwen tool turns: a run of <tool_call> blocks is one map block, found
+ * after content (with the template's blank line in the raw text) and after
+ * an empty answer (blank line in the text only). */
+static void test_kv_tool_map_handles_qwen_blocks(void) {
+    const char *run =
+        "<tool_call>\n<function=memoria_save>\n<parameter=cat>\ntechnical\n</parameter>\n"
+        "<parameter=imp>\n2\n</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=ping>\n<parameter=host>\nhk-2\n</parameter>\n</function>\n</tool_call>";
+    const char *after_content =
+        "\n\n<tool_call>\n<function=ping>\n<parameter=host>\nsh-2\n</parameter>\n</function>\n</tool_call>";
+
+    server src = {0}, dst = {0};
+    pthread_mutex_init(&src.tool_mu, NULL);
+    pthread_mutex_init(&dst.tool_mu, NULL);
+    tool_memory_put(&src, "call_a", run);            /* after an empty answer */
+    tool_memory_put(&src, "call_b", run);
+    tool_memory_put(&src, "call_c", after_content);  /* after content */
+
+    char text[2048];
+    snprintf(text, sizeof(text), "<think>\nplan\n</think>\n\n%s<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nSure.%s<|im_end|>\n",
+             run, after_content);
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    uint64_t estimated_bytes = 0, bytes = 0;
+    TEST_ASSERT(kv_tool_map_serialized_size(&src, text, &estimated_bytes));
+    TEST_ASSERT(kv_tool_map_write(&src, fp, text, &bytes));
+    TEST_ASSERT(bytes > 0 && estimated_bytes == bytes);
+    rewind(fp);
+    TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == 3);
+
+    chat_msgs msgs = {0};
+    chat_msg a = {0};
+    a.role = xstrdup("assistant");
+    tool_call ca = {.id = xstrdup("call_a"), .name = xstrdup("memoria_save"), .arguments = xstrdup("{}")};
+    tool_call cb = {.id = xstrdup("call_b"), .name = xstrdup("ping"), .arguments = xstrdup("{}")};
+    tool_calls_push(&a.calls, ca);
+    tool_calls_push(&a.calls, cb);
+    chat_msgs_push(&msgs, a);
+    chat_msg c = {0};
+    c.role = xstrdup("assistant");
+    tool_call cc = {.id = xstrdup("call_c"), .name = xstrdup("ping"), .arguments = xstrdup("{}")};
+    tool_calls_push(&c.calls, cc);
+    chat_msgs_push(&msgs, c);
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&dst, &msgs, &stats);
+    TEST_ASSERT(msgs.v[0].calls.raw_tool_text && !strcmp(msgs.v[0].calls.raw_tool_text, run));
+    TEST_ASSERT(msgs.v[1].calls.raw_tool_text && !strcmp(msgs.v[1].calls.raw_tool_text, after_content));
+    TEST_ASSERT(stats.disk == 2 && stats.canonical == 0);
+
+    chat_msgs_free(&msgs);
+    fclose(fp);
+    tool_memory_free(&src.tool_mem);
+    tool_memory_free(&dst.tool_mem);
+    pthread_mutex_destroy(&src.tool_mu);
+    pthread_mutex_destroy(&dst.tool_mu);
+}
+
 static void test_kv_tool_map_restores_before_prompt_render(void) {
     char tmpl[] = "/tmp/ds4-kv-tool-map-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -20566,6 +20704,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
+    test_kv_tool_map_handles_qwen_blocks();
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();

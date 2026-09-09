@@ -70881,7 +70881,9 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         }
     }
 
-    if (common == s->checkpoint.len) {
+    /* A Qwen session resumes from the state it saved after the prompt and
+     * prefills the canonical tail, so a rewrite is a plain sync. */
+    if (common == s->checkpoint.len || ds4_model_is_qwen()) {
         return ds4_session_sync(s, prompt, err, errlen) == 0 ?
             DS4_SESSION_REWRITE_OK : DS4_SESSION_REWRITE_ERROR;
     }
