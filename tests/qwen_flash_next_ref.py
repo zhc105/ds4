@@ -41,6 +41,9 @@ def lin(base, keep=True):
     return w
 def silu(x): return x / (1 + np.exp(-x))
 def sigmoid(x): return 1 / (1 + np.exp(-x))
+def bf16_round(x):
+    u = np.asarray(x, np.float32).view(np.uint32)
+    return ((u + 0x7fff + ((u >> 16) & 1)) & 0xffff0000).astype(np.uint32).view(np.float32)
 def rms(x, w=None, one=True):
     y = x / np.sqrt((x * x).mean(-1, keepdims=True) + eps)
     if w is None: return y
@@ -98,7 +101,7 @@ class ATTN:
         k = (lin(base + '.k_proj') @ h).reshape(nkv, ahd); v = (lin(base + '.v_proj') @ h).reshape(nkv, ahd)
         q = rope(rms(qg[:, :ahd], W(base + '.q_norm.weight')), pos); gate = qg[:, ahd:]
         k = rope(rms(k, W(base + '.k_norm.weight')), pos)
-        self.K.append(k); self.V.append(v)
+        self.K.append(bf16_round(k)); self.V.append(bf16_round(v))   # the caches are bf16
         K = np.stack(self.K); Vv = np.stack(self.V)   # [t, nkv, hd]
         out = np.zeros((nh, ahd), np.float32)
         for hh in range(nh):

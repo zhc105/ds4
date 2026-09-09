@@ -470,18 +470,7 @@ static void qwen35_matvec_bf16_rows(
     }
 }
 
-/* Split f32 activations into a bf16 high part and a bf16 remainder (the
- * exact operands of the tensor-core attention), or round them to bf16
- * alone (the operands of the bypass GEMMs). */
-__global__ static void qwen35_split_bf16_kernel(__nv_bfloat16 *hi, __nv_bfloat16 *lo, const float *x, uint64_t n) {
-    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float v = x[i];
-    const __nv_bfloat16 h = __float2bfloat16(v);
-    hi[i] = h;
-    lo[i] = __float2bfloat16(v - __bfloat162float(h));
-}
-
+/* Round f32 activations to bf16 (the operands of the bypass GEMMs). */
 __global__ static void qwen35_to_bf16_kernel(__nv_bfloat16 *dst, const float *x, uint64_t n) {
     const uint64_t i = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) * 4u;
     if (i + 4u <= n) {
@@ -945,11 +934,12 @@ __device__ __forceinline__ void qwen35_split_f32(float x, __nv_bfloat16 *hi, __n
 
 /* Per (token, head slot): RMS-normalise and RoPE the query heads in place
  * (the q buffer holds [query | gate] per head), do the same for the key heads
- * and store them in the cache, copy the value heads into the cache.  With
+ * and store them in the cache, copy the value heads into the cache.  The
+ * caches are bf16 (the CPU reference rounds its rows the same way).  With
  * qh/ql (prefill) the finished queries are also written split into bf16 for
  * the tensor-core attention. */
 __global__ static void qwen35_attn_prepare_kernel(
-        float *qg, float *k_cache, float *v_cache, const float *k, const float *v,
+        float *qg, __nv_bfloat16 *k_cache, __nv_bfloat16 *v_cache, const float *k, const float *v,
         const float *q_norm, const float *k_norm, __nv_bfloat16 *qh, __nv_bfloat16 *ql,
         uint32_t n_head, uint32_t n_kv, uint32_t hd, uint32_t n_rot,
         uint32_t pos0, uint32_t n_tokens, float freq_base, float eps) {
@@ -960,7 +950,7 @@ __global__ static void qwen35_attn_prepare_kernel(
     if (t >= n_tokens || tid >= hd) return;
     float *head;
     const float *norm_w;
-    float *dst = NULL;
+    __nv_bfloat16 *dst = NULL;
     if (slot < n_head) {
         head = qg + ((uint64_t)t * n_head + slot) * 2u * hd;
         norm_w = q_norm;
@@ -972,7 +962,7 @@ __global__ static void qwen35_attn_prepare_kernel(
     } else {
         const uint32_t h = slot - n_head - n_kv;
         v_cache[((uint64_t)(pos0 + t) * n_kv + h) * hd + tid] =
-            v[((uint64_t)t * n_kv + h) * hd + tid];
+            __float2bfloat16(v[((uint64_t)t * n_kv + h) * hd + tid]);
         return;
     }
     const float x = head[tid];
@@ -991,7 +981,7 @@ __global__ static void qwen35_attn_prepare_kernel(
         head[tid + half] = x0 * s + x1 * c;
     }
     if (dst || qh) __syncthreads();
-    if (dst) dst[tid] = head[tid];
+    if (dst) dst[tid] = __float2bfloat16(head[tid]);
     if (qh && slot < n_head) {
         const uint64_t i = ((uint64_t)t * n_head + slot) * hd + tid;
         qwen35_split_f32(head[tid], qh + i, ql + i);
@@ -1007,7 +997,7 @@ __global__ static void qwen35_attn_prepare_kernel(
  * because n_tokens * n_head blocks alone cannot fill the GPU while scanning
  * a long cache. */
 __global__ static void qwen35_attention_kernel(
-        float *att, float *part, const float *qg, const float *k_cache, const float *v_cache,
+        float *att, float *part, const float *qg, const __nv_bfloat16 *k_cache, const __nv_bfloat16 *v_cache,
         const int32_t *sel, const uint32_t *n_sel, uint32_t max_sel,
         uint32_t n_head, uint32_t n_kv, uint32_t hd, uint32_t pos0, uint32_t n_tokens,
         uint32_t n_splits) {
@@ -1037,9 +1027,13 @@ __global__ static void qwen35_attention_kernel(
     for (uint32_t i = 0; i < per; i++) qv[i] = q[lane * per + i];
     for (uint32_t key = warp; key < n_local; key += n_warps) {
         const uint32_t cell = cells ? (uint32_t)cells[key0 + key] : key0 + key;
-        const float *kr = k_cache + cell * kv_stride + kvh * hd + lane * per;
+        const __nv_bfloat162 *kr = (const __nv_bfloat162 *)(k_cache + cell * kv_stride + kvh * hd + lane * per);
         float dot = 0.0f;
-        for (uint32_t i = 0; i < per; i++) dot = fmaf(qv[i], kr[i], dot);
+        for (uint32_t i = 0; i < per / 2u; i++) {
+            const float2 kk = __bfloat1622float2(kr[i]);
+            dot = fmaf(qv[2u * i], kk.x, dot);
+            dot = fmaf(qv[2u * i + 1u], kk.y, dot);
+        }
         dot = warp_sum_f32(dot);
         if (lane == 0u) scores[key] = dot * scale;
     }
@@ -1061,10 +1055,10 @@ __global__ static void qwen35_attention_kernel(
     const float sum = qwen35_cuda_block_sum(local_sum, scratch);
     __syncthreads();
     float acc = 0.0f;
-    const float *vc = v_cache + kvh * hd + tid;
+    const __nv_bfloat16 *vc = v_cache + kvh * hd + tid;
     for (uint32_t key = 0; key < n_local; key++) {
         const uint32_t cell = cells ? (uint32_t)cells[key0 + key] : key0 + key;
-        acc = fmaf(scores[key], vc[cell * kv_stride], acc);
+        acc = fmaf(scores[key], __bfloat162float(vc[cell * kv_stride]), acc);
     }
     if (n_splits == 1u) {
         att[((uint64_t)t * n_head + h) * hd + tid] = acc / sum * qwen35_cuda_sigmoid(gate[tid]);
@@ -1102,11 +1096,9 @@ __global__ static void qwen35_attention_merge_kernel(
 
 /* ---- Tensor-core prefill attention ---------------------------------------
  * Block per (token, KV head), eight warps.  The rows are the group's query
- * heads (up to 16) and the keys come in 16-cell tiles gathered from split
- * bf16 copies of the caches, so the causal prefix and a QSA cell list cost
- * the same.  Every product is a bf16 hi/lo split (hi*hi + hi*lo + lo*hi with
- * f32 accumulation), within f32 rounding of the CPU reference at a third of
- * the tensor-core rate.  Warp w scores keys 8*(w%2).. over dims 64*(w/2)..
+ * heads (up to 16) and the keys come in 16-cell tiles gathered from the bf16
+ * caches, so the causal prefix and a QSA cell list cost the same.  Warp w
+ * scores keys 8*(w%2).. over dims 64*(w/2)..
  * with its query fragments held in registers; one thread per (row, key)
  * sums the four partials and runs the online softmax; warp w then owns
  * output dims 32*w.. .  The mma.sync fragment layouts are the m16n8k16
@@ -1138,23 +1130,23 @@ __device__ __forceinline__ void qwen35_ldsm_x4(uint32_t *r, const void *p) {
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
 }
 
-/* SPLIT: every operand is a bf16 hi/lo pair and every product takes three
- * MMAs, within f32 rounding of the reference (the 2B's guard path).
- * Otherwise the operands are plain bf16 with f32 accumulation, the
- * checkpoint's own attention precision, and the gather moves half the
- * bytes: the kernel is bound by the L2 bandwidth of the per-token K/V
- * gather. */
+/* SPLIT: the queries and probabilities are bf16 hi/lo pairs and every
+ * product takes two MMAs, within f32 rounding of the reference, which
+ * rounds its K/V rows to bf16 as the cache does (the 2B's guard path).
+ * Otherwise they are plain bf16 with f32 accumulation, the checkpoint's own
+ * attention precision.  The kernel is bound by the L2 bandwidth of the
+ * per-token K/V gather. */
 template <bool SPLIT>
 __global__ static void __launch_bounds__(256, 2) qwen35_attention_tc_kernel(
         float *att, __nv_bfloat16 *att_bf16, const float *qg, const __nv_bfloat16 *qh, const __nv_bfloat16 *ql,
-        const __nv_bfloat16 *kh, const __nv_bfloat16 *kl, const __nv_bfloat16 *vh, const __nv_bfloat16 *vl,
+        const __nv_bfloat16 *k_cache, const __nv_bfloat16 *v_cache,
         const int32_t *sel, const uint32_t *n_sel, uint32_t max_sel,
         uint32_t n_head, uint32_t n_kv, uint32_t pos0, uint32_t n_tokens) {
     constexpr uint32_t hd = 256u;
-    constexpr uint32_t NP = SPLIT ? 2u : 1u;                                        /* operand parts */
-    __shared__ __align__(16) __nv_bfloat16 ks[NP][QWEN35_TC_KEYS][QWEN35_TC_LD];  /* [hi, lo][key][dim] */
-    __shared__ __align__(16) __nv_bfloat16 vs[NP][QWEN35_TC_KEYS][QWEN35_TC_LD];
-    __shared__ __align__(16) __nv_bfloat16 ps[NP][16][QWEN35_TC_LDP];             /* probabilities [row][key] */
+    constexpr uint32_t NP = SPLIT ? 2u : 1u;                                        /* query and probability parts */
+    __shared__ __align__(16) __nv_bfloat16 ks[QWEN35_TC_KEYS][QWEN35_TC_LD];      /* [key][dim] */
+    __shared__ __align__(16) __nv_bfloat16 vs[QWEN35_TC_KEYS][QWEN35_TC_LD];
+    __shared__ __align__(16) __nv_bfloat16 ps[NP][16][QWEN35_TC_LDP];             /* [hi, lo] probabilities [row][key] */
     __shared__ float sp[4][16][QWEN35_TC_KEYS];                                    /* score partials per dim quarter */
     __shared__ float alpha_s[16], lsum_s[16];
     const uint32_t t = blockIdx.x;
@@ -1200,10 +1192,10 @@ __global__ static void __launch_bounds__(256, 2) qwen35_attention_tc_kernel(
             const uint32_t c = c0 + key;
             const bool valid = c < n_cells;
             const uint64_t row = valid ? (uint64_t)(cells ? (uint32_t)cells[c] : c) * kv_stride + kvh * hd + e : 0u;
-            const __nv_bfloat16 *src[4] = { kh + row, vh + row, kl + row, vl + row };
-            __nv_bfloat16 *dst[4] = { &ks[0][key][e], &vs[0][key][e], &ks[NP - 1u][key][e], &vs[NP - 1u][key][e] };
+            const __nv_bfloat16 *src[2] = { k_cache + row, v_cache + row };
+            __nv_bfloat16 *dst[2] = { &ks[key][e], &vs[key][e] };
             const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
-            for (uint32_t a = 0; a < 2u * NP; a++) {
+            for (uint32_t a = 0; a < 2u; a++) {
                 const uint4 x0 = valid ? ((const uint4 *)src[a])[0] : zero;
                 const uint4 x1 = valid ? ((const uint4 *)src[a])[1] : zero;
                 ((uint4 *)dst[a])[0] = x0;
@@ -1217,14 +1209,10 @@ __global__ static void __launch_bounds__(256, 2) qwen35_attention_tc_kernel(
             const uint32_t key = sk + (lane & 7u);
             for (uint32_t step = 0; step < 4u; step++) {
                 const uint32_t d = sd + step * 16u + ((lane >> 3u) & 1u) * 8u;
-                uint32_t bh[2], bl[2];
-                qwen35_ldsm_x2(bh, &ks[0][key][d]);
+                uint32_t bh[2];
+                qwen35_ldsm_x2(bh, &ks[key][d]);
                 qwen35_mma_bf16(s, qa[0][step], bh[0], bh[1]);
-                if (SPLIT) {
-                    qwen35_ldsm_x2(bl, &ks[NP - 1u][key][d]);
-                    qwen35_mma_bf16(s, qa[0][step], bl[0], bl[1]);
-                    qwen35_mma_bf16(s, qa[1][step], bh[0], bh[1]);
-                }
+                if (SPLIT) qwen35_mma_bf16(s, qa[1][step], bh[0], bh[1]);
             }
             const uint32_t r = lane >> 2u;
             const uint32_t kc = sk + (lane & 3u) * 2u;
@@ -1267,18 +1255,14 @@ __global__ static void __launch_bounds__(256, 2) qwen35_attention_tc_kernel(
             const uint32_t key = (lane & 7u) + ((lane >> 3u) & 1u) * 8u;
             for (uint32_t j = 0; j < 4u; j++) {
                 const uint32_t d = warp * 32u + j * 8u;
-                uint32_t bh[2], bl[2];
-                qwen35_ldsm_x2_trans(bh, &vs[0][key][d]);
+                uint32_t bh[2];
+                qwen35_ldsm_x2_trans(bh, &vs[key][d]);
                 o[j][0] *= a0;
                 o[j][1] *= a0;
                 o[j][2] *= a1;
                 o[j][3] *= a1;
                 qwen35_mma_bf16(o[j], ph, bh[0], bh[1]);
-                if (SPLIT) {
-                    qwen35_ldsm_x2_trans(bl, &vs[NP - 1u][key][d]);
-                    qwen35_mma_bf16(o[j], ph, bl[0], bl[1]);
-                    qwen35_mma_bf16(o[j], pl, bh[0], bh[1]);
-                }
+                if (SPLIT) qwen35_mma_bf16(o[j], pl, bh[0], bh[1]);
             }
         }
         __syncthreads();   /* the next gather overwrites the tiles */
@@ -1308,11 +1292,11 @@ __global__ static void __launch_bounds__(256, 2) qwen35_attention_tc_kernel(
 extern "C" int ds4_gpu_qwen35_attention(
         ds4_gpu_tensor       *att,          /* [n_tok][n_head * hd] */
         ds4_gpu_tensor       *att_bf16,     /* optional: a prefill chunk's output goes there in bf16 instead */
-        int                   exact,        /* prefill operands as hi/lo pairs (f32-exact) or plain bf16 */
+        int                   exact,        /* prefill queries and probabilities as hi/lo pairs (f32-exact) or plain bf16 */
         ds4_gpu_tensor       *part,         /* split partials, see QWEN35_ATTN_SPLIT_MAX */
-        ds4_gpu_tensor       *split,        /* prefill: bf16 hi/lo copies of the caches and queries, see below */
+        ds4_gpu_tensor       *split,        /* prefill: bf16 hi/lo copies of the queries, see below */
         ds4_gpu_tensor       *qg,           /* [n_tok][n_head * 2 * hd], modified in place */
-        ds4_gpu_tensor       *k_cache,      /* [ctx][n_kv * hd] */
+        ds4_gpu_tensor       *k_cache,      /* bf16 [ctx][n_kv * hd] */
         ds4_gpu_tensor       *v_cache,
         const ds4_gpu_tensor *k,            /* [n_tok][n_kv * hd] */
         const ds4_gpu_tensor *v,
@@ -1343,8 +1327,8 @@ extern "C" int ds4_gpu_qwen35_attention(
         att->bytes < (uint64_t)n_tokens * n_head * hd * sizeof(float) ||
         k->bytes < n_tokens * kv_dim * sizeof(float) ||
         v->bytes < n_tokens * kv_dim * sizeof(float) ||
-        k_cache->bytes < (uint64_t)ctx * kv_dim * sizeof(float) ||
-        v_cache->bytes < (uint64_t)ctx * kv_dim * sizeof(float)) {
+        k_cache->bytes < (uint64_t)ctx * kv_dim * sizeof(__nv_bfloat16) ||
+        v_cache->bytes < (uint64_t)ctx * kv_dim * sizeof(__nv_bfloat16)) {
         return 0;
     }
     if (sel && (!n_sel || max_sel == 0u ||
@@ -1357,24 +1341,18 @@ extern "C" int ds4_gpu_qwen35_attention(
     const float *k_norm = glm53_cuda_weight_f32(model_map, model_size, k_norm_offset, hd, tier, "attn k norm");
     if (!q_norm || !k_norm) return 0;
     cudaStream_t stream = cuda_decode_stream();
-    /* Prefill chunks take the tensor-core kernel over split-bf16 copies of
-     * the caches' first pos0 + n_tokens rows and of the prepared queries:
-     * split = [K hi | K lo | V hi | V lo | Q hi | Q lo]. */
+    /* Prefill chunks take the tensor-core kernel over the caches and
+     * split-bf16 copies of the prepared queries: split = [Q hi | Q lo]. */
     const bool tc = n_tokens > QWEN35_ATTN_SPLIT_ROWS && hd == 256u && n_head / n_kv <= 16u;
-    const uint64_t kv_elems = (uint64_t)(pos0 + n_tokens) * kv_dim;
     const uint64_t q_elems = (uint64_t)n_tokens * n_head * hd;
-    __nv_bfloat16 *kh = NULL, *kl = NULL, *vh = NULL, *vl = NULL, *qh = NULL, *ql = NULL;
+    __nv_bfloat16 *qh = NULL, *ql = NULL;
     if (tc) {
-        if (!split || split->bytes < (4u * kv_elems + 2u * q_elems) * sizeof(__nv_bfloat16)) return 0;
-        kh = (__nv_bfloat16 *)split->ptr;
-        kl = kh + kv_elems;
-        vh = kl + kv_elems;
-        vl = vh + kv_elems;
-        qh = vl + kv_elems;
+        if (!split || split->bytes < 2u * q_elems * sizeof(__nv_bfloat16)) return 0;
+        qh = (__nv_bfloat16 *)split->ptr;
         ql = qh + q_elems;
     }
     qwen35_attn_prepare_kernel<<<dim3(n_tokens, n_head + 2u * n_kv, 1u), hd, 0, stream>>>(
-        (float *)qg->ptr, (float *)k_cache->ptr, (float *)v_cache->ptr,
+        (float *)qg->ptr, (__nv_bfloat16 *)k_cache->ptr, (__nv_bfloat16 *)v_cache->ptr,
         (const float *)k->ptr, (const float *)v->ptr, q_norm, k_norm, qh, ql,
         n_head, n_kv, hd, n_rot, pos0, n_tokens, freq_base, eps);
     if (tc) {
@@ -1382,20 +1360,17 @@ extern "C" int ds4_gpu_qwen35_attention(
         const dim3 grid(n_tokens, n_kv, 1u);
         float *out = (float *)att->ptr;
         __nv_bfloat16 *out_bf16 = att_bf16 ? (__nv_bfloat16 *)att_bf16->ptr : NULL;
+        const __nv_bfloat16 *kc = (const __nv_bfloat16 *)k_cache->ptr;
+        const __nv_bfloat16 *vc = (const __nv_bfloat16 *)v_cache->ptr;
         const int32_t *cells = sel ? (const int32_t *)sel->ptr : NULL;
         const uint32_t *n_cells = sel ? (const uint32_t *)n_sel->ptr : NULL;
         if (exact) {
-            const unsigned blocks = (unsigned)((kv_elems + 255u) / 256u);
-            qwen35_split_bf16_kernel<<<blocks, 256, 0, stream>>>(kh, kl, (const float *)k_cache->ptr, kv_elems);
-            qwen35_split_bf16_kernel<<<blocks, 256, 0, stream>>>(vh, vl, (const float *)v_cache->ptr, kv_elems);
             qwen35_attention_tc_kernel<true><<<grid, 256, 0, stream>>>(
-                out, out_bf16, (const float *)qg->ptr, qh, ql, kh, kl, vh, vl, cells, n_cells, max_sel,
+                out, out_bf16, (const float *)qg->ptr, qh, ql, kc, vc, cells, n_cells, max_sel,
                 n_head, n_kv, pos0, n_tokens);
         } else {
-            qwen35_to_bf16(kh, (const float *)k_cache->ptr, kv_elems, stream);
-            qwen35_to_bf16(vh, (const float *)v_cache->ptr, kv_elems, stream);
             qwen35_attention_tc_kernel<false><<<grid, 256, 0, stream>>>(
-                out, out_bf16, (const float *)qg->ptr, qh, ql, kh, kl, vh, vl, cells, n_cells, max_sel,
+                out, out_bf16, (const float *)qg->ptr, qh, ql, kc, vc, cells, n_cells, max_sel,
                 n_head, n_kv, pos0, n_tokens);
         }
         return cuda_ok(cudaGetLastError(), "Qwen tensor-core attention launch");
@@ -1425,8 +1400,8 @@ extern "C" int ds4_gpu_qwen35_attention(
         smem_limit = smem;
     }
     qwen35_attention_kernel<<<dim3(n_tokens, n_head, n_splits), hd, smem, stream>>>(
-        (float *)att->ptr, (float *)part->ptr, (const float *)qg->ptr, (const float *)k_cache->ptr,
-        (const float *)v_cache->ptr, sel ? (const int32_t *)sel->ptr : NULL,
+        (float *)att->ptr, (float *)part->ptr, (const float *)qg->ptr, (const __nv_bfloat16 *)k_cache->ptr,
+        (const __nv_bfloat16 *)v_cache->ptr, sel ? (const int32_t *)sel->ptr : NULL,
         sel ? (const uint32_t *)n_sel->ptr : NULL, max_sel,
         n_head, n_kv, hd, pos0, n_tokens, n_splits);
     if (n_splits > 1u) {

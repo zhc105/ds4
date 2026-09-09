@@ -8392,6 +8392,14 @@ static inline float bf16_to_f32(uint16_t h) {
     return v.f;
 }
 
+/* x rounded to the nearest bf16 (ties to even), kept as f32. */
+static inline float bf16_round(float x) {
+    union { uint32_t u; float f; } v = { .f = x };
+    v.u += 0x7fffu + ((v.u >> 16) & 1u);
+    v.u &= 0xffff0000u;
+    return v.f;
+}
+
 static void embed_token_bf16(const ds4_model *m, const ds4_weights *w, int token, float *out) {
     ds4_tensor *te = w->token_embd;
     if (te->type != DS4_TENSOR_BF16 || te->ndim != 2) {
@@ -15983,8 +15991,11 @@ static void qwen_attention_forward(
         rms_norm_weight(kh, kh, k_norm, hd, eps);
         qwen_rope_inplace(kh, pos);
     }
-    memcpy(ls->k + (uint64_t)pos * kv_dim, k, kv_dim * sizeof(float));
-    memcpy(ls->v + (uint64_t)pos * kv_dim, v, kv_dim * sizeof(float));
+    /* the cache rows are bf16 on the graph; the reference rounds the same way */
+    for (uint32_t i = 0; i < kv_dim; i++) {
+        ls->k[(uint64_t)pos * kv_dim + i] = bf16_round(k[i]);
+        ls->v[(uint64_t)pos * kv_dim + i] = bf16_round(v[i]);
+    }
 
     const float scale = 1.0f / sqrtf((float)hd);
     for (uint32_t h = 0; h < n_head; h++) {
@@ -16365,7 +16376,7 @@ static ds4_context_memory qwen_context_memory_estimate(uint32_t ctx) {
         if (ds4_qwen_layer_is_gdn(il)) {
             m.compressed_bytes += gdn_state * sizeof(float);
         } else {
-            m.raw_bytes += 2ull * ctx * kv_dim * sizeof(float);
+            m.raw_bytes += 2ull * ctx * kv_dim * 2u;   /* bf16 K and V */
         }
     }
     m.prefill_cap = ctx;
@@ -16426,7 +16437,7 @@ typedef struct {
     ds4_gpu_tensor *att;         /* GDN or attention output before the out proj */
     ds4_gpu_tensor *att_bf16;    /* the same in bf16 for Flash-Next prefill */
     ds4_gpu_tensor *att_part;    /* decode attention split partials */
-    ds4_gpu_tensor *att_split;   /* prefill attention: bf16 hi/lo copies of K/V cache rows and queries */
+    ds4_gpu_tensor *att_split;   /* prefill attention: bf16 hi/lo copies of the chunk's queries */
     ds4_gpu_tensor *logits;      /* [n_vocab] */
     /* Flash-Next.  x is then [max_rows][n_hc][n_embd]; the mixer leaves the
      * normalised streams and inject weights for the combine, like the CPU
@@ -16550,8 +16561,9 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
                 g->snap_ssm[il] = qwen_graph_tensor((uint64_t)spec_rows * v_dim * hd, &ok);
             }
         } else {
-            g->k_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim, &ok);
-            g->v_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim, &ok);
+            /* the K/V caches are bf16, the checkpoint's own attention precision (24 KiB a token for Flash-Next) */
+            g->k_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim / 2u, &ok);
+            g->v_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim / 2u, &ok);
             if (ds4_qwen_layer_is_qsa(il)) {
                 const uint32_t r = g_ds4_compress_ratios[il];
                 g->bkey[il] = qwen_graph_tensor((uint64_t)(ctx / r) * DS4_N_INDEXER_HEAD_DIM / 2u, &ok);   /* bf16 */
@@ -16565,8 +16577,8 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
         /* the drafter's block: an attention layer with the indexer, plus the streams it reads */
         const uint32_t il = DS4_N_LAYER;
         const uint32_t r = g_ds4_compress_ratios[il];
-        g->k_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim, &ok);
-        g->v_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim, &ok);
+        g->k_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim / 2u, &ok);
+        g->v_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim / 2u, &ok);
         g->bkey[il] = qwen_graph_tensor((uint64_t)(ctx / r) * DS4_N_INDEXER_HEAD_DIM / 2u, &ok);
         g->khist[il] = qwen_graph_tensor((uint64_t)(r - 1u) * DS4_N_INDEXER_HEAD_DIM, &ok);
         g->mtp_hid = qwen_graph_tensor((uint64_t)max_rows * DS4_N_HC * DS4_N_EMBD / 2u, &ok);
@@ -16600,8 +16612,8 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
     g->att_bf16 = qwen_graph_tensor(rows * qwen_max_u64(v_dim, attn_dim) / 2u, &ok);
     /* up to 8 decode rows x heads x 64 key splits x (values, max, sum) */
     g->att_part = qwen_graph_tensor(8ull * DS4_N_HEAD * 64ull * (DS4_N_HEAD_DIM + 2u), &ok);
-    /* prefill: bf16 hi/lo copies of the K and V caches and of the chunk's queries */
-    g->att_split = qwen_graph_tensor((4ull * ctx * kv_dim + 2ull * rows * attn_dim) / 2u, &ok);
+    /* prefill: bf16 hi/lo copies of the chunk's queries */
+    g->att_split = qwen_graph_tensor(rows * attn_dim, &ok);
     g->logits = qwen_graph_tensor((uint64_t)(spec_rows ? spec_rows : 1u) * DS4_N_VOCAB, &ok);   /* rows of a speculative batch */
     if (ds4_qwen_has_hc()) {
         g->xn = qwen_graph_tensor(rows * x_dim, &ok);
