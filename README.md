@@ -290,7 +290,10 @@ about 1e-5 and is the tool for doubts vLLM's FP4 noise cannot settle.
 `DS4_QWEN_TRACE=1` prints per-layer residual norms for locating a divergence.
 The graph is checked against the CPU dump with `tests/qwen_dump_compare.py
 cpu.bin gpu.bin --chunk C` (KL and argmax per position; C is the
-`--prefill-chunk` of the graph run), where it lands at KL 1e-10.  Every graph
+`--prefill-chunk` of the graph run), where it lands at KL 1e-7 (1e-6 at
+worst: both backends round their K/V rows to bf16, and keys that differ by
+f32 rounding between them can land on different sides of a bf16 boundary;
+the default threshold is 1e-5).  Every graph
 matmul keeps f32 activations (NVFP4/BF16/F32 weights dequantised on the fly),
 which is what makes that comparison exact; tensor-core paths are a later,
 separately measured step.  Over long prompts the comparison is bounded by

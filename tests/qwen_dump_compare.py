@@ -5,7 +5,13 @@ Both backends dump every prompt position, so the rows line up from position
 0.  --chunk C drops the first C-1 rows of the reference for dumps made by
 older graph builds that only started at the end of the first prefill chunk.
 
-    tests/qwen_dump_compare.py cpu.bin gpu.bin [--vocab 248320] [--max-kl 1e-6]
+    tests/qwen_dump_compare.py cpu.bin gpu.bin [--vocab 248320] [--max-kl 1e-5]
+
+The K/V caches are bf16 on both backends, and the f32 keys they round
+differ by about 1e-7 between the backends, so elements on a rounding
+boundary land on different sides: the exact comparison now sits at KL
+1e-7 on average and 1e-6 at worst (argmax still 100%).  A kernel bug
+shows up at 1e-3 and above.
 
 Prints max |dlogit|, mean and max KL(cpu || gpu) and the argmax agreement and
 exits 1 when the KL or argmax thresholds are missed.
@@ -20,7 +26,7 @@ ap.add_argument("ref")
 ap.add_argument("test")
 ap.add_argument("--chunk", type=int, default=1, help="graph prefill chunk used for the test dump")
 ap.add_argument("--vocab", type=int, default=248320)
-ap.add_argument("--max-kl", type=float, default=1e-6)
+ap.add_argument("--max-kl", type=float, default=1e-5)
 args = ap.parse_args()
 
 V = args.vocab
