@@ -69187,8 +69187,10 @@ static uint64_t qwen_payload_layer_bytes(const ds4_qwen_gpu_graph *g, uint32_t i
     return bytes;
 }
 
+/* A copy as long as the live history is the live state itself (a prompt
+ * stored before any generation): the load remakes it from the live state. */
 static bool qwen_payload_copy_saved(const ds4_session *s, const qwen_state_copy *c) {
-    return c->tokens.len > 0 && c->tokens.len <= s->checkpoint.len && ds4_tokens_starts_with(&s->checkpoint, &c->tokens);
+    return c->tokens.len > 0 && c->tokens.len < s->checkpoint.len && ds4_tokens_starts_with(&s->checkpoint, &c->tokens);
 }
 
 static uint64_t qwen_session_payload_bytes(ds4_session *s) {
@@ -69385,6 +69387,10 @@ static int qwen_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h
     s->qwen_mtp_pending = h[12] != 0u;
     s->qwen_mtp_draft = -1;
     s->checkpoint_valid = true;
+    if (!qwen_session_state_save(s)) {   /* the prompt's own copy, if the live state still is one */
+        payload_set_err(err, errlen, "Qwen state save failed after the KV restore");
+        return 1;
+    }
     return 0;
 }
 
