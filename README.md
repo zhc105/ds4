@@ -1606,6 +1606,20 @@ place, so a copy stays usable only while the rows still hold its history:
 returning to an earlier branch of the conversation resumes from the last
 saved prompt before the two branches fork.
 
+A Qwen disk checkpoint holds the bf16 K/V rows and block keys up to the
+live length, the live recurrent state, and those saved prompt states, so a
+conversation loaded back from disk keeps its edit resilience.  Size the
+budget for it: about 26 KiB a token plus 112 MB per state, so a 150K
+conversation is 4 GiB and the 4096 MB default holds none of it.
+
+```sh
+./ds4-server --cuda -m gguf/Qwen3.8-Flash-Next-NVFP4.gguf ... \
+  --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 32768
+```
+
+Requests that carry images still bypass the disk cache on every model: the
+disk key does not identify the images.
+
 Enable it with:
 
 ```sh
