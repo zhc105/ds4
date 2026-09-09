@@ -35,6 +35,7 @@
 /tests/test_qwen_vision_image
 /tests/test_qwen_vision_engine
 /tests/test_qwen_state_cache
+/tests/test_qwen_disk_kv
 *.o
 *.dSYM/
 __pycache__/
