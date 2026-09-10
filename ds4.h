@@ -434,23 +434,36 @@ int ds4_session_sync_multimodal(ds4_session *s,
                                 size_t image_count,
                                 char *err,
                                 size_t errlen);
-/* Return true only when every image that conditioned the live checkpoint has
- * the same token span and embedding fingerprint in the supplied prompt. */
+/* Return true only when the supplied prompt's images are, in order, the
+ * pictures that conditioned the live checkpoint (same placeholder size and
+ * embedding fingerprint); whether they sit at the same positions is for the
+ * token or text comparison that goes with the check. */
 bool ds4_session_vision_state_matches(const ds4_session *s,
                                       const ds4_vision_span *images,
                                       size_t image_count);
+/* The same for the prompt's first images only: the live prefix can then be
+ * extended by a prompt that adds pictures after it. */
+bool ds4_session_vision_prefix_matches(const ds4_session *s,
+                                       const ds4_vision_span *images,
+                                       size_t image_count);
+/* How many images conditioned the live checkpoint, and where the i-th of
+ * them sits in the live tokens. */
+size_t ds4_session_vision_image_count(const ds4_session *s);
+uint32_t ds4_session_vision_image_start(const ds4_session *s, size_t i);
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
-        ds4_session *s, const ds4_tokens *prompt, int common,
+        ds4_session *s, const ds4_tokens *prompt,
+        const ds4_vision_span *images, size_t image_count, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
-/* Tokens of prompt that ds4_session_sync() would take from a saved
- * turn-boundary state instead of the live prefix (Qwen sessions keep the
- * state after the last few prompts; 0 elsewhere). */
-int ds4_session_resumable_prefix(ds4_session *s, const ds4_tokens *prompt);
+/* Tokens of prompt that ds4_session_sync_multimodal() would take from a
+ * saved turn-boundary state instead of the live prefix (Qwen sessions keep
+ * the state after the last few prompts; 0 elsewhere). */
+int ds4_session_resumable_prefix(ds4_session *s, const ds4_tokens *prompt,
+                                 const ds4_vision_span *images, size_t image_count);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,

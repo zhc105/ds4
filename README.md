@@ -1620,8 +1620,14 @@ conversation is 4 GiB and the 4096 MB default holds none of it.
   --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 32768
 ```
 
-Requests that carry images still bypass the disk cache on every model: the
-disk key does not identify the images.
+Images and the live state: a request that adds a picture after the live
+end continues from the live tokens like any other (the text or visible
+transcript is compared past the last picture the session already holds,
+and the new picture's placeholder tokens are placed after the retokenized
+text before it), and a saved prompt state resumes only a prompt that
+carries the same pictures it was made with.  Requests that carry images
+still bypass the disk cache on every model: the disk key does not identify
+the images.
 
 Enable it with:
 

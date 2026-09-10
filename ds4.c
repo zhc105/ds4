@@ -16385,6 +16385,18 @@ static ds4_context_memory qwen_context_memory_estimate(uint32_t ctx) {
     return m;
 }
 
+/* An image that conditioned a state: the size of its placeholder span and
+ * the fingerprint of its embedding, plus where it sits in that history.
+ * The position is not part of the identity comparison: the token or text
+ * comparison that goes with it settles that, and the same picture sits at
+ * different token positions in the live history and in a replay that
+ * renders the turns before it differently. */
+typedef struct {
+    uint32_t token_start;
+    uint32_t token_count;
+    uint8_t fingerprint[32];
+} ds4_vision_identity;
+
 #ifdef DS4_QWEN_GPU
 /* =========================================================================
  * Qwen3.5 CUDA Graph.
@@ -17342,6 +17354,8 @@ typedef struct {
     token_vec tokens;
     float *logits;           /* of the last token, so the same prompt again costs nothing */
     bool mtp_pending;
+    ds4_vision_identity *images;   /* the pictures folded into the state: only their prompt resumes from it */
+    size_t image_count;
 } qwen_state_copy;
 enum { QWEN_STATE_COPIES = 5 };
 
@@ -56733,12 +56747,6 @@ typedef struct ds4_dspark_spec_stats {
 
 #endif
 
-typedef struct {
-    uint32_t token_start;
-    uint32_t token_count;
-    uint8_t fingerprint[32];
-} ds4_vision_identity;
-
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -67734,6 +67742,7 @@ void ds4_session_free(ds4_session *s) {
             for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
                 if (s->qwen_states[i].state) ds4_gpu_tensor_free(s->qwen_states[i].state);
                 free(s->qwen_states[i].logits);
+                free(s->qwen_states[i].images);
                 token_vec_free(&s->qwen_states[i].tokens);
             }
             token_vec_free(&s->qwen_kv_tokens);
@@ -69004,26 +69013,49 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  */
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
 
-static bool ds4_session_vision_prefix_matches(
+/* Identity of the images folded into a state: the first n of the prompt's
+ * images must be the same pictures, in order.  (A prompt whose next image
+ * sits inside the state's history fails the token comparison that goes
+ * with this check: the state has no placeholders there.) */
+static bool vision_identities_prefix(
+        const ds4_vision_identity *ids,
+        size_t                     n,
+        const ds4_vision_span     *images,
+        size_t                     image_count) {
+    if (image_count != 0 && !images) return false;
+    if (n > image_count) return false;
+    for (size_t i = 0; i < n; i++) {
+        if (ids[i].token_count != images[i].embedding.token_count ||
+            memcmp(ids[i].fingerprint, images[i].embedding.fingerprint,
+                   sizeof(ids[i].fingerprint)) != 0) return false;
+    }
+    return true;
+}
+
+static ds4_vision_identity *vision_identities_from_spans(
+        const ds4_vision_span *spans,
+        size_t                 n) {
+    if (n == 0 || n > SIZE_MAX / sizeof(ds4_vision_identity)) return NULL;
+    ds4_vision_identity *ids = calloc(n, sizeof(*ids));
+    if (!ids) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        ids[i].token_start = spans[i].token_start;
+        ids[i].token_count = spans[i].embedding.token_count;
+        memcpy(ids[i].fingerprint, spans[i].embedding.fingerprint,
+               sizeof(ids[i].fingerprint));
+    }
+    return ids;
+}
+
+bool ds4_session_vision_prefix_matches(
         const ds4_session     *s,
         const ds4_vision_span *images,
         size_t                 image_count) {
     if (!s || (image_count != 0 && !images)) return false;
-    if (!s->checkpoint_valid) return true;
-    if (s->checkpoint_image_count > image_count) return false;
-    for (size_t i = 0; i < s->checkpoint_image_count; i++) {
-        const ds4_vision_identity *old = &s->checkpoint_images[i];
-        const ds4_vision_span *current = &images[i];
-        if (old->token_start != current->token_start ||
-            old->token_count != current->embedding.token_count ||
-            memcmp(old->fingerprint, current->embedding.fingerprint,
-                   sizeof(old->fingerprint)) != 0) return false;
-    }
-    if (s->checkpoint_image_count < image_count) {
-        const ds4_vision_span *next = &images[s->checkpoint_image_count];
-        if (next->token_start < (uint32_t)s->checkpoint.len) return false;
-    }
-    return true;
+    return !s->checkpoint_valid ||
+           vision_identities_prefix(s->checkpoint_images,
+                                    s->checkpoint_image_count,
+                                    images, image_count);
 }
 
 bool ds4_session_vision_state_matches(
@@ -69033,6 +69065,14 @@ bool ds4_session_vision_state_matches(
     return s && s->checkpoint_valid &&
            s->checkpoint_image_count == image_count &&
            ds4_session_vision_prefix_matches(s, images, image_count);
+}
+
+size_t ds4_session_vision_image_count(const ds4_session *s) {
+    return s && s->checkpoint_valid ? s->checkpoint_image_count : 0;
+}
+
+uint32_t ds4_session_vision_image_start(const ds4_session *s, size_t i) {
+    return i < ds4_session_vision_image_count(s) ? s->checkpoint_images[i].token_start : 0u;
 }
 
 bool ds4_session_has_vision_state(const ds4_session *s) {
@@ -69055,19 +69095,9 @@ static bool ds4_session_vision_range_overlaps(
 }
 
 static bool ds4_session_store_vision_identities(ds4_session *s) {
-    ds4_vision_identity *copy = NULL;
-    if (s->sync_image_count != 0) {
-        if (s->sync_image_count > SIZE_MAX / sizeof(copy[0])) return false;
-        copy = calloc(s->sync_image_count, sizeof(copy[0]));
-        if (!copy) return false;
-        for (size_t i = 0; i < s->sync_image_count; i++) {
-            copy[i].token_start = s->sync_images[i].token_start;
-            copy[i].token_count = s->sync_images[i].embedding.token_count;
-            memcpy(copy[i].fingerprint,
-                   s->sync_images[i].embedding.fingerprint,
-                   sizeof(copy[i].fingerprint));
-        }
-    }
+    ds4_vision_identity *copy =
+        vision_identities_from_spans(s->sync_images, s->sync_image_count);
+    if (s->sync_image_count != 0 && !copy) return false;
     free(s->checkpoint_images);
     s->checkpoint_images = copy;
     s->checkpoint_image_count = s->sync_image_count;
@@ -69128,12 +69158,22 @@ static bool qwen_session_kv_holds(const ds4_session *s, const ds4_tokens *histor
     return ds4_tokens_starts_with(&s->qwen_kv_tokens, history);
 }
 
+/* A copy resumes a prompt when its history is a prefix of the prompt, its
+ * rows are still in place, and the pictures folded into it are the
+ * prompt's own (the images being synchronized when the copy was made). */
+static bool qwen_state_copy_resumes(const ds4_session *s, const qwen_state_copy *c, const ds4_tokens *prompt,
+                                    const ds4_vision_span *images, size_t image_count) {
+    return c->tokens.len > 0 && ds4_tokens_starts_with(prompt, &c->tokens) && qwen_session_kv_holds(s, &c->tokens) &&
+           vision_identities_prefix(c->images, c->image_count, images, image_count);
+}
+
 static bool qwen_session_state_save(ds4_session *s) {
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
     if (!s->checkpoint_valid || s->checkpoint.len <= 0 || (uint32_t)s->checkpoint.len != g->n_tokens) return true;
     for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {   /* the same prompt again */
         const qwen_state_copy *c = &s->qwen_states[i];
-        if (c->tokens.len == s->checkpoint.len && ds4_tokens_starts_with(&s->checkpoint, &c->tokens)) return true;
+        if (c->tokens.len == s->checkpoint.len && c->image_count == s->sync_image_count &&
+            qwen_state_copy_resumes(s, c, &s->checkpoint, s->sync_images, s->sync_image_count)) return true;
     }
     qwen_state_copy *c = &s->qwen_states[s->qwen_state_next];
     if (!c->state) {
@@ -69143,6 +69183,10 @@ static bool qwen_session_state_save(ds4_session *s) {
     }
     s->qwen_state_next = (s->qwen_state_next + 1u) % QWEN_STATE_COPIES;
     c->tokens.len = 0;   /* an empty copy is never a usable prefix */
+    free(c->images);
+    c->images = vision_identities_from_spans(s->sync_images, s->sync_image_count);
+    c->image_count = c->images ? s->sync_image_count : 0;
+    if (c->image_count != s->sync_image_count) return false;
     if (!qwen_graph_state_walk(g, c->state, 1)) return false;
     for (int i = 0; i < s->checkpoint.len; i++) token_vec_push(&c->tokens, s->checkpoint.v[i]);
     memcpy(c->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
@@ -69150,15 +69194,16 @@ static bool qwen_session_state_save(ds4_session *s) {
     return true;
 }
 
-/* Make the longest copy that is a prefix of prompt the live state; returns
- * its length, 0 when there is none. */
+/* Make the longest copy that resumes the prompt being synchronized the
+ * live state; returns its length, 0 when there is none.  The identities
+ * of the live checkpoint follow at the end of the sync. */
 static int qwen_session_state_restore(ds4_session *s, const ds4_tokens *prompt) {
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
     qwen_state_copy *c = NULL;
     for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
         qwen_state_copy *v = &s->qwen_states[i];
-        if (v->tokens.len > 0 && (!c || v->tokens.len > c->tokens.len) &&
-            ds4_tokens_starts_with(prompt, &v->tokens) && qwen_session_kv_holds(s, &v->tokens)) {
+        if ((!c || v->tokens.len > c->tokens.len) &&
+            qwen_state_copy_resumes(s, v, prompt, s->sync_images, s->sync_image_count)) {
             c = v;
         }
     }
@@ -69188,9 +69233,11 @@ static uint64_t qwen_payload_layer_bytes(const ds4_qwen_gpu_graph *g, uint32_t i
 }
 
 /* A copy as long as the live history is the live state itself (a prompt
- * stored before any generation): the load remakes it from the live state. */
+ * stored before any generation): the load remakes it from the live state.
+ * Copies made with pictures stay out: the file is keyed by text alone. */
 static bool qwen_payload_copy_saved(const ds4_session *s, const qwen_state_copy *c) {
-    return c->tokens.len > 0 && c->tokens.len < s->checkpoint.len && ds4_tokens_starts_with(&s->checkpoint, &c->tokens);
+    return c->tokens.len > 0 && c->tokens.len < s->checkpoint.len && c->image_count == 0 &&
+           ds4_tokens_starts_with(&s->checkpoint, &c->tokens);
 }
 
 static uint64_t qwen_session_payload_bytes(ds4_session *s) {
@@ -69317,7 +69364,10 @@ static int qwen_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h
     /* from here the graph is being overwritten: the live state and every saved copy are gone */
     s->checkpoint_valid = false;
     s->mtp_draft_valid = false;
-    for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) s->qwen_states[i].tokens.len = 0;
+    for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
+        s->qwen_states[i].tokens.len = 0;
+        s->qwen_states[i].image_count = 0;
+    }
     ds4_gpu_tensor *state = ds4_gpu_tensor_alloc(state_bytes);
     if (!state) {
         token_vec_free(&new_checkpoint);
@@ -69685,8 +69735,10 @@ static int qwen_session_spec_cycle(
 #endif /* DS4_QWEN_GPU */
 
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
-    if (s && !ds4_session_vision_prefix_matches(
-                     s, s->sync_images, s->sync_image_count)) {
+    if (s && s->checkpoint_valid &&
+        (!ds4_session_vision_prefix_matches(s, s->sync_images, s->sync_image_count) ||
+         (s->sync_image_count > s->checkpoint_image_count &&
+          s->sync_images[s->checkpoint_image_count].token_start < (uint32_t)s->checkpoint.len))) {
         ds4_session_invalidate(s);
     }
 #ifndef DS4_NO_GPU
@@ -70850,7 +70902,8 @@ bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int c
  * needed without mutating the session.  The server may still find an older disk KV
  * checkpoint before falling back to a full replay. */
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
-        ds4_session *s, const ds4_tokens *prompt, int common,
+        ds4_session *s, const ds4_tokens *prompt,
+        const ds4_vision_span *images, size_t image_count, int common,
         char *err, size_t errlen) {
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
@@ -70882,9 +70935,11 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
     }
 
     /* A Qwen session resumes from the state it saved after the prompt and
-     * prefills the canonical tail, so a rewrite is a plain sync. */
+     * prefills the canonical tail, so a rewrite is a plain sync; the images
+     * are the prompt's own, already where the live tokens hold them. */
     if (common == s->checkpoint.len || ds4_model_is_qwen()) {
-        return ds4_session_sync(s, prompt, err, errlen) == 0 ?
+        return ds4_session_sync_multimodal(s, prompt, images, image_count,
+                                           err, errlen) == 0 ?
             DS4_SESSION_REWRITE_OK : DS4_SESSION_REWRITE_ERROR;
     }
 
@@ -70906,13 +70961,14 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
-int ds4_session_resumable_prefix(ds4_session *s, const ds4_tokens *prompt) {
+int ds4_session_resumable_prefix(ds4_session *s, const ds4_tokens *prompt,
+                                 const ds4_vision_span *images, size_t image_count) {
     int best = 0;
 #ifdef DS4_QWEN_GPU
     if (ds4_model_is_qwen() && !ds4_session_is_cpu(s)) {
         for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
             const qwen_state_copy *c = &s->qwen_states[i];
-            if (c->tokens.len > best && ds4_tokens_starts_with(prompt, &c->tokens) && qwen_session_kv_holds(s, &c->tokens)) {
+            if (c->tokens.len > best && qwen_state_copy_resumes(s, c, prompt, images, image_count)) {
                 best = c->tokens.len;
             }
         }
@@ -70920,6 +70976,8 @@ int ds4_session_resumable_prefix(ds4_session *s, const ds4_tokens *prompt) {
 #else
     (void)s;
     (void)prompt;
+    (void)images;
+    (void)image_count;
 #endif
     return best;
 }

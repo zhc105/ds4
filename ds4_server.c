@@ -853,12 +853,20 @@ static void id_list_free(stop_list *ids);
 static bool responses_live_has_call_id(server *s, const char *id);
 static bool anthropic_live_has_call_id(server *s, const char *id);
 
+/* Where an image sits in a request: its marker's bytes in prompt_text and
+ * its placeholder block's tokens in prompt. */
+typedef struct {
+    size_t text_start, text_end;
+    int block_start, block_end;
+} request_image_place;
+
 typedef struct {
     req_kind kind;
     api_style api;
     server_model_syntax model_syntax;
     ds4_tokens prompt;
     ds4_vision_span *images;
+    request_image_place *image_places;
     size_t image_count;
     char *model;
     bool model_from_request;
@@ -1072,6 +1080,7 @@ static void request_free(request *r) {
     for (size_t i = 0; i < r->image_count; i++)
         ds4_vision_embedding_free(&r->images[i].embedding);
     free(r->images);
+    free(r->image_places);
     free(r->model);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
     free(r->stops.v);
@@ -3540,6 +3549,7 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
 
     r->images = xmalloc(count * sizeof(r->images[0]));
     memset(r->images, 0, count * sizeof(r->images[0]));
+    r->image_places = xmalloc(count * sizeof(r->image_places[0]));
     const char *cursor = r->prompt_text;
     for (size_t i = 0; i < count; i++) {
         const char *marker = strstr(cursor, inputs[i]->marker);
@@ -3548,14 +3558,19 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
             ok = false;
             break;
         }
+        request_image_place *place = &r->image_places[i];
+        place->text_start = (size_t)(marker - r->prompt_text);
+        place->text_end = place->text_start + strlen(inputs[i]->marker);
         char *prefix = xstrndup(cursor, (size_t)(marker - cursor));
         ds4_tokenize_rendered_chat(e, prefix, &r->prompt);
         free(prefix);
+        place->block_start = r->prompt.len;
         if (!ds4_prompt_append_vision(e, &r->prompt, &r->images[i],
                                       &embeddings[i], err, errlen)) {
             ok = false;
             break;
         }
+        place->block_end = r->prompt.len;
         r->image_count++;
         cursor = marker + strlen(inputs[i]->marker);
     }
@@ -11042,31 +11057,72 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                                   req && req->api == API_RESPONSES);
 }
 
+/* The effective prompt of a request continued from the live tokens: those
+ * tokens, then the request's text from byte `offset` on.  The live prefix
+ * holds the request's first pictures (the caller checked their identity),
+ * so the markers of the others must lie past the offset; the request's
+ * tokens from its first new image on are kept as tokenized, shifted by what
+ * retokenizing the text before them changed.  The request's image spans
+ * then describe the effective prompt: the live pictures where the live
+ * tokens hold them, the new ones after the shift. */
+static bool build_prompt_after_live(server *s, server_slot *slot, request *req,
+                                    const ds4_tokens *live_tokens, size_t offset,
+                                    ds4_tokens *out) {
+    const size_t live_images = ds4_session_vision_image_count(slot->session);
+    const request_image_place *next =
+        live_images < req->image_count ? &req->image_places[live_images] : NULL;
+    if (next && next->text_start < offset) return false;
+    for (size_t i = 0; i < live_images; i++)
+        req->images[i].token_start = ds4_session_vision_image_start(slot->session, i);
+    if (!next) {
+        build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, live_tokens, req->prompt_text + offset, out);
+        return true;
+    }
+    char *between = xstrndup(req->prompt_text + offset, next->text_start - offset);
+    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live_tokens, between, out);
+    free(between);
+    const int shift = out->len - next->block_start;
+    for (int i = next->block_start; i < req->prompt.len; i++)
+        ds4_tokens_push(out, req->prompt.v[i]);
+    for (size_t i = live_images; i < req->image_count; i++)
+        req->images[i].token_start = (uint32_t)((int)req->images[i].token_start + shift);
+    return true;
+}
+
+/* Continue the live graph from its own text.  The live tokenization is
+ * authoritative (sampled tokens need not be what BPE makes of their text),
+ * so the request's text is compared byte-wise against the text of the live
+ * tokens and only the bytes past the live end are tokenized: the request's
+ * own token suffix may have merged across that boundary.  With images in
+ * the live prefix the tokens through the last of them are equal (`common`)
+ * and the comparison starts after its block. */
 static int live_text_prefix_prompt(server *s, server_slot *slot,
-                                   const request *req,
+                                   request *req, int common,
                                    ds4_tokens *effective_prompt) {
     if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len <= 0) return 0;
+    if (!ds4_session_vision_prefix_matches(slot->session, req->images,
+                                           req->image_count)) return 0;
+    const size_t live_images = ds4_session_vision_image_count(slot->session);
+    const request_image_place *last =
+        live_images ? &req->image_places[live_images - 1] : NULL;
+    const int base_tok = last ? last->block_end : 0;
+    const size_t base_txt = last ? last->text_end : 0;
+    if (common < base_tok) return 0;
 
+    const ds4_tokens live_tail = { live_tokens->v + base_tok,
+                                   live_tokens->len - base_tok, 0 };
     size_t live_text_len = 0;
-    char *live_text = render_tokens_text(s->engine, live_tokens, &live_text_len);
-    const size_t prompt_text_len = strlen(req->prompt_text);
-    if (!byte_prefix_match(req->prompt_text, prompt_text_len,
-                           live_text, live_text_len))
-    {
-        free(live_text);
+    char *live_text = render_tokens_text(s->engine, &live_tail, &live_text_len);
+    const char *text = req->prompt_text + base_txt;
+    const bool ok = byte_prefix_match(text, strlen(text), live_text, live_text_len);
+    free(live_text);
+    if (!ok || !build_prompt_after_live(s, slot, req, live_tokens,
+                                        base_txt + live_text_len, effective_prompt)) {
         return 0;
     }
-
-    /* This is the core text-prefix case.  The live graph is authoritative, so
-     * keep its sampled tokenization and tokenize only the request bytes that
-     * come after it.  Reusing req->prompt's token suffix would be wrong: full
-     * prompt BPE may have merged across this byte boundary. */
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + live_text_len,
-        effective_prompt);
-    free(live_text);
     return live_tokens->len;
 }
 
@@ -11183,11 +11239,13 @@ static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
  * frontier.  If the visible key does not match, callers fall back to ordinary
  * token/text/disk matching. */
 static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
-                                               const request *req,
+                                               request *req,
                                                int live_pos,
                                                ds4_tokens *effective_prompt) {
     if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
     if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
+    if (!ds4_session_vision_prefix_matches(slot->session, req->images,
+                                           req->image_count)) return 0;
 
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
@@ -11205,10 +11263,10 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
 
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
-
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
-        effective_prompt);
+    if (!build_prompt_after_live(s, slot, req, live_tokens, visible_len,
+                                 effective_prompt)) {
+        return 0;
+    }
     return live_tokens->len;
 }
 
@@ -11925,7 +11983,7 @@ static int server_multimodal_resume_pos(ds4_session *session,
     const int common = ds4_session_common_prefix(session, prompt);
     return server_multimodal_resume_frontier(
         live, common, prompt->len,
-        ds4_session_vision_state_matches(session, images, image_count));
+        ds4_session_vision_prefix_matches(session, images, image_count));
 }
 
 static int server_session_sync_multimodal(server *s, server_slot *slot,
@@ -12311,10 +12369,11 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
  * otherwise put the live text and its disk key one token past every future
  * prompt. */
 static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
-                                         job *j, const char *ctx,
+                                         job *j, int prompt_tokens, const char *ctx,
                                          uint64_t trace_id, const char *content,
                                          const char *reasoning, const tool_calls *calls) {
-    if (!j->req.prompt_text) return;
+    const int live_len = ds4_session_pos(slot->session);
+    if (!j->req.prompt_text || live_len < prompt_tokens) return;
 
     char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
 
@@ -12323,8 +12382,17 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     buf_puts(&rendered, suffix_text);
 
     ds4_tokens canonical = {0};
-    ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
-    const int live_len = ds4_session_pos(slot->session);
+    if (j->req.image_count != 0) {
+        /* Pictures do not render as text: keep the live tokens of the prompt,
+         * whose images sit where the session holds them, and canonicalize
+         * the answer after them. */
+        const ds4_tokens prompt = { ds4_session_tokens(slot->session)->v,
+                                    prompt_tokens, 0 };
+        build_prompt_from_exact_prefix_and_text_suffix(s->engine, &prompt,
+                                                       suffix_text, &canonical);
+    } else {
+        ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
+    }
     const int common = ds4_session_common_prefix(slot->session, &canonical);
     if (common == live_len && canonical.len == live_len) goto done;
 
@@ -12343,7 +12411,28 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     }
     free(live_text);
 
-    if (j->req.image_count != 0) {
+    if (common < prompt_tokens) {
+        trace_event(s, trace_id,
+                    "tool checkpoint canonicalization skipped: common=%d prompt=%d live=%d canonical=%d",
+                    common, prompt_tokens, live_len, canonical.len);
+        goto done;
+    }
+
+    char err[160] = {0};
+    pthread_mutex_lock(&s->inference_mu);
+    ds4_session_rewrite_result rr =
+        ds4_session_rewrite_from_common(slot->session, &canonical,
+                                        j->req.images, j->req.image_count,
+                                        common, err, sizeof(err));
+    pthread_mutex_unlock(&s->inference_mu);
+    if (rr == DS4_SESSION_REWRITE_OK) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
+                   ctx, common, live_len, canonical.len);
+        trace_event(s, trace_id,
+                    "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
+                    common, live_len, canonical.len);
+    } else if (rr == DS4_SESSION_REWRITE_REBUILD_NEEDED && j->req.image_count != 0) {
         /* Rebuilding through the text-only disk cache would either lose the
          * vision embeddings or restore rows for an unverified image. Keep the
          * correctly conditioned sampled frontier instead. */
@@ -12352,29 +12441,6 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                    ctx, common, live_len, canonical.len);
         trace_event(s, trace_id,
                     "multimodal tool checkpoint canonicalization skipped: common=%d live=%d canonical=%d",
-                    common, live_len, canonical.len);
-        goto done;
-    }
-
-    if (common < j->req.prompt.len) {
-        trace_event(s, trace_id,
-                    "tool checkpoint canonicalization skipped: common=%d prompt=%d live=%d canonical=%d",
-                    common, j->req.prompt.len, live_len, canonical.len);
-        goto done;
-    }
-
-    char err[160] = {0};
-    pthread_mutex_lock(&s->inference_mu);
-    ds4_session_rewrite_result rr =
-        ds4_session_rewrite_from_common(slot->session, &canonical, common,
-                                        err, sizeof(err));
-    pthread_mutex_unlock(&s->inference_mu);
-    if (rr == DS4_SESSION_REWRITE_OK) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
-                   ctx, common, live_len, canonical.len);
-        trace_event(s, trace_id,
-                    "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
                     common, live_len, canonical.len);
     } else if (rr == DS4_SESSION_REWRITE_REBUILD_NEEDED) {
         /* The generated DSML suffix and the canonical prompt share a prefix,
@@ -12812,7 +12878,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cache_source = cached > 0 ? "memory-token" : "none";
         }
     }
-    if (cached == 0 && live_vision_match) {
+    if (cached == 0) {
         int thinking_cached =
             thinking_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
                                                 &effective_prompt);
@@ -12826,8 +12892,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     int disk_cached = 0;
     char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
-    if (cached == 0 && live_vision_match) {
-        int text_cached = live_text_prefix_prompt(s, slot, &j->req,
+    if (cached == 0) {
+        int text_cached = live_text_prefix_prompt(s, slot, &j->req, common,
                                                   &effective_prompt);
         if (text_cached > 0) {
             cached = text_cached;
@@ -12838,7 +12904,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (cached == 0) {
         /* The engine resumes an edited history from the state it saved after
          * an earlier prompt; only the accounting happens here. */
-        const int resumable = ds4_session_resumable_prefix(slot->session, prompt_for_sync);
+        const int resumable = ds4_session_resumable_prefix(
+            slot->session, prompt_for_sync, j->req.images, j->req.image_count);
         if (resumable > 0) {
             cached = resumable;
             cache_source = "memory-state";
@@ -13778,7 +13845,7 @@ decode_again:
          * replaying those bytes keeps future prompts aligned without rebuilding
          * hidden reasoning.  Responses deliberately skips this path because its
          * previous_response_id contract binds the next turn to live state. */
-        canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
+        canonicalize_tool_checkpoint(s, slot, j, prompt_tokens, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
         thinking_live_clear(s, slot);
@@ -13794,7 +13861,7 @@ decode_again:
             j->req.kind == REQ_CHAT && j->req.api != API_RESPONSES &&
             !strcmp(final_finish, "stop"))
         {
-            canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
+            canonicalize_tool_checkpoint(s, slot, j, prompt_tokens, ctx_span, trace_id,
                                          parsed_content ? parsed_content : "",
                                          parsed_reasoning, &parsed_calls);
         }
@@ -13990,8 +14057,8 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
     if (required_slot == slot->id) return INT_MAX;
     if (ds4_session_pos(slot->session) > 0 &&
-        !ds4_session_vision_state_matches(slot->session,
-                                          j->req.images, j->req.image_count)) {
+        !ds4_session_vision_prefix_matches(slot->session,
+                                           j->req.images, j->req.image_count)) {
         return -1;
     }
     int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
