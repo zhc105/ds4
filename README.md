@@ -1771,6 +1771,14 @@ The cache stores checkpoints at four moments:
 - `evict`: before an unrelated request replaces the live in-memory session.
 - `shutdown`: when the server exits cleanly.
 
+When a store would exceed `--kv-disk-space-mb`, files are deleted by
+recency: the one loaded (or, never loaded, written) longest ago goes first,
+whatever it was once hit for, so the conversations being switched between
+now keep their files and abandoned ones lose theirs.  A continued waypoint
+that the store being written extends goes before anything else, and the
+store made before loading another conversation's file never deletes that
+file.
+
 Cold saves intentionally trim a small token suffix and align down to a prefill
 chunk boundary. This avoids common BPE boundary retokenization misses when a
 future request appends text to the same prompt. The defaults are conservative:

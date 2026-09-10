@@ -10381,7 +10381,6 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
  */
 
 #define KV_CACHE_FIXED_HEADER DS4_KVSTORE_FIXED_HEADER
-#define KV_CACHE_HIT_HALF_LIFE_SECONDS DS4_KVSTORE_HIT_HALF_LIFE_SECONDS
 #define KV_EXT_TOOL_MAP DS4_KVSTORE_EXT_TOOL_MAP
 #define KV_EXT_RESPONSES_VISIBLE DS4_KVSTORE_EXT_RESPONSES_VISIBLE
 #define KV_EXT_THINKING_VISIBLE DS4_KVSTORE_EXT_THINKING_VISIBLE
@@ -10730,18 +10729,16 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
 }
 
 #ifdef DS4_SERVER_TEST
-static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
-                                      uint64_t now,
+static double kv_entry_eviction_score(const kv_entry *e,
                                       const ds4_kvstore_eviction_context *incoming) {
-    return ds4_kvstore_entry_eviction_score(e, live, now, incoming);
+    return ds4_kvstore_entry_eviction_score(e, incoming);
 }
 #endif
 
 #ifdef DS4_SERVER_TEST
-static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
-                           uint64_t extra_bytes,
+static void kv_cache_evict(kv_disk_cache *kc, uint64_t extra_bytes,
                            const ds4_kvstore_eviction_context *incoming) {
-    ds4_kvstore_evict(kc, live, extra_bytes, incoming);
+    ds4_kvstore_evict(kc, extra_bytes, incoming);
 }
 #endif
 
@@ -20079,7 +20076,7 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, NULL, 0, NULL);
+    kv_cache_evict(&kc, 0, NULL);
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
     TEST_ASSERT(access(new_path, F_OK) == 0);
@@ -20092,39 +20089,42 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_prefers_anchor_reason(void) {
-    char tmpl[] = "/tmp/ds4-kv-anchor-reason-test.XXXXXX";
+/* Recency beats everything a file was once hit for: an anchor of a
+ * conversation that has not come back for hours goes before a waypoint of
+ * the one being worked on. */
+static void test_kv_cache_eviction_is_by_recency(void) {
+    char tmpl[] = "/tmp/ds4-kv-recency-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
-    const char *anchor_sha = "1111111111111111111111111111111111111111";
-    const char *continued_sha = "2222222222222222222222222222222222222222";
+    const char *old_sha = "1111111111111111111111111111111111111111";
+    const char *recent_sha = "2222222222222222222222222222222222222222";
     uint64_t now = (uint64_t)time(NULL);
-    test_kv_stub_file(dir, anchor_sha, KV_REASON_COLD, 2048, 0, now, 2048);
-    test_kv_stub_file(dir, continued_sha, KV_REASON_CONTINUED, 2048, 0, now, 2048);
+    test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 8192, 20, now - 5u * 3600u, 2048);
+    test_kv_stub_file(dir, recent_sha, KV_REASON_CONTINUED, 2048, 0, now, 2048);
 
-    char anchor_name[44], continued_name[44];
-    snprintf(anchor_name, sizeof(anchor_name), "%.40s.kv", anchor_sha);
-    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
-    char *anchor_path = path_join(dir, anchor_name);
-    char *continued_path = path_join(dir, continued_name);
+    char old_name[44], recent_name[44];
+    snprintf(old_name, sizeof(old_name), "%.40s.kv", old_sha);
+    snprintf(recent_name, sizeof(recent_name), "%.40s.kv", recent_sha);
+    char *old_path = path_join(dir, old_name);
+    char *recent_path = path_join(dir, recent_name);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, NULL, 0, NULL);
+    kv_cache_evict(&kc, 0, NULL);
 
-    TEST_ASSERT(access(anchor_path, F_OK) == 0);
-    TEST_ASSERT(access(continued_path, F_OK) != 0);
+    TEST_ASSERT(access(old_path, F_OK) != 0);
+    TEST_ASSERT(access(recent_path, F_OK) == 0);
 
     kv_cache_close(&kc);
-    unlink(anchor_path);
-    unlink(continued_path);
-    free(anchor_path);
-    free(continued_path);
+    unlink(old_path);
+    unlink(recent_path);
+    free(old_path);
+    free(recent_path);
     rmdir(dir);
 }
 
@@ -20147,7 +20147,7 @@ static void test_kv_cache_eviction_makes_room_before_store(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 4096u) + 16u;
-    kv_cache_evict(&kc, NULL, KV_CACHE_FIXED_HEADER + 4u + 4096u, NULL);
+    kv_cache_evict(&kc, KV_CACHE_FIXED_HEADER + 4u + 4096u, NULL);
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
 
@@ -20176,7 +20176,7 @@ static void test_kv_cache_eviction_ignores_oversize_incoming(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 1024u) + 16u;
-    kv_cache_evict(&kc, NULL, kc.budget_bytes + 1, NULL);
+    kv_cache_evict(&kc, kc.budget_bytes + 1, NULL);
 
     TEST_ASSERT(access(old_path, F_OK) == 0);
 
@@ -20223,7 +20223,7 @@ static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
         .ctx_size = 32768,
         .reject_different_quant = false,
     };
-    kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
+    kv_cache_evict(&kc, incoming_bytes, &incoming);
 
     TEST_ASSERT(access(continued_path, F_OK) != 0);
     TEST_ASSERT(access(cold_path, F_OK) == 0);
@@ -20267,7 +20267,7 @@ static void test_kv_cache_eviction_spares_next_prompt_file(void) {
     kc.budget_bytes =
         incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(needed_text) + 2048u;
     kc.spare_text = next_prompt;
-    kv_cache_evict(&kc, NULL, incoming_bytes, NULL);
+    kv_cache_evict(&kc, incoming_bytes, NULL);
 
     TEST_ASSERT(access(needed_path, F_OK) == 0);
     TEST_ASSERT(access(other_path, F_OK) != 0);
@@ -20317,7 +20317,7 @@ static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
         .ctx_size = 65536,
         .reject_different_quant = false,
     };
-    kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
+    kv_cache_evict(&kc, incoming_bytes, &incoming);
 
     TEST_ASSERT(access(continued_path, F_OK) == 0);
     TEST_ASSERT(access(cold_path, F_OK) != 0);
@@ -20330,25 +20330,20 @@ static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_score_decays_stale_hits(void) {
-    /* stale: lower tokens-per-byte (e.g. tool-heavy prompt) but boosted by
-     * 10 hits well in the past.  fresh: higher tokens-per-byte and zero hits,
-     * just stored.  The stale hit bonus decays by inactivity, so fresh wins on
-     * its better baseline even though stale once had more successful hits. */
-    const uint64_t now = 1000u + 14u * KV_CACHE_HIT_HALF_LIFE_SECONDS;
-    kv_entry stale = {.tokens = 1024, .hits = 10, .file_size = 4096, .last_used = 1000};
-    kv_entry fresh = {.tokens = 2048, .hits = 0,  .file_size = 4096, .last_used = now};
-
-    double s_on = kv_entry_eviction_score(&stale, NULL, now, NULL);
-    double f_on = kv_entry_eviction_score(&fresh, NULL, now, NULL);
-    TEST_ASSERT(s_on < f_on);
-
-    /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
-     * regardless of how old another entry's hit history is. */
-    TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
+static void test_kv_cache_eviction_score_is_recency(void) {
+    /* Hits and density do not count; the moment of last use does, a file
+     * never used counting from when it was written, and a shorter file of
+     * the same moment goes first. */
+    kv_entry hit_long_ago = {.tokens = 1024, .hits = 10, .file_size = 4096, .last_used = 1000};
+    kv_entry fresh = {.tokens = 2048, .hits = 0, .file_size = 65536, .created_at = 5000};
+    kv_entry fresh_longer = {.tokens = 4096, .hits = 0, .file_size = 4096, .created_at = 5000};
+    TEST_ASSERT(kv_entry_eviction_score(&hit_long_ago, NULL) <
+                kv_entry_eviction_score(&fresh, NULL));
+    TEST_ASSERT(kv_entry_eviction_score(&fresh, NULL) <
+                kv_entry_eviction_score(&fresh_longer, NULL));
 }
 
-static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
+static void test_kv_cache_eviction_old_hits_do_not_protect(void) {
     char tmpl[] = "/tmp/ds4-kv-stale-hit-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
@@ -20357,10 +20352,7 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     const char *old_sha = "1111111111111111111111111111111111111111";
     const char *new_sha = "2222222222222222222222222222222222222222";
     uint64_t now = (uint64_t)time(NULL);
-    uint64_t stale = now > KV_CACHE_HIT_HALF_LIFE_SECONDS * 14ull
-        ? now - KV_CACHE_HIT_HALF_LIFE_SECONDS * 14ull
-        : 1;
-    test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 2048, 15, stale, 2048);
+    test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 2048, 15, now - 60u, 2048);
     test_kv_stub_file(dir, new_sha, KV_REASON_COLD, 2048, 0, now, 2048);
 
     char old_name[44], new_name[44];
@@ -20374,7 +20366,7 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, NULL, 0, NULL);
+    kv_cache_evict(&kc, 0, NULL);
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
     TEST_ASSERT(access(new_path, F_OK) == 0);
@@ -20410,7 +20402,7 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, NULL, 0, NULL);
+    kv_cache_evict(&kc, 0, NULL);
 
     TEST_ASSERT(access(cold_path, F_OK) != 0);
     TEST_ASSERT(access(continued_path, F_OK) == 0);
@@ -20925,14 +20917,14 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
-    test_kv_cache_eviction_prefers_anchor_reason();
+    test_kv_cache_eviction_is_by_recency();
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_spares_next_prompt_file();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
-    test_kv_cache_eviction_score_decays_stale_hits();
-    test_kv_cache_eviction_decayed_hits_tie_break_by_age();
+    test_kv_cache_eviction_score_is_recency();
+    test_kv_cache_eviction_old_hits_do_not_protect();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
 
