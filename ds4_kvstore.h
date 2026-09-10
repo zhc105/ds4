@@ -71,6 +71,10 @@ typedef struct {
     bool reject_different_quant;
     ds4_kvstore_options opt;
     int continued_last_store_tokens;
+    /* Text of the prompt about to be served, set for the store that runs
+     * ahead of its load: a file that begins that prompt is what the load
+     * needs, so eviction spares it. */
+    const char *spare_text;
     ds4_kvstore_entry *entry;
     int len;
     int cap;

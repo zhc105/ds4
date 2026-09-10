@@ -10852,12 +10852,15 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
     };
 }
 
+/* spare_text: the prompt served next, when this store runs ahead of its
+ * load; the files that prompt begins are spared by the store's eviction. */
 static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const ds4_tokens *tokens,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
-                                            const char *cache_text_key) {
+                                            const char *cache_text_key,
+                                            const char *spare_text) {
     if (!s || !slot) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
@@ -10872,6 +10875,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
         return false;
     }
     pthread_mutex_lock(&s->kv_mu);
+    s->kv.spare_text = spare_text;
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                                                   slot->session,
                                                   tokens, store_len, reason,
@@ -10879,6 +10883,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_ext,
                                                   cache_text_key,
                                                   &hooks, err, sizeof(err));
+    s->kv.spare_text = NULL;
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     return ok;
@@ -10888,11 +10893,11 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
-                                           NULL, 0, NULL);
+                                           NULL, 0, NULL, NULL);
 }
 
 static void kv_cache_store_current(server *s, server_slot *slot,
-                                   const char *reason) {
+                                   const char *reason, const char *spare_text) {
     if (!s || !slot) return;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
@@ -10927,10 +10932,12 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
         kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+                                        visible_text, visible_ext, visible_key,
+                                        spare_text);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
+        kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
+                                        NULL, 0, NULL, spare_text);
     }
 }
 
@@ -12984,8 +12991,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
-         * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, slot, "evict");
+         * would silently discard the newer conversation state; the store must
+         * not evict the file that hit. */
+        kv_cache_store_current(s, slot, "evict", j->req.prompt_text);
     }
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
@@ -15351,7 +15359,7 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting resident KV cache before shutdown slot=%d tokens=%d",
                    i, tokens->len);
-        kv_cache_store_current(&s, slot, "shutdown");
+        kv_cache_store_current(&s, slot, "shutdown", NULL);
     }
     server_close_resources(&s);
     return 0;
@@ -20228,6 +20236,50 @@ static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
     rmdir(dir);
 }
 
+/* The store that runs ahead of a load must not evict the file that load
+ * needs, even when it scores lowest. */
+static void test_kv_cache_eviction_spares_next_prompt_file(void) {
+    char tmpl[] = "/tmp/ds4-kv-spare-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *needed_text = "system: hello world";
+    const char *other_text = "a different conversation";
+    const char *next_prompt = "system: hello world\nuser: back to this one";
+    test_kv_text_stub_file(dir, needed_text, KV_REASON_CONTINUED, 1024, 2048);
+    test_kv_text_stub_file(dir, other_text, KV_REASON_COLD, 4096, 2048);
+
+    char needed_sha[41], other_sha[41];
+    sha1_bytes_hex(needed_text, strlen(needed_text), needed_sha);
+    sha1_bytes_hex(other_text, strlen(other_text), other_sha);
+    char needed_name[44], other_name[44];
+    snprintf(needed_name, sizeof(needed_name), "%.40s.kv", needed_sha);
+    snprintf(other_name, sizeof(other_name), "%.40s.kv", other_sha);
+    char *needed_path = path_join(dir, needed_name);
+    char *other_path = path_join(dir, other_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    const uint64_t incoming_bytes = KV_CACHE_FIXED_HEADER + 4u + 64u + 2048u;
+    kc.budget_bytes =
+        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(needed_text) + 2048u;
+    kc.spare_text = next_prompt;
+    kv_cache_evict(&kc, NULL, incoming_bytes, NULL);
+
+    TEST_ASSERT(access(needed_path, F_OK) == 0);
+    TEST_ASSERT(access(other_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(needed_path);
+    unlink(other_path);
+    free(needed_path);
+    free(other_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
     char tmpl[] = "/tmp/ds4-kv-prefix-ctx-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -20877,6 +20929,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
+    test_kv_cache_eviction_spares_next_prompt_file();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();

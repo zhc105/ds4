@@ -558,6 +558,16 @@ double ds4_kvstore_entry_eviction_score(
     return score;
 }
 
+/* A file that begins the prompt about to be served (kc->spare_text) is
+ * what the load after this store needs. */
+static bool kv_cache_entry_spared(const ds4_kvstore *kc, size_t spare_len,
+                                  const ds4_kvstore_entry *e) {
+    if (!kc->spare_text || e->text_bytes == 0 || (size_t)e->text_bytes > spare_len) return false;
+    char sha[41];
+    ds4_kvstore_sha1_bytes_hex(kc->spare_text, (size_t)e->text_bytes, sha);
+    return !strcmp(sha, e->sha);
+}
+
 void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming) {
@@ -565,19 +575,19 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     if (extra_bytes > kc->budget_bytes) return;
     kv_cache_refresh(kc);
     const uint64_t now = (uint64_t)time(NULL);
+    const size_t spare_len = kc->spare_text ? strlen(kc->spare_text) : 0;
     uint64_t total = 0;
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     const uint64_t target = kc->budget_bytes - extra_bytes;
     while (total > target && kc->len > 0) {
-        int victim = 0;
-        double victim_score =
-            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
-                                             incoming);
-        for (int i = 1; i < kc->len; i++) {
+        int victim = -1;
+        double victim_score = 0.0;
+        for (int i = 0; i < kc->len; i++) {
+            if (kv_cache_entry_spared(kc, spare_len, &kc->entry[i])) continue;
             double score =
                 ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
                                                  incoming);
-            if (score < victim_score ||
+            if (victim < 0 || score < victim_score ||
                 (score == victim_score &&
                  kc->entry[i].last_used < kc->entry[victim].last_used))
             {
@@ -585,6 +595,7 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                 victim_score = score;
             }
         }
+        if (victim < 0) break;   /* only the files the next load needs are left */
         ds4_kvstore_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
