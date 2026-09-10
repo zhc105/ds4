@@ -4271,88 +4271,77 @@ static bool agent_fp_remaining(FILE *fp, uint64_t *out) {
     return true;
 }
 
-static bool agent_kv_read_text(FILE *fp, uint32_t text_bytes,
-                               char **text_out, char *err, size_t err_len) {
-    /* text_bytes is read from the on-disk header; cap it against the bytes
-     * actually left in the file before allocating, so a 1-byte file declaring
-     * text_bytes = 0xFFFFFFFF can't request ~4 GiB. */
-    uint64_t remaining = 0;
-    if (!agent_fp_remaining(fp, &remaining) || text_bytes > remaining) {
-        if (err && err_len) snprintf(err, err_len, "truncated cached text");
-        return false;
-    }
-    char *text = xmalloc((size_t)text_bytes + 1);
-    if (fread(text, 1, text_bytes, fp) != text_bytes) {
-        if (err && err_len) snprintf(err, err_len, "truncated cached text");
-        free(text);
-        return false;
-    }
-    text[text_bytes] = '\0';
-    *text_out = text;
+/* The session title travels as a trailer of the checkpoint file, written
+ * through the store's trailer hooks: u32 length, then the bytes. */
+static bool agent_title_size_cb(void *ud, const char *text, uint64_t *bytes_out) {
+    (void)text;
+    const char *title = ud;
+    *bytes_out = 4u + (title ? strlen(title) : 0);
     return true;
 }
 
-static bool agent_kv_write_title_trailer(FILE *fp, const char *title,
-                                         char *err, size_t err_len) {
-    size_t title_len = title ? strlen(title) : 0;
-    if (title_len > UINT32_MAX) {
-        snprintf(err, err_len, "agent session title is too large");
-        return false;
-    }
+static bool agent_title_write_cb(void *ud, FILE *fp, const char *text, uint64_t *written) {
+    (void)text;
+    const char *title = ud ? ud : "";
+    const size_t len = strlen(title);
+    if (len > UINT32_MAX) return false;
     uint8_t tb[4];
-    ds4_kvstore_le_put32(tb, (uint32_t)title_len);
-    return fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-           fwrite(title ? title : "", 1, title_len, fp) == title_len;
+    ds4_kvstore_le_put32(tb, (uint32_t)len);
+    *written = 4u + len;
+    return fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) && fwrite(title, 1, len, fp) == len;
 }
 
-/* Read the optional agent title trailer without disturbing the payload cursor.
- * The caller is positioned just after rendered text, which is also the payload
- * start expected by ds4_session_load_payload(). */
-static bool agent_kv_read_title_trailer(FILE *fp, const ds4_kvstore_entry *hdr,
-                                        char **title_out,
-                                        char *err, size_t err_len) {
-    off_t payload_pos = ftello(fp);
-    if (payload_pos < 0) {
-        if (err && err_len) snprintf(err, err_len, "%s", strerror(errno));
-        return false;
-    }
-    if (hdr->payload_bytes > (uint64_t)LLONG_MAX ||
-        fseeko(fp, (off_t)hdr->payload_bytes, SEEK_CUR) != 0)
+static ds4_kvstore_trailer_hooks agent_title_hooks(const char *title) {
+    return (ds4_kvstore_trailer_hooks){
+        .ud = (void *)title,
+        .ext_flag = DS4_KVSTORE_EXT_SESSION_TITLE,
+        .serialized_size = agent_title_size_cb,
+        .write = agent_title_write_cb,
+    };
+}
+
+/* Read the title trailer of a file whose index says it carries one. */
+static bool agent_kv_read_title(FILE *fp, const ds4_kvstore_entry *hdr,
+                                char **title_out, char *err, size_t err_len) {
+    if (hdr->trailer_offset > (uint64_t)LLONG_MAX ||
+        fseeko(fp, (off_t)hdr->trailer_offset, SEEK_SET) != 0)
     {
         if (err && err_len) snprintf(err, err_len, "%s", strerror(errno));
         return false;
     }
-
     uint8_t tb[4];
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) {
         if (err && err_len) snprintf(err, err_len, "missing agent session title trailer");
-        fseeko(fp, payload_pos, SEEK_SET);
         return false;
     }
     uint32_t title_bytes = ds4_kvstore_le_get32(tb);
-    /* Same cap as agent_kv_read_text: reject a title length larger than the
-     * bytes left in the file before allocating. */
+    /* Cap the file-declared length against the bytes left before allocating. */
     uint64_t title_remaining = 0;
     if (!agent_fp_remaining(fp, &title_remaining) || title_bytes > title_remaining) {
         if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
-        fseeko(fp, payload_pos, SEEK_SET);
         return false;
     }
     char *title = xmalloc((size_t)title_bytes + 1);
     if (fread(title, 1, title_bytes, fp) != title_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
         free(title);
-        fseeko(fp, payload_pos, SEEK_SET);
         return false;
     }
     title[title_bytes] = '\0';
-    if (fseeko(fp, payload_pos, SEEK_SET) != 0) {
-        if (err && err_len) snprintf(err, err_len, "%s", strerror(errno));
-        free(title);
-        return false;
-    }
     *title_out = title;
     return true;
+}
+
+/* A file's live state is the one at its history's end; a stripped session
+ * (text only, no state) rebuilds from its text. */
+static bool agent_kv_live_state(const ds4_kvstore_entry *hdr, uint32_t *index_out) {
+    for (uint32_t i = 0; i < hdr->n_states; i++) {
+        if (hdr->state[i].bytes != 0 && hdr->state[i].position == hdr->tokens) {
+            *index_out = i;
+            return true;
+        }
+    }
+    return false;
 }
 
 static void agent_kv_identity_sha(const ds4_kvstore_entry *hdr,
@@ -4366,9 +4355,7 @@ static void agent_kv_identity_sha(const ds4_kvstore_entry *hdr,
     }
 }
 
-static bool agent_kv_payload_requires_rebuild(const agent_worker *w,
-                                              uint64_t payload_bytes) {
-    if (payload_bytes == 0) return true;
+static bool agent_kv_payload_requires_rebuild(const agent_worker *w) {
     return w && w->cfg && ds4_tp_enabled(&w->cfg->engine.tp);
 }
 
@@ -4390,24 +4377,29 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
     }
 
     ds4_kvstore_entry hdr = {0};
-    uint32_t text_bytes = 0;
-    bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
+    bool ok = ds4_kvstore_read_index(fp, &hdr);
     if (!ok) snprintf(err, err_len, "invalid KV header");
 
-    char *text = NULL;
-    if (ok) ok = agent_kv_read_text(fp, text_bytes, &text, err, err_len);
+    const uint32_t text_bytes = hdr.text_bytes;
+    char *text = ok ? ds4_kvstore_read_text(fp, &hdr) : NULL;
+    if (ok && !text) {
+        snprintf(err, err_len, "truncated cached text");
+        ok = false;
+    }
     char *title = NULL;
     bool has_title = ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE);
     if (has_title)
-        ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
+        ok = agent_kv_read_title(fp, &hdr, &title, err, err_len);
+    uint32_t live_state = 0;
+    const bool has_state = ok && agent_kv_live_state(&hdr, &live_state);
     uint32_t expected_tokens = hdr.tokens;
-    if (ok && hdr.payload_bytes != 0 &&
+    if (ok && has_state &&
         hdr.model_id != (uint8_t)ds4_engine_model_id(w->engine))
     {
         snprintf(err, err_len, "KV checkpoint was written for a different model");
         ok = false;
     }
-    if (ok && hdr.payload_bytes != 0 &&
+    if (ok && has_state &&
         hdr.quant_bits != (uint8_t)ds4_engine_routed_quant_bits(w->engine))
     {
         snprintf(err, err_len, "KV checkpoint was written for a different quantization");
@@ -4431,7 +4423,7 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
     }
 
     char load_err[160] = {0};
-    if (ok && agent_kv_payload_requires_rebuild(w, hdr.payload_bytes)) {
+    if (ok && (!has_state || agent_kv_payload_requires_rebuild(w))) {
         /* A saved payload contains only the leader's graph state. Rebuild from
          * rendered text under TP so session_sync mirrors the same token prefix
          * to the worker before either rank resumes decoding. */
@@ -4444,14 +4436,15 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
         }
         ds4_tokens_free(&rebuilt);
     } else if (ok &&
-               ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
-                                        load_err, sizeof(load_err)) != 0)
+               ds4_kvstore_load(w->engine, w->session, fp, &hdr, live_state, NULL,
+                                load_err, sizeof(load_err)) == 0)
     {
         snprintf(err, err_len, "%s", load_err[0] ? load_err : "failed to load KV payload");
         ds4_session_invalidate(w->session);
         ok = false;
     }
     fclose(fp);
+    free(hdr.state);
 
     if (ok) {
         const ds4_tokens *live = ds4_session_tokens(w->session);
@@ -4522,81 +4515,25 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
     if (sha_out) memcpy(sha_out, sha, sizeof(sha));
 
-    ds4_session_payload_file staged = {0};
-    char save_err[160] = {0};
-    if (ds4_session_stage_payload(w->session, &staged,
-                                  save_err, sizeof(save_err)) != 0) {
-        snprintf(err, err_len, "%s",
-                 save_err[0] ? save_err : "session has no valid KV payload");
-        free(text);
-        return false;
+    /* The store appends to the file when the session grew out of it and
+     * rewrites it otherwise; the identity's creation time is kept. */
+    ds4_kvstore_trailer_hooks hooks = agent_title_hooks(session_title);
+    const ds4_kvstore_store_request req = {
+        .tokens = tokens,
+        .store_len = tokens->len,
+        .reason = reason,
+        .hooks = session_identity ? &hooks : NULL,
+        .path = path,
+        .created_at = created_at,
+    };
+    (void)model_id;
+    char *written = ds4_kvstore_store(NULL, w->engine, w->session, &req, err, err_len);
+    if (!written && (!err_len || !err[0])) {
+        snprintf(err, err_len, "failed to write KV file");
     }
-    uint64_t payload_bytes = staged.bytes;
-
-    agent_buf tmpl = {0};
-    agent_buf_puts(&tmpl, path);
-    agent_buf_puts(&tmpl, ".tmp.XXXXXX");
-    char *tmp = agent_buf_take(&tmpl);
-    int fd = mkstemp(tmp);
-    if (fd < 0) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        ds4_session_payload_file_free(&staged);
-        free(tmp);
-        free(text);
-        return false;
-    }
-
-    FILE *fp = fdopen(fd, "wb");
-    if (!fp) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        close(fd);
-        unlink(tmp);
-        ds4_session_payload_file_free(&staged);
-        free(tmp);
-        free(text);
-        return false;
-    }
-
-    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
-                            ds4_kvstore_reason_code(reason),
-                            session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0,
-                            (uint32_t)tokens->len, 0,
-                            (uint32_t)ds4_session_ctx(w->session),
-                            created_at, now, payload_bytes);
-    uint8_t tb[4];
-    ds4_kvstore_le_put32(tb, (uint32_t)text_len);
-
-    errno = 0;
-    bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
-              fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-              fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_write_staged_payload(&staged, fp,
-                                               save_err, sizeof(save_err)) == 0 &&
-              (!session_identity ||
-               agent_kv_write_title_trailer(fp, session_title,
-                                            save_err, sizeof(save_err))) &&
-              fflush(fp) == 0;
-    int saved_errno = errno;
-    if (fclose(fp) != 0) {
-        if (!saved_errno) saved_errno = errno;
-        ok = false;
-    }
-    if (ok && rename(tmp, path) != 0) {
-        saved_errno = errno;
-        ok = false;
-    }
-    if (!ok) {
-        snprintf(err, err_len, "%s",
-                 saved_errno ? strerror(saved_errno) :
-                 (save_err[0] ? save_err : "failed to write KV file"));
-        unlink(tmp);
-    }
-
-    ds4_session_payload_file_free(&staged);
-    free(tmp);
+    free(written);
     free(text);
-    return ok;
+    return written != NULL;
 }
 
 static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
@@ -5137,19 +5074,19 @@ static char *agent_session_title_from_file(const char *path, size_t max_bytes) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return xstrdup("(unreadable session)");
     ds4_kvstore_entry hdr = {0};
-    uint32_t text_bytes = 0;
     char *text = NULL;
     char *trailer_title = NULL;
-    bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes) &&
-              agent_kv_read_text(fp, text_bytes, &text, NULL, 0);
+    bool ok = ds4_kvstore_read_index(fp, &hdr) &&
+              (text = ds4_kvstore_read_text(fp, &hdr)) != NULL;
     if (ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE))
-        ok = agent_kv_read_title_trailer(fp, &hdr, &trailer_title, NULL, 0);
+        ok = agent_kv_read_title(fp, &hdr, &trailer_title, NULL, 0);
     fclose(fp);
     char *title = ok ?
         (trailer_title ?
             agent_session_title_clip(trailer_title, max_bytes) :
-            agent_session_title_from_text(text, text_bytes, max_bytes)) :
+            agent_session_title_from_text(text, hdr.text_bytes, max_bytes)) :
         xstrdup("(unreadable session)");
+    free(hdr.state);
     free(trailer_title);
     free(text);
     return title;
@@ -5709,10 +5646,11 @@ static void agent_worker_list_sessions(agent_worker *w) {
         printf("%s%.8s%s %s>%s %s%s%s\n",
                sha_on, e->sha, reset, dim, reset,
                title_on, sessions[i].title, reset);
+        uint32_t live = 0;
         printf("         %s> %s, %u tokens, %.2f MB%s%s\n\n",
                dim, age, e->tokens,
                (double)e->file_size / (1024.0 * 1024.0),
-               e->payload_bytes == 0 ? ", stripped" : "",
+               agent_kv_live_state(e, &live) ? "" : ", stripped",
                reset);
     }
     printf("%sUse /switch <id> to select a session, /del <id> to remove, "
@@ -5910,16 +5848,16 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
     }
 
     ds4_kvstore_entry hdr = {0};
-    uint32_t text_bytes = 0;
     char *text = NULL;
     char *title = NULL;
-    bool ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes) &&
-              agent_kv_read_text(fp, text_bytes, &text, err, err_len);
+    bool ok = ds4_kvstore_read_index(fp, &hdr) &&
+              (text = ds4_kvstore_read_text(fp, &hdr)) != NULL;
     if (ok && (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE))
-        ok = agent_kv_read_title_trailer(fp, &hdr, &title, err, err_len);
+        ok = agent_kv_read_title(fp, &hdr, &title, err, err_len);
     fclose(fp);
     if (!ok) {
         if (!err[0]) snprintf(err, err_len, "failed to read session");
+        free(hdr.state);
         free(title);
         free(text);
         free(path);
@@ -5927,9 +5865,10 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
     }
 
     char actual_sha[41];
-    agent_kv_identity_sha(&hdr, text, text_bytes, title, actual_sha);
+    agent_kv_identity_sha(&hdr, text, hdr.text_bytes, title, actual_sha);
     if (strcmp(actual_sha, sha)) {
         snprintf(err, err_len, "cached session identity does not match file name");
+        free(hdr.state);
         free(title);
         free(text);
         free(path);
@@ -5941,64 +5880,19 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
     uint32_t stripped_token_count = (uint32_t)stripped_tokens.len;
     ds4_tokens_free(&stripped_tokens);
 
-    agent_buf tmpl = {0};
-    agent_buf_puts(&tmpl, path);
-    agent_buf_puts(&tmpl, ".tmp.XXXXXX");
-    char *tmp = agent_buf_take(&tmpl);
-    int fd = mkstemp(tmp);
-    if (fd < 0) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        free(tmp);
-        free(text);
-        free(path);
-        return false;
-    }
-
-    fp = fdopen(fd, "wb");
-    if (!fp) {
-        snprintf(err, err_len, "%s", strerror(errno));
-        close(fd);
-        unlink(tmp);
-        free(tmp);
-        free(text);
-        free(path);
-        return false;
-    }
-
-    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-    uint64_t now = (uint64_t)time(NULL);
-    ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
-                            stripped_token_count, hdr.hits, hdr.ctx_size,
-                            hdr.created_at, now, 0);
-    uint8_t tb[4];
-    ds4_kvstore_le_put32(tb, text_bytes);
-
-    errno = 0;
-    ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
-         fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-         fwrite(text, 1, text_bytes, fp) == text_bytes &&
-         (!(hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE) ||
-          agent_kv_write_title_trailer(fp, title, err, err_len)) &&
-         fflush(fp) == 0;
-    int saved_errno = errno;
-    if (fclose(fp) != 0) {
-        if (!saved_errno) saved_errno = errno;
-        ok = false;
-    }
-    if (ok && rename(tmp, path) != 0) {
-        saved_errno = errno;
-        ok = false;
-    }
+    ds4_kvstore_trailer_hooks hooks = agent_title_hooks(title);
+    ok = ds4_kvstore_write_text_only(path, hdr.model_id, hdr.quant_bits, hdr.reason, 0,
+                                     stripped_token_count, hdr.ctx_size, hdr.created_at, text,
+                                     (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE) ? &hooks : NULL,
+                                     err, err_len);
     if (!ok) {
-        snprintf(err, err_len, "%s",
-                 saved_errno ? strerror(saved_errno) : "failed to write stripped session");
-        unlink(tmp);
+        if (!err[0]) snprintf(err, err_len, "failed to write stripped session");
     } else {
         if (sha_out) memcpy(sha_out, sha, 41);
         if (tokens_out) *tokens_out = stripped_token_count;
     }
 
-    free(tmp);
+    free(hdr.state);
     free(title);
     free(text);
     free(path);
@@ -6022,7 +5916,8 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
     bool stripped = false;
     ds4_kvstore_entry entry = {0};
     if (ds4_kvstore_read_entry_file(path, sha, &entry)) {
-        stripped = entry.payload_bytes == 0;
+        uint32_t live = 0;
+        stripped = !agent_kv_live_state(&entry, &live);
         ds4_kvstore_entry_free(&entry);
     }
     if (stripped) {
@@ -7217,12 +7112,10 @@ static void test_agent_cache_rejects_impossible_lengths(void) {
 
     AGENT_TEST_ASSERT(fputc('x', fp) != EOF);
     rewind(fp);
-    char *text = NULL;
-    char err[128] = {0};
-    AGENT_TEST_ASSERT(!agent_kv_read_text(fp, UINT32_MAX, &text,
-                                         err, sizeof(err)));
-    AGENT_TEST_ASSERT(text == NULL);
-    AGENT_TEST_ASSERT(strstr(err, "truncated cached text") != NULL);
+    /* a file-declared text length past the end of the file must not allocate */
+    ds4_kvstore_entry hdr = {0};
+    hdr.text_bytes = UINT32_MAX;
+    AGENT_TEST_ASSERT(ds4_kvstore_read_text(fp, &hdr) == NULL);
     fclose(fp);
 
     fp = tmpfile();
@@ -7232,14 +7125,11 @@ static void test_agent_cache_rejects_impossible_lengths(void) {
     ds4_kvstore_le_put32(tb, UINT32_MAX);
     AGENT_TEST_ASSERT(fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb));
     rewind(fp);
-    ds4_kvstore_entry hdr = {0};
     char *title = NULL;
-    err[0] = '\0';
-    AGENT_TEST_ASSERT(!agent_kv_read_title_trailer(fp, &hdr, &title,
-                                                   err, sizeof(err)));
+    char err[128] = {0};
+    AGENT_TEST_ASSERT(!agent_kv_read_title(fp, &hdr, &title, err, sizeof(err)));
     AGENT_TEST_ASSERT(title == NULL);
     AGENT_TEST_ASSERT(strstr(err, "truncated agent session title trailer") != NULL);
-    AGENT_TEST_ASSERT(ftello(fp) == 0);
     fclose(fp);
 }
 
@@ -7249,10 +7139,9 @@ static void test_agent_tp_cache_payload_rebuild_policy(void) {
         .cfg = &cfg,
     };
 
-    AGENT_TEST_ASSERT(agent_kv_payload_requires_rebuild(&w, 0));
-    AGENT_TEST_ASSERT(!agent_kv_payload_requires_rebuild(&w, 1));
+    AGENT_TEST_ASSERT(!agent_kv_payload_requires_rebuild(&w));
     cfg.engine.tp.role = DS4_TP_LEADER;
-    AGENT_TEST_ASSERT(agent_kv_payload_requires_rebuild(&w, 1));
+    AGENT_TEST_ASSERT(agent_kv_payload_requires_rebuild(&w));
 }
 
 static void test_agent_steering_command(void) {

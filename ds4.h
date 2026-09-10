@@ -619,6 +619,33 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
 void ds4_session_payload_file_free(ds4_session_payload_file *payload);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+
+/* The same checkpoint in position-major pieces, for a file that grows with
+ * its conversation.  A block holds what each of a run of positions
+ * contributes (K/V rows, block keys) and is written once: the file grows by
+ * appending blocks.  A state is everything else at one position (recurrent
+ * state, logits, drafter bookkeeping) or, for a family that keeps no
+ * blocks, the whole checkpoint.  State 0 is the live one; the others are
+ * the saved prompt states the session can still resume, all at earlier
+ * positions of the same history. */
+uint32_t ds4_session_block_positions(ds4_session *s);   /* positions per block; 0: no blocks */
+uint64_t ds4_session_block_bytes(ds4_session *s, uint32_t from, uint32_t to);
+int ds4_session_write_blocks(ds4_session *s, FILE *fp, uint32_t from, uint32_t to,
+                             char *err, size_t errlen);
+/* Read positions [from, to) of a block the file holds as [from, stored_to).
+ * Reading from position 0 begins a restore: the live state is gone until
+ * ds4_session_read_state() brings one back. */
+int ds4_session_read_blocks(ds4_session *s, FILE *fp, uint32_t from, uint32_t to,
+                            uint32_t stored_to, char *err, size_t errlen);
+size_t ds4_session_state_count(ds4_session *s);
+uint32_t ds4_session_state_position(ds4_session *s, size_t i);
+uint64_t ds4_session_state_bytes(ds4_session *s, size_t i);
+int ds4_session_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_t errlen);
+/* Bring back a state read from a file: as the live state, or as a saved
+ * one the live history (already restored) can fall back to.  The history
+ * folded into it is tokens[0..position); its blocks are already read. */
+int ds4_session_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position,
+                           uint64_t bytes, bool live, char *err, size_t errlen);
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);

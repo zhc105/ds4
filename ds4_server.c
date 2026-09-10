@@ -9740,6 +9740,7 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    char *kv_path;   /* the file the live conversation was loaded from or last stored to */
 
     job *assigned;
     job *running;
@@ -10669,24 +10670,6 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
     return loaded;
 }
 
-#ifdef DS4_SERVER_TEST
-static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
-                           uint8_t reason, uint8_t ext_flags,
-                           uint32_t tokens, uint32_t hits, uint32_t ctx_size,
-                           uint64_t created_at, uint64_t last_used,
-                           uint64_t payload_bytes) {
-    ds4_kvstore_fill_header(h, 0, quant_bits, reason, ext_flags, tokens, hits,
-                            ctx_size, created_at, last_used, payload_bytes);
-}
-#endif
-
-static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
-    return ds4_kvstore_read_header(fp, e, text_bytes);
-}
-
-
-
-
 static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs) {
     if (!s || s->disable_exact_dsml_tool_replay || !s->kv.enabled || !msgs) return;
     stop_list wanted = {0};
@@ -10713,15 +10696,14 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
         if (!fp) continue;
 
         kv_entry hdr = {0};
-        uint32_t text_bytes = 0;
-        bool ok = kv_read_header(fp, &hdr, &text_bytes);
-        uint64_t skip = (uint64_t)text_bytes + hdr.payload_bytes;
-        if (ok && hdr.model_id == model_id && (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
-            skip <= (uint64_t)INT64_MAX &&
-            fseeko(fp, (off_t)skip, SEEK_CUR) == 0)
+        if (ds4_kvstore_read_index(fp, &hdr) && hdr.model_id == model_id &&
+            (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
+            hdr.trailer_offset <= (uint64_t)INT64_MAX &&
+            fseeko(fp, (off_t)hdr.trailer_offset, SEEK_SET) == 0)
         {
             kv_tool_map_load_from_pos(s, fp, &wanted);
         }
+        free(hdr.state);
         fclose(fp);
     }
     closedir(d);
@@ -10729,16 +10711,14 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
 }
 
 #ifdef DS4_SERVER_TEST
-static double kv_entry_eviction_score(const kv_entry *e,
-                                      const ds4_kvstore_eviction_context *incoming) {
-    return ds4_kvstore_entry_eviction_score(e, incoming);
+static double kv_entry_eviction_score(const kv_entry *e) {
+    return ds4_kvstore_entry_eviction_score(e);
 }
 #endif
 
 #ifdef DS4_SERVER_TEST
-static void kv_cache_evict(kv_disk_cache *kc, uint64_t extra_bytes,
-                           const ds4_kvstore_eviction_context *incoming) {
-    ds4_kvstore_evict(kc, extra_bytes, incoming);
+static void kv_cache_evict(kv_disk_cache *kc, uint64_t extra_bytes) {
+    ds4_kvstore_evict(kc, extra_bytes);
 }
 #endif
 
@@ -10801,23 +10781,10 @@ static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tok
     return ds4_kvstore_continued_store_target(kc, live_tokens);
 }
 
-/* A same-text-prefix file can be reused by a larger context, but not by a
- * smaller one: the payload was validated against the context capacity recorded
- * in the file.  If the existing file cannot be used by this server, replace it
- * so this context can still populate its own cache. */
-
-
-
 #ifdef DS4_SERVER_TEST
-static bool kv_cache_file_size_fits(const kv_disk_cache *kc,
-                                    uint64_t text_bytes,
-                                    uint64_t payload_bytes,
-                                    uint64_t tool_map_bytes,
-                                    uint64_t *file_bytes_out,
+static bool kv_cache_file_size_fits(const kv_disk_cache *kc, uint64_t file_bytes,
                                     uint64_t *required_bytes_out) {
-    return ds4_kvstore_file_size_fits(kc, text_bytes, payload_bytes,
-                                      tool_map_bytes, file_bytes_out,
-                                      required_bytes_out);
+    return ds4_kvstore_file_size_fits(kc, file_bytes, required_bytes_out);
 }
 #endif
 
@@ -10849,15 +10816,15 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
     };
 }
 
-/* spare_text: the prompt served next, when this store runs ahead of its
- * load; the files that prompt begins are spared by the store's eviction. */
+/* Store the slot's live prefix.  The slot remembers the file its
+ * conversation lives in (the one it was loaded from or last stored to), so
+ * a store that continues that conversation appends to it. */
 static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const ds4_tokens *tokens,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
-                                            const char *cache_text_key,
-                                            const char *spare_text) {
+                                            const char *cache_text_key) {
     if (!s || !slot) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
@@ -10871,30 +10838,51 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
         pthread_mutex_unlock(&s->inference_mu);
         return false;
     }
+    const ds4_kvstore_store_request req = {
+        .tokens = tokens,
+        .store_len = store_len,
+        .reason = reason,
+        .key_override = cache_text_override,
+        .key_ext = cache_text_ext,
+        .key_kind = cache_text_key,
+        .hooks = &hooks,
+        .extend_path = slot->kv_path,
+    };
     pthread_mutex_lock(&s->kv_mu);
-    s->kv.spare_text = spare_text;
-    bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
-                                                  slot->session,
-                                                  tokens, store_len, reason,
-                                                  cache_text_override,
-                                                  cache_text_ext,
-                                                  cache_text_key,
-                                                  &hooks, err, sizeof(err));
-    s->kv.spare_text = NULL;
+    char *path = ds4_kvstore_store(&s->kv, s->engine, slot->session, &req, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
-    return ok;
+    if (path) {
+        free(slot->kv_path);
+        slot->kv_path = path;
+    }
+    return path != NULL;
 }
 
 static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
-                                           NULL, 0, NULL, NULL);
+                                           NULL, 0, NULL);
+}
+
+/* Before the live session is stored away for another conversation, mark
+ * that conversation's file as in use: the store's eviction goes by recency
+ * and must not take the file the load right after it needs. */
+static void kv_cache_touch_prompt_file(server *s, const char *prompt_text) {
+    if (!s || !s->kv.enabled || !prompt_text || !s->engine) return;
+    pthread_mutex_lock(&s->kv_mu);
+    uint32_t state = 0;
+    const int idx = ds4_kvstore_find_text_prefix(&s->kv, prompt_text,
+                                                 ds4_engine_model_id(s->engine),
+                                                 ds4_engine_routed_quant_bits(s->engine),
+                                                 s->ctx_size, &state);
+    if (idx >= 0) ds4_kvstore_touch_file(s->kv.entry[idx].path, s->kv.entry[idx].hits, 0);
+    pthread_mutex_unlock(&s->kv_mu);
 }
 
 static void kv_cache_store_current(server *s, server_slot *slot,
-                                   const char *reason, const char *spare_text) {
+                                   const char *reason) {
     if (!s || !slot) return;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
@@ -10929,12 +10917,10 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
         kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key,
-                                        spare_text);
+                                        visible_text, visible_ext, visible_key);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        NULL, 0, NULL, spare_text);
+        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
     }
 }
 
@@ -10996,6 +10982,8 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     }
     pthread_mutex_unlock(&s->kv_mu);
     slot->continued_last_store_tokens = 0;
+    free(slot->kv_path);
+    slot->kv_path = NULL;
     pthread_mutex_lock(&s->inference_mu);
     ds4_session_invalidate(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
@@ -11017,7 +11005,7 @@ static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
 #ifdef DS4_SERVER_TEST
 static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
                                      int quant_bits, int ctx_size) {
-    return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size);
+    return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size, NULL);
 }
 #endif
 
@@ -11048,6 +11036,8 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
+        free(slot->kv_path);
+        slot->kv_path = lr.path ? xstrdup(lr.path) : NULL;
     }
     ds4_kvstore_load_result_free(&lr);
     return loaded;
@@ -12988,9 +12978,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
-         * would silently discard the newer conversation state; the store must
-         * not evict the file that hit. */
-        kv_cache_store_current(s, slot, "evict", j->req.prompt_text);
+         * would silently discard the newer conversation state. */
+        kv_cache_touch_prompt_file(s, j->req.prompt_text);
+        kv_cache_store_current(s, slot, "evict");
     }
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
@@ -14751,6 +14741,7 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
         if (slot->session) ds4_session_free(slot->session);
+        free(slot->kv_path);
     }
     free(s->slot_threads);
     free(s->slots);
@@ -15356,7 +15347,7 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting resident KV cache before shutdown slot=%d tokens=%d",
                    i, tokens->len);
-        kv_cache_store_current(&s, slot, "shutdown", NULL);
+        kv_cache_store_current(&s, slot, "shutdown");
     }
     server_close_resources(&s);
     return 0;
@@ -19670,14 +19661,14 @@ static void test_kv_cache_file_size_must_fit_budget(void) {
     kv_disk_cache kc = {0};
     kc.budget_bytes = 1100;
 
-    TEST_ASSERT(kv_cache_file_size_fits(&kc, 100, 930, 0, NULL, NULL));
-    TEST_ASSERT(!kv_cache_file_size_fits(&kc, 100, 938, 0, NULL, NULL));
-    TEST_ASSERT(!kv_cache_file_size_fits(&kc, 100, 900, 40, NULL, NULL));
-    TEST_ASSERT(!kv_cache_file_size_fits(&kc, UINT64_MAX, 1, 0, NULL, NULL));
+    /* 1% headroom on top of the file */
+    TEST_ASSERT(kv_cache_file_size_fits(&kc, 1080, NULL));
+    TEST_ASSERT(!kv_cache_file_size_fits(&kc, 1090, NULL));
+    TEST_ASSERT(!kv_cache_file_size_fits(&kc, UINT64_MAX, NULL));
 
     kc.budget_bytes = 0;
-    TEST_ASSERT(kv_cache_file_size_fits(&kc, 100, 900, 40, NULL, NULL));
-    TEST_ASSERT(!kv_cache_file_size_fits(&kc, UINT64_MAX, 1, 0, NULL, NULL));
+    TEST_ASSERT(kv_cache_file_size_fits(&kc, 1090, NULL));
+    TEST_ASSERT(!kv_cache_file_size_fits(&kc, UINT64_MAX, NULL));
 }
 
 static void test_sha1_bytes_hex_matches_known_vector(void) {
@@ -19686,66 +19677,53 @@ static void test_sha1_bytes_hex_matches_known_vector(void) {
     TEST_ASSERT(!strcmp(sha, "a9993e364706816aba3e25717850c26c9cd0d89d"));
 }
 
+/* A checkpoint file with a text but no state, named by sha, of about
+ * payload_bytes: the eviction tests care for sizes and times only. */
 static void test_kv_stub_file(const char *dir, const char *sha,
                               uint8_t reason, uint32_t tokens, uint32_t hits,
                               uint64_t last_used, uint64_t payload_bytes) {
     char name[44];
     snprintf(name, sizeof(name), "%.40s.kv", sha);
     char *path = path_join(dir, name);
-    FILE *fp = fopen(path, "wb");
-    TEST_ASSERT(fp != NULL);
-    if (!fp) {
-        free(path);
-        return;
-    }
-
-    uint8_t h[KV_CACHE_FIXED_HEADER];
-    kv_fill_header(h, 2, reason, 0, tokens, hits, 32768, 100, last_used, payload_bytes);
-    uint8_t text_len[4] = {0};
-    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
-    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
-    for (uint64_t i = 0; i < payload_bytes; i++) {
-        TEST_ASSERT(fputc(0, fp) != EOF);
-    }
-    TEST_ASSERT(fclose(fp) == 0);
+    char *text = xmalloc((size_t)payload_bytes + 1);
+    memset(text, 'x', (size_t)payload_bytes);
+    text[payload_bytes] = '\0';
+    char err[160] = {0};
+    TEST_ASSERT(ds4_kvstore_write_text_only(path, 0, 2, reason, 0, tokens, 32768, 100,
+                                            text, NULL, err, sizeof(err)));
+    TEST_ASSERT(ds4_kvstore_touch_file(path, hits, last_used));
+    free(text);
     free(path);
 }
 
+static uint64_t test_file_size(const char *dir, const char *sha) {
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    struct stat st;
+    const uint64_t size = stat(path, &st) == 0 ? (uint64_t)st.st_size : 0;
+    free(path);
+    return size;
+}
+
+/* A file keyed by text, as the lookup tests need. */
 static void test_kv_text_stub_file_model(const char *dir, const char *text,
                                          uint8_t model_id, uint8_t reason,
-                                         uint32_t tokens,
-                                         uint64_t payload_bytes) {
+                                         uint32_t tokens) {
     char sha[41];
     sha1_bytes_hex(text, strlen(text), sha);
     char name[44];
     snprintf(name, sizeof(name), "%.40s.kv", sha);
     char *path = path_join(dir, name);
-    FILE *fp = fopen(path, "wb");
-    TEST_ASSERT(fp != NULL);
-    if (!fp) {
-        free(path);
-        return;
-    }
-
-    uint8_t h[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
-                            32768, 100, 100, payload_bytes);
-    uint8_t text_len[4];
-    le_put32(text_len, (uint32_t)strlen(text));
-    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
-    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
-    TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
-    for (uint64_t i = 0; i < payload_bytes; i++) {
-        TEST_ASSERT(fputc(0, fp) != EOF);
-    }
-    TEST_ASSERT(fclose(fp) == 0);
+    char err[160] = {0};
+    TEST_ASSERT(ds4_kvstore_write_text_only(path, model_id, 2, reason, 0, tokens, 32768, 100,
+                                            text, NULL, err, sizeof(err)));
     free(path);
 }
 
 static void test_kv_text_stub_file(const char *dir, const char *text,
-                                   uint8_t reason,
-                                   uint32_t tokens, uint64_t payload_bytes) {
-    test_kv_text_stub_file_model(dir, text, 0, reason, tokens, payload_bytes);
+                                   uint8_t reason, uint32_t tokens) {
+    test_kv_text_stub_file_model(dir, text, 0, reason, tokens);
 }
 
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
@@ -19756,8 +19734,8 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
 
     const char *short_text = "transcript prefix";
     const char *long_text = "transcript prefix with sampled token bytes";
-    test_kv_text_stub_file(dir, short_text, KV_REASON_COLD, 512, 0);
-    test_kv_text_stub_file(dir, long_text, KV_REASON_COLD, 768, 0);
+    test_kv_text_stub_file(dir, short_text, KV_REASON_COLD, 512);
+    test_kv_text_stub_file(dir, long_text, KV_REASON_COLD, 768);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -19795,7 +19773,7 @@ static void test_kv_cache_lookup_rejects_wrong_model(void) {
     if (!dir) return;
 
     const char *text = "shared rendered prefix";
-    test_kv_text_stub_file_model(dir, text, 1, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file_model(dir, text, 1, KV_REASON_COLD, 512);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -19803,9 +19781,9 @@ static void test_kv_cache_lookup_rejects_wrong_model(void) {
     kc.opt = kv_cache_default_options();
 
     TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "shared rendered prefix and tail",
-                                             0, 2, 32768) < 0);
+                                             0, 2, 32768, NULL) < 0);
     int idx = ds4_kvstore_find_text_prefix(&kc, "shared rendered prefix and tail",
-                                           1, 2, 32768);
+                                           1, 2, 32768, NULL);
     TEST_ASSERT(idx >= 0);
     TEST_ASSERT(idx >= 0 && kc.entry[idx].model_id == 1);
 
@@ -19833,17 +19811,14 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     snprintf(name, sizeof(name), "%.40s.kv", sha);
     char *path = path_join(dir, name);
 
-    FILE *fp = fopen(path, "wb");
+    char err[160] = {0};
+    TEST_ASSERT(ds4_kvstore_write_text_only(path, 0, 2, KV_REASON_COLD, 0, 512, 32768, 100,
+                                            text, NULL, err, sizeof(err)));
+    FILE *fp = fopen(path, "r+b");
     TEST_ASSERT(fp != NULL);
     if (fp) {
-        uint8_t h[KV_CACHE_FIXED_HEADER];
-        kv_fill_header(h, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0);
-        h[20] = 0; /* pre-ABI-guard files used this byte as reserved zero. */
-        uint8_t text_len[4];
-        le_put32(text_len, (uint32_t)strlen(text));
-        TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
-        TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
-        TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+        /* header byte 20 is the payload ABI: an older build's file */
+        TEST_ASSERT(fseek(fp, 20, SEEK_SET) == 0 && fputc(0, fp) != EOF);
         TEST_ASSERT(fclose(fp) == 0);
     }
 
@@ -19853,7 +19828,7 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     kc.opt = kv_cache_default_options();
 
     TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "stale rendered prefix and tail",
-                                             0, 2, 32768) < 0);
+                                             0, 2, 32768, NULL) < 0);
 
     kv_cache_close(&kc);
     unlink(path);
@@ -20000,20 +19975,10 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     pthread_mutex_init(&src.tool_mu, NULL);
     tool_memory_put(&src, "call_disk", dsml);
 
-    FILE *fp = fopen(path, "wb");
-    TEST_ASSERT(fp != NULL);
-    if (fp) {
-        uint8_t h[KV_CACHE_FIXED_HEADER];
-        kv_fill_header(h, 2, KV_REASON_CONTINUED, KV_EXT_TOOL_MAP, 512, 0, 32768, 100, 100, 0);
-        uint8_t text_len[4];
-        le_put32(text_len, (uint32_t)strlen(text));
-        TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
-        TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
-        TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
-        uint64_t ignored = 0;
-        TEST_ASSERT(kv_tool_map_write(&src, fp, dsml, &ignored));
-        TEST_ASSERT(fclose(fp) == 0);
-    }
+    ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(&src, NULL);
+    char err[160] = {0};
+    TEST_ASSERT(ds4_kvstore_write_text_only(path, 0, 2, KV_REASON_CONTINUED, 0, 512, 32768, 100,
+                                            text, &hooks, err, sizeof(err)));
 
     server dst = {0};
     pthread_mutex_init(&dst.tool_mu, NULL);
@@ -20075,8 +20040,8 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
-    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, 0, NULL);
+    kc.budget_bytes = test_file_size(dir, new_sha) + 16u;
+    kv_cache_evict(&kc, 0);
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
     TEST_ASSERT(access(new_path, F_OK) == 0);
@@ -20114,8 +20079,8 @@ static void test_kv_cache_eviction_is_by_recency(void) {
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
-    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, 0, NULL);
+    kc.budget_bytes = test_file_size(dir, recent_sha) + 16u;
+    kv_cache_evict(&kc, 0);
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
     TEST_ASSERT(access(recent_path, F_OK) == 0);
@@ -20146,8 +20111,8 @@ static void test_kv_cache_eviction_makes_room_before_store(void) {
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
-    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 4096u) + 16u;
-    kv_cache_evict(&kc, KV_CACHE_FIXED_HEADER + 4u + 4096u, NULL);
+    kc.budget_bytes = test_file_size(dir, old_sha) + 16u;
+    kv_cache_evict(&kc, test_file_size(dir, old_sha));
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
 
@@ -20175,8 +20140,8 @@ static void test_kv_cache_eviction_ignores_oversize_incoming(void) {
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
-    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 1024u) + 16u;
-    kv_cache_evict(&kc, kc.budget_bytes + 1, NULL);
+    kc.budget_bytes = test_file_size(dir, old_sha) + 16u;
+    kv_cache_evict(&kc, kc.budget_bytes + 1);
 
     TEST_ASSERT(access(old_path, F_OK) == 0);
 
@@ -20186,73 +20151,21 @@ static void test_kv_cache_eviction_ignores_oversize_incoming(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
-    char tmpl[] = "/tmp/ds4-kv-prefix-evict-test.XXXXXX";
+/* Switching conversations touches the file the next request needs before
+ * the outgoing one is stored; that keeps it out of the store's eviction
+ * even when it is the oldest file. */
+static void test_kv_cache_touched_file_survives_eviction(void) {
+    char tmpl[] = "/tmp/ds4-kv-touch-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
-    const char *continued_text = "system: hello world";
-    const char *cold_text = "different stable prefix";
-    const char *incoming_text = "system: hello world\nuser: prompt";
-    test_kv_text_stub_file(dir, continued_text, KV_REASON_CONTINUED, 4096, 2048);
-    test_kv_text_stub_file(dir, cold_text, KV_REASON_COLD, 1024, 2048);
+    const char *needed_sha = "1111111111111111111111111111111111111111";
+    const char *other_sha = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, needed_sha, KV_REASON_CONTINUED, 1024, 0, now - 5u * 3600u, 2048);
+    test_kv_stub_file(dir, other_sha, KV_REASON_COLD, 4096, 0, now - 60u, 2048);
 
-    char continued_sha[41], cold_sha[41];
-    sha1_bytes_hex(continued_text, strlen(continued_text), continued_sha);
-    sha1_bytes_hex(cold_text, strlen(cold_text), cold_sha);
-    char continued_name[44], cold_name[44];
-    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
-    snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
-    char *continued_path = path_join(dir, continued_name);
-    char *cold_path = path_join(dir, cold_name);
-
-    kv_disk_cache kc = {0};
-    kc.enabled = true;
-    kc.dir = xstrdup(dir);
-    kc.opt = kv_cache_default_options();
-    uint64_t incoming_bytes =
-        KV_CACHE_FIXED_HEADER + 4u + strlen(incoming_text) + 2048u;
-    kc.budget_bytes =
-        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(cold_text) + 2048u;
-    ds4_kvstore_eviction_context incoming = {
-        .text = incoming_text,
-        .text_len = strlen(incoming_text),
-        .model_id = 0,
-        .quant_bits = 2,
-        .ctx_size = 32768,
-        .reject_different_quant = false,
-    };
-    kv_cache_evict(&kc, incoming_bytes, &incoming);
-
-    TEST_ASSERT(access(continued_path, F_OK) != 0);
-    TEST_ASSERT(access(cold_path, F_OK) == 0);
-
-    kv_cache_close(&kc);
-    unlink(continued_path);
-    unlink(cold_path);
-    free(continued_path);
-    free(cold_path);
-    rmdir(dir);
-}
-
-/* The store that runs ahead of a load must not evict the file that load
- * needs, even when it scores lowest. */
-static void test_kv_cache_eviction_spares_next_prompt_file(void) {
-    char tmpl[] = "/tmp/ds4-kv-spare-evict-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
-    TEST_ASSERT(dir != NULL);
-    if (!dir) return;
-
-    const char *needed_text = "system: hello world";
-    const char *other_text = "a different conversation";
-    const char *next_prompt = "system: hello world\nuser: back to this one";
-    test_kv_text_stub_file(dir, needed_text, KV_REASON_CONTINUED, 1024, 2048);
-    test_kv_text_stub_file(dir, other_text, KV_REASON_COLD, 4096, 2048);
-
-    char needed_sha[41], other_sha[41];
-    sha1_bytes_hex(needed_text, strlen(needed_text), needed_sha);
-    sha1_bytes_hex(other_text, strlen(other_text), other_sha);
     char needed_name[44], other_name[44];
     snprintf(needed_name, sizeof(needed_name), "%.40s.kv", needed_sha);
     snprintf(other_name, sizeof(other_name), "%.40s.kv", other_sha);
@@ -20263,11 +20176,9 @@ static void test_kv_cache_eviction_spares_next_prompt_file(void) {
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
-    const uint64_t incoming_bytes = KV_CACHE_FIXED_HEADER + 4u + 64u + 2048u;
-    kc.budget_bytes =
-        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(needed_text) + 2048u;
-    kc.spare_text = next_prompt;
-    kv_cache_evict(&kc, incoming_bytes, NULL);
+    kc.budget_bytes = test_file_size(dir, needed_sha) + 16u;
+    TEST_ASSERT(ds4_kvstore_touch_file(needed_path, 0, 0));
+    kv_cache_evict(&kc, 0);
 
     TEST_ASSERT(access(needed_path, F_OK) == 0);
     TEST_ASSERT(access(other_path, F_OK) != 0);
@@ -20280,56 +20191,6 @@ static void test_kv_cache_eviction_spares_next_prompt_file(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
-    char tmpl[] = "/tmp/ds4-kv-prefix-ctx-test.XXXXXX";
-    char *dir = mkdtemp(tmpl);
-    TEST_ASSERT(dir != NULL);
-    if (!dir) return;
-
-    const char *continued_text = "system: hello world";
-    const char *cold_text = "different stable prefix";
-    const char *incoming_text = "system: hello world\nuser: prompt";
-    test_kv_text_stub_file(dir, continued_text, KV_REASON_CONTINUED, 4096, 2048);
-    test_kv_text_stub_file(dir, cold_text, KV_REASON_COLD, 1024, 2048);
-
-    char continued_sha[41], cold_sha[41];
-    sha1_bytes_hex(continued_text, strlen(continued_text), continued_sha);
-    sha1_bytes_hex(cold_text, strlen(cold_text), cold_sha);
-    char continued_name[44], cold_name[44];
-    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
-    snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
-    char *continued_path = path_join(dir, continued_name);
-    char *cold_path = path_join(dir, cold_name);
-
-    kv_disk_cache kc = {0};
-    kc.enabled = true;
-    kc.dir = xstrdup(dir);
-    kc.opt = kv_cache_default_options();
-    uint64_t incoming_bytes =
-        KV_CACHE_FIXED_HEADER + 4u + strlen(incoming_text) + 2048u;
-    kc.budget_bytes =
-        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(continued_text) + 2048u;
-    ds4_kvstore_eviction_context incoming = {
-        .text = incoming_text,
-        .text_len = strlen(incoming_text),
-        .model_id = 0,
-        .quant_bits = 2,
-        .ctx_size = 65536,
-        .reject_different_quant = false,
-    };
-    kv_cache_evict(&kc, incoming_bytes, &incoming);
-
-    TEST_ASSERT(access(continued_path, F_OK) == 0);
-    TEST_ASSERT(access(cold_path, F_OK) != 0);
-
-    kv_cache_close(&kc);
-    unlink(continued_path);
-    unlink(cold_path);
-    free(continued_path);
-    free(cold_path);
-    rmdir(dir);
-}
-
 static void test_kv_cache_eviction_score_is_recency(void) {
     /* Hits and density do not count; the moment of last use does, a file
      * never used counting from when it was written, and a shorter file of
@@ -20337,10 +20198,8 @@ static void test_kv_cache_eviction_score_is_recency(void) {
     kv_entry hit_long_ago = {.tokens = 1024, .hits = 10, .file_size = 4096, .last_used = 1000};
     kv_entry fresh = {.tokens = 2048, .hits = 0, .file_size = 65536, .created_at = 5000};
     kv_entry fresh_longer = {.tokens = 4096, .hits = 0, .file_size = 4096, .created_at = 5000};
-    TEST_ASSERT(kv_entry_eviction_score(&hit_long_ago, NULL) <
-                kv_entry_eviction_score(&fresh, NULL));
-    TEST_ASSERT(kv_entry_eviction_score(&fresh, NULL) <
-                kv_entry_eviction_score(&fresh_longer, NULL));
+    TEST_ASSERT(kv_entry_eviction_score(&hit_long_ago) < kv_entry_eviction_score(&fresh));
+    TEST_ASSERT(kv_entry_eviction_score(&fresh) < kv_entry_eviction_score(&fresh_longer));
 }
 
 static void test_kv_cache_eviction_old_hits_do_not_protect(void) {
@@ -20365,8 +20224,8 @@ static void test_kv_cache_eviction_old_hits_do_not_protect(void) {
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
-    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, 0, NULL);
+    kc.budget_bytes = test_file_size(dir, new_sha) + 16u;
+    kv_cache_evict(&kc, 0);
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
     TEST_ASSERT(access(new_path, F_OK) == 0);
@@ -20401,8 +20260,8 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
-    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, 0, NULL);
+    kc.budget_bytes = test_file_size(dir, continued_sha) + 16u;
+    kv_cache_evict(&kc, 0);
 
     TEST_ASSERT(access(cold_path, F_OK) != 0);
     TEST_ASSERT(access(continued_path, F_OK) == 0);
@@ -20920,9 +20779,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_is_by_recency();
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();
-    test_kv_cache_eviction_prefers_superseded_continued_prefix();
-    test_kv_cache_eviction_spares_next_prompt_file();
-    test_kv_cache_eviction_keeps_smaller_context_prefix();
+    test_kv_cache_touched_file_survives_eviction();
     test_kv_cache_eviction_score_is_recency();
     test_kv_cache_eviction_old_hits_do_not_protect();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();

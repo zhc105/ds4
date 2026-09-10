@@ -32,27 +32,45 @@ typedef enum {
     DS4_KVSTORE_LOG_WARNING,
 } ds4_kvstore_log_type;
 
+/* One point of a file's history a session can resume from: its position,
+ * and the prompt bytes it stands for (the rendered text of the history up
+ * to there, or a visible-transcript key of its own kept in the file). */
 typedef struct {
-    /* The file name is the rendered byte prefix, not the token sequence. The
-     * payload still carries the exact tokens and graph state; the hash only
-     * answers "does this checkpoint represent the bytes at the front of the
-     * incoming prompt?" */
-    char sha[41];
+    uint32_t position;
+    uint32_t key_len;
+    char sha[41];          /* of the key bytes */
+    uint64_t offset;       /* the state blob */
+    uint64_t bytes;
+    uint64_t key_offset;   /* the key bytes when they are not the text's prefix; 0 otherwise */
+} ds4_kvstore_state;
+
+/* A checkpoint file holds one conversation: the blocks of its history
+ * (what every position contributes, written once and appended to) and a
+ * tail with the tokens, the rendered text, the states the session can
+ * resume from, and the protocol trailers. */
+typedef struct {
+    char sha[41];          /* the file name */
     char *path;
     uint8_t quant_bits;
-    /* Stored in header byte 7.  Flash is 0 for backward compatibility with
-     * older cache files where this reserved byte was always written as zero. */
     uint8_t model_id;
-    uint8_t reason;
-    uint32_t tokens;
+    uint8_t reason;        /* of the last store */
+    uint8_t ext_flags;
+    uint32_t tokens;       /* the history's length */
     uint32_t hits;
     uint32_t ctx_size;
-    uint8_t ext_flags;
     uint64_t created_at;
     uint64_t last_used;
-    uint64_t payload_bytes;
-    uint64_t text_bytes;
     uint64_t file_size;
+    uint64_t tail_offset;
+    uint32_t blocks_end;   /* positions the blocks cover */
+    uint32_t block_positions;
+    uint32_t text_bytes;
+    uint32_t tail_tokens;  /* tokens listed in the tail (none in a text-only file) */
+    uint64_t tokens_offset;
+    uint64_t text_offset;
+    uint64_t trailer_offset;
+    ds4_kvstore_state *state;
+    uint32_t n_states;
 } ds4_kvstore_entry;
 
 typedef struct {
@@ -70,10 +88,6 @@ typedef struct {
     bool reject_different_quant;
     ds4_kvstore_options opt;
     int continued_last_store_tokens;
-    /* Text of the prompt about to be served, set for the store that runs
-     * ahead of its load: a file that begins that prompt is what the load
-     * needs, so eviction spares it. */
-    const char *spare_text;
     ds4_kvstore_entry *entry;
     int len;
     int cap;
@@ -81,15 +95,6 @@ typedef struct {
     void *log_ud;
     void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg);
 } ds4_kvstore;
-
-typedef struct {
-    const char *text;
-    size_t text_len;
-    uint8_t model_id;
-    uint8_t quant_bits;
-    uint32_t ctx_size;
-    bool reject_different_quant;
-} ds4_kvstore_eviction_context;
 
 typedef struct {
     void *ud;
@@ -100,9 +105,28 @@ typedef struct {
     const void *load_wanted;
 } ds4_kvstore_trailer_hooks;
 
+/* What to store: the session's first store_len tokens (they must be its
+ * whole live history), under the store's reason.  A key override keys the
+ * live state by a visible transcript instead of the rendered text.  The
+ * store extends the file at extend_path when the session grew out of it,
+ * writes to path when one is given (extending it when it can), and
+ * otherwise writes a new file named by the text; created_at 0 means now. */
 typedef struct {
-    int tokens;
-    uint32_t text_bytes;
+    const ds4_tokens *tokens;
+    int store_len;
+    const char *reason;
+    const char *key_override;
+    uint8_t key_ext;
+    const char *key_kind;
+    const ds4_kvstore_trailer_hooks *hooks;
+    const char *extend_path;
+    const char *path;
+    uint64_t created_at;
+} ds4_kvstore_store_request;
+
+typedef struct {
+    int tokens;            /* the position resumed */
+    uint32_t key_len;
     uint8_t quant_bits;
     uint8_t ext_flags;
     double load_ms;
@@ -146,46 +170,42 @@ void ds4_kvstore_restore_suppressed_continued(ds4_kvstore *kc,
                                               int old_tokens,
                                               int suppressed_tokens);
 
-bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
-                                uint64_t text_bytes,
-                                uint64_t payload_bytes,
-                                uint64_t trailer_bytes,
-                                uint64_t *file_bytes_out,
+bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc, uint64_t file_bytes,
                                 uint64_t *required_bytes_out);
-double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
-                                        const ds4_kvstore_eviction_context *incoming);
-void ds4_kvstore_evict(ds4_kvstore *kc, uint64_t extra_bytes,
-                       const ds4_kvstore_eviction_context *incoming);
+double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e);
+/* Make room for extra_bytes under the budget, least recently used first. */
+void ds4_kvstore_evict(ds4_kvstore *kc, uint64_t extra_bytes);
+/* The file and state whose key is the longest prefix of prompt_text. */
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
-                                 int model_id, int quant_bits, int ctx_size);
+                                 int model_id, int quant_bits, int ctx_size,
+                                 uint32_t *state_out);
 
-bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
-                                        ds4_engine *engine,
-                                        ds4_session *session,
-                                        const ds4_tokens *tokens,
-                                        int store_len,
-                                        const char *reason,
-                                        const char *cache_text_override,
-                                        uint8_t cache_text_ext,
-                                        const char *cache_text_key,
-                                        const ds4_kvstore_trailer_hooks *hooks,
-                                        char *err,
-                                        size_t err_len);
-bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
-                                   ds4_engine *engine,
-                                   ds4_session *session,
-                                   const ds4_tokens *tokens,
-                                   int store_len,
-                                   const char *reason,
-                                   const ds4_kvstore_trailer_hooks *hooks,
-                                   char *err,
-                                   size_t err_len);
+/* Store; the path written (to free) or NULL.  kc may be NULL: no budget,
+ * no eviction, no log. */
+char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *session,
+                        const ds4_kvstore_store_request *req, char *err, size_t err_len);
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
                                        ds4_engine *engine,
                                        ds4_session *session,
                                        const ds4_kvstore_trailer_hooks *hooks,
+                                       const char *extend_path,
+                                       char **path_out,
                                        char *err,
                                        size_t err_len);
+/* A file with the tokens and text of a history but no state: the agent's
+ * stripped sessions, rebuilt from text when opened. */
+bool ds4_kvstore_write_text_only(const char *path, uint8_t model_id, uint8_t quant_bits,
+                                 uint8_t reason, uint8_t ext_flags, uint32_t tokens,
+                                 uint32_t ctx_size, uint64_t created_at, const char *text,
+                                 const ds4_kvstore_trailer_hooks *hooks,
+                                 char *err, size_t err_len);
+
+/* Resume a file's state (by index in its index) into the session; the
+ * position resumed, 0 on failure. */
+int ds4_kvstore_load(ds4_engine *engine, ds4_session *session, FILE *fp,
+                     const ds4_kvstore_entry *e, uint32_t state_index,
+                     const ds4_kvstore_trailer_hooks *hooks,
+                     char *err, size_t err_len);
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_engine *engine,
                               ds4_session *session,
@@ -196,17 +216,13 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               bool responses_protocol);
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result);
 
-bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
-                             uint32_t *text_bytes);
+/* The file's header and index; e->path and e->sha are the caller's. */
+bool ds4_kvstore_read_index(FILE *fp, ds4_kvstore_entry *e);
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
                                  ds4_kvstore_entry *out);
-void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
-                             uint8_t model_id, uint8_t quant_bits,
-                             uint8_t reason, uint8_t ext_flags,
-                             uint32_t tokens, uint32_t hits, uint32_t ctx_size,
-                             uint64_t created_at, uint64_t last_used,
-                             uint64_t payload_bytes);
-bool ds4_kvstore_touch_file(const char *path, uint32_t hits);
+char *ds4_kvstore_read_text(FILE *fp, const ds4_kvstore_entry *e);
+/* Record a use of the file: its hit count and when (0: now). */
+bool ds4_kvstore_touch_file(const char *path, uint32_t hits, uint64_t used_at);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);
 void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
 char *ds4_kvstore_path_join(const char *dir, const char *name);

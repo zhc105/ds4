@@ -1611,9 +1611,11 @@ saved prompt before the two branches fork.
 
 A Qwen disk checkpoint holds the bf16 K/V rows and block keys up to the
 live length, the live recurrent state, and those saved prompt states, so a
-conversation loaded back from disk keeps its edit resilience.  Size the
-budget for it: about 26 KiB a token plus 112 MB per state, so a 150K
-conversation is 4 GiB and the 4096 MB default holds none of it.
+conversation loaded back from disk keeps its edit resilience.  A
+conversation is one file that grows in place as it is stored again, so
+size the budget per conversation: about 26 KiB a token plus 112 MB per
+state, so a 150K conversation is 4 GiB and the 4096 MB default holds none
+of it.
 
 ```sh
 ./ds4-server --cuda -m gguf/Qwen3.8-Flash-Next-NVFP4.gguf ... \
@@ -1652,40 +1654,50 @@ RAM map keeps up to 100000 IDs by default; tune it with `--tool-memory-max-ids`.
 Use `--disable-exact-dsml-tool-replay` to disable this and fall back to
 canonical JSON-to-DSML rendering.
 
-On disk, a cache file is:
+On disk, a cache file holds one conversation and grows with it:
 
 ```text
 KVC fixed header, 48 bytes
-u32 rendered_text_bytes
-rendered_text_bytes of UTF-8-ish token text
-DS4 session payload, payload_bytes from the KVC header
-optional tool-id map section
+blocks: what every position of the history contributes (K/V rows, block
+        keys), in runs of block_positions positions, written once and
+        appended to as the conversation grows
+tail:   "TAIL", state index, tokens, rendered text, visible-transcript
+        keys, state blobs, optional tool-id map section
 ```
 
 The fixed header is little-endian:
 
 ```text
 0   u8[3]  magic = "KVC"
-3   u8     version = 1
+3   u8     version = 2
 4   u8     routed expert quant bits, currently 2 or 4
-5   u8     save reason: 0 unknown, 1 cold, 2 continued, 3 evict, 4 shutdown
-6   u8     extension flags, bit 0 = appended tool-id map
-7   u8     reserved
-8   u32    cached token count
+5   u8     reason of the last store: 0 unknown, 1 cold, 2 continued, 3 evict, 4 shutdown
+6   u8     extension flags, bit 0 = tool-id map, bits 1-2 = visible-transcript key
+7   u8     model id
+8   u32    token count of the history
 12  u32    hit count
-16  u32    context size the snapshot was written for
-20  u8[4]  reserved
+16  u32    context size the checkpoint was written for
+20  u8     payload ABI, then reserved
 24  u64    creation Unix time
 32  u64    last-used Unix time
-40  u64    DS4 session payload byte count
+40  u64    offset of the tail
 ```
 
-The rendered text is the tokenizer-decoded text for the cached token prefix.
-It is both the human-inspectable prefix and the lookup identity: its SHA1 is
-the filename, and a file is reusable only when those bytes are a prefix of the
-incoming rendered prompt. After load, the exact checkpoint tokens from the DS4
-payload remain authoritative, and only the incoming text suffix after the cached
-bytes is tokenized.
+Each state in the tail's index is a point the session can resume from: the
+recurrent state, logits and drafter bookkeeping at one position for a Qwen
+graph, or the whole checkpoint for a family that keeps no blocks.  A store
+that continues a file (its history is the session's own so far) appends the
+new positions' blocks and rewrites the tail; the live state and the saved
+prompt states go into the index, and the file's first state stays, so the
+anchor of a shared system prompt remains available to other conversations.
+An edited history, a fork or another conversation is a new file, left to
+recency-based eviction.
+
+A state is keyed by the prompt bytes it stands for: the rendered text of the
+history up to its position, or a visible-transcript key of its own.  Lookup
+hashes the incoming prompt's first key_len bytes against every state of every
+file and resumes the longest match; after load the exact checkpoint tokens
+remain authoritative, and only the incoming text after the key is tokenized.
 
 The optional tool-id map is present only when header extension bit 0 is set.
 Appended sections use fixed bit order, so future extension bits can add fields

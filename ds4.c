@@ -58793,6 +58793,16 @@ static uint64_t qwen_session_payload_bytes(ds4_session *s);
 static int qwen_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 static int qwen_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
                                      char *err, size_t errlen);
+#define QWEN_BLOCK_POSITIONS 2048u
+static uint64_t qwen_block_bytes(const ds4_qwen_gpu_graph *g, uint32_t from, uint32_t to);
+static int qwen_block_io(ds4_session *s, FILE *fp, uint32_t from, uint32_t to, uint32_t stored_to,
+                         bool read, char *err, size_t errlen);
+static size_t qwen_session_state_count(ds4_session *s);
+static const qwen_state_copy *qwen_session_saved_state(ds4_session *s, size_t i);
+static uint64_t qwen_state_blob_bytes(ds4_session *s);
+static int qwen_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_t errlen);
+static int qwen_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position, bool live,
+                           char *err, size_t errlen);
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
@@ -59871,6 +59881,134 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     metal_graph_dspark_cache_reset(g);
     return 0;
 #endif
+}
+
+/* Position-major checkpoint pieces (ds4.h).  Only the Qwen graph keeps
+ * blocks; every other family is one state holding its whole payload. */
+static bool session_has_blocks(const ds4_session *s) {
+#ifdef DS4_QWEN_GPU
+    return s && ds4_model_is_qwen() && !ds4_session_is_cpu(s) && !s->distributed;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
+uint32_t ds4_session_block_positions(ds4_session *s) {
+#ifdef DS4_QWEN_GPU
+    if (session_has_blocks(s)) return QWEN_BLOCK_POSITIONS;
+#endif
+    (void)s;
+    return 0;
+}
+
+uint64_t ds4_session_block_bytes(ds4_session *s, uint32_t from, uint32_t to) {
+#ifdef DS4_QWEN_GPU
+    if (session_has_blocks(s)) return qwen_block_bytes(&s->qwen_graph, from, to);
+#endif
+    (void)s;
+    (void)from;
+    (void)to;
+    return 0;
+}
+
+int ds4_session_write_blocks(ds4_session *s, FILE *fp, uint32_t from, uint32_t to,
+                             char *err, size_t errlen) {
+#ifdef DS4_QWEN_GPU
+    if (session_has_blocks(s)) return qwen_block_io(s, fp, from, to, to, false, err, errlen);
+#endif
+    (void)s;
+    (void)fp;
+    (void)from;
+    (void)to;
+    payload_set_err(err, errlen, "this session keeps no checkpoint blocks");
+    return 1;
+}
+
+int ds4_session_read_blocks(ds4_session *s, FILE *fp, uint32_t from, uint32_t to,
+                            uint32_t stored_to, char *err, size_t errlen) {
+#ifdef DS4_QWEN_GPU
+    if (session_has_blocks(s)) {
+        if (from == 0) {
+            if (ds4_gpu_synchronize() == 0) {
+                payload_set_err(err, errlen, "failed to synchronize accelerator before the KV restore");
+                return 1;
+            }
+            s->checkpoint_valid = false;   /* the rows are being overwritten */
+            s->mtp_draft_valid = false;
+        }
+        return qwen_block_io(s, fp, from, to, stored_to, true, err, errlen);
+    }
+#endif
+    (void)s;
+    (void)fp;
+    (void)from;
+    (void)to;
+    (void)stored_to;
+    payload_set_err(err, errlen, "this session keeps no checkpoint blocks");
+    return 1;
+}
+
+size_t ds4_session_state_count(ds4_session *s) {
+    if (!s || !s->checkpoint_valid || s->checkpoint.len <= 0) return 0;
+#ifdef DS4_QWEN_GPU
+    if (session_has_blocks(s)) return qwen_session_state_count(s);
+#endif
+    return 1;
+}
+
+uint32_t ds4_session_state_position(ds4_session *s, size_t i) {
+#ifdef DS4_QWEN_GPU
+    if (session_has_blocks(s) && i > 0) {
+        const qwen_state_copy *c = qwen_session_saved_state(s, i - 1);
+        return c ? (uint32_t)c->tokens.len : 0u;
+    }
+#endif
+    (void)i;
+    return s ? (uint32_t)s->checkpoint.len : 0u;
+}
+
+uint64_t ds4_session_state_bytes(ds4_session *s, size_t i) {
+#ifdef DS4_QWEN_GPU
+    if (session_has_blocks(s)) return qwen_state_blob_bytes(s);
+#endif
+    return i == 0 ? ds4_session_payload_bytes(s) : 0;
+}
+
+int ds4_session_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_t errlen) {
+#ifdef DS4_QWEN_GPU
+    if (session_has_blocks(s)) return qwen_write_state(s, i, fp, err, errlen);
+#endif
+    if (i != 0) {
+        payload_set_err(err, errlen, "this session has no saved states");
+        return 1;
+    }
+    return ds4_session_save_payload(s, fp, err, errlen);
+}
+
+int ds4_session_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position,
+                           uint64_t bytes, bool live, char *err, size_t errlen) {
+#ifdef DS4_QWEN_GPU
+    if (session_has_blocks(s)) {
+        if (bytes != qwen_state_blob_bytes(s)) {
+            payload_set_err(err, errlen, "KV checkpoint state has the wrong size");
+            return 1;
+        }
+        return qwen_read_state(s, fp, tokens, position, live, err, errlen);
+    }
+#endif
+    if (!live) {
+        payload_set_err(err, errlen, "this session has no saved states");
+        return 1;
+    }
+    if (ds4_session_load_payload(s, fp, bytes, err, errlen) != 0) return 1;
+    if (s->checkpoint.len != (int)position ||
+        memcmp(s->checkpoint.v, tokens, (size_t)position * sizeof(int)) != 0) {
+        ds4_session_invalidate(s);
+        payload_set_err(err, errlen, "KV checkpoint state does not match its history");
+        return 1;
+    }
+    return 0;
 }
 
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
@@ -69204,223 +69342,201 @@ static int qwen_session_state_restore(ds4_session *s, const ds4_tokens *prompt) 
     return c->tokens.len;
 }
 
-/* Disk checkpoint of a session: the token list, the K/V rows and block
- * keys of every attention layer (the drafter's slot included) up to the
- * live length, the live recurrent state with its logits, then the saved
- * prompt states whose history is a prefix of the live one, so a session
- * loaded back keeps its ability to resume edited histories; their rows are
- * the live rows.  Header fields: 0 magic, 1 version, 2 ctx, 3 tokens,
- * 4 layers, 5 kv_dim, 6 vocab, 7 state bytes, 8 saved states, 9 drafter
- * present, 10 indexer dim, 11 model variant, 12 drafter pending flag. */
-static uint64_t qwen_payload_layer_bytes(const ds4_qwen_gpu_graph *g, uint32_t il, uint32_t n) {
-    uint64_t bytes = 2ull * n * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;   /* bf16 K and V rows */
-    if (g->bkey[il]) bytes += (uint64_t)(n / g_ds4_compress_ratios[il]) * DS4_N_INDEXER_HEAD_DIM * 2u;
-    return bytes;
-}
-
-/* A copy as long as the live history is the live state itself (a prompt
- * stored before any generation): the load remakes it from the live state.
- * Copies made with pictures stay out: the file is keyed by text alone. */
-static bool qwen_payload_copy_saved(const ds4_session *s, const qwen_state_copy *c) {
-    return c->tokens.len > 0 && c->tokens.len < s->checkpoint.len && c->image_count == 0 &&
-           ds4_tokens_starts_with(&s->checkpoint, &c->tokens);
-}
-
-static uint64_t qwen_session_payload_bytes(ds4_session *s) {
-    ds4_qwen_gpu_graph *g = &s->qwen_graph;
-    const uint32_t n = (uint32_t)s->checkpoint.len;
-    const uint64_t state_bytes = qwen_graph_state_walk(g, NULL, 0);
-    uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) + (uint64_t)n * sizeof(uint32_t);
+/* Disk checkpoint of a session in position-major pieces (ds4.h).  A block
+ * holds the bf16 K and V rows of a run of positions and the block keys
+ * those positions completed, for every attention layer and the drafter's
+ * slot; a state is the drafter's pending flag, the recurrent state and
+ * the logits of one position.  The live state comes first, then the saved
+ * prompt states whose history is a strict prefix of the live one (their
+ * rows are the live rows) and which hold no pictures: the file is keyed by
+ * text alone. */
+static uint64_t qwen_block_bytes(const ds4_qwen_gpu_graph *g, uint32_t from, uint32_t to) {
+    uint64_t bytes = 0;
     for (uint32_t il = 0; il <= DS4_N_LAYER; il++) {
-        if (g->k_cache[il]) bytes += qwen_payload_layer_bytes(g, il, n);
-    }
-    bytes += state_bytes + (uint64_t)DS4_N_VOCAB * sizeof(float);
-    for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
-        const qwen_state_copy *c = &s->qwen_states[i];
-        if (qwen_payload_copy_saved(s, c)) {
-            bytes += 2u * sizeof(uint32_t) + (uint64_t)c->tokens.len * sizeof(uint32_t) +
-                     state_bytes + (uint64_t)DS4_N_VOCAB * sizeof(float);
+        if (!g->k_cache[il]) continue;
+        bytes += 2ull * (to - from) * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+        if (g->bkey[il]) {
+            const uint32_t r = g_ds4_compress_ratios[il];
+            bytes += (uint64_t)(to / r - from / r) * DS4_N_INDEXER_HEAD_DIM * 2u;
         }
     }
     return bytes;
 }
 
-/* One layer's rows in payload order: K, V, then the completed block keys. */
-static int qwen_payload_layer_io(ds4_session *s, FILE *fp, uint32_t il, uint32_t n, uint8_t *buf,
-                                 uint64_t *remaining, char *err, size_t errlen) {
+/* One block's rows, layer by layer: K, V, then the block keys.  A read
+ * takes the rows of [from, to) out of a block the file holds as
+ * [from, stored_to). */
+static int qwen_block_io(ds4_session *s, FILE *fp, uint32_t from, uint32_t to, uint32_t stored_to,
+                         bool read, char *err, size_t errlen) {
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
-    const uint64_t kv_bytes = (uint64_t)n * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
-    const uint64_t bkey_bytes = g->bkey[il] ? (uint64_t)(n / g_ds4_compress_ratios[il]) * DS4_N_INDEXER_HEAD_DIM * 2u : 0u;
-    ds4_gpu_tensor *tensors[3] = { g->k_cache[il], g->v_cache[il], g->bkey[il] };
-    const uint64_t bytes[3] = { kv_bytes, kv_bytes, bkey_bytes };
-    for (int i = 0; i < 3; i++) {
-        if (bytes[i] == 0u) continue;
-        const int rc = remaining
-            ? payload_read_tensor_span(fp, tensors[i], 0, bytes[i], buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen)
-            : payload_write_tensor_span(fp, tensors[i], 0, bytes[i], buf, DS4_SESSION_IO_CHUNK, err, errlen);
-        if (rc != 0) return rc;
-    }
-    return 0;
-}
-
-static int qwen_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
-    ds4_qwen_gpu_graph *g = &s->qwen_graph;
-    const uint32_t n = (uint32_t)s->checkpoint.len;
-    const uint64_t state_bytes = qwen_graph_state_walk(g, NULL, 0);
-    if (n != g->n_tokens || state_bytes == 0u) {
-        payload_set_err(err, errlen, "Qwen session state does not match its checkpoint");
-        return 1;
-    }
-    if (ds4_gpu_synchronize() == 0) {
-        payload_set_err(err, errlen, "failed to synchronize accelerator before the Qwen snapshot");
-        return 1;
-    }
-    uint32_t n_copies = 0;
-    for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) n_copies += qwen_payload_copy_saved(s, &s->qwen_states[i]);
-    const uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
-        DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION, (uint32_t)s->ctx_size, n, DS4_N_LAYER,
-        DS4_N_HEAD_KV * DS4_N_HEAD_DIM, DS4_N_VOCAB, (uint32_t)state_bytes, n_copies, g->mtp ? 1u : 0u,
-        DS4_N_INDEXER_HEAD_DIM, (uint32_t)DS4_MODEL_VARIANT, s->qwen_mtp_pending ? 1u : 0u,
-    };
-    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
-        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
-    }
-    for (uint32_t i = 0; i < n; i++) {
-        if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
-    }
-    ds4_gpu_tensor *state = ds4_gpu_tensor_alloc(state_bytes);
-    if (!state) {
-        payload_set_err(err, errlen, "failed to allocate the Qwen state staging tensor");
-        return 1;
-    }
+    const uint64_t row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+    const uint64_t key = (uint64_t)DS4_N_INDEXER_HEAD_DIM * 2u;
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
     for (uint32_t il = 0; rc == 0 && il <= DS4_N_LAYER; il++) {
-        if (g->k_cache[il]) rc = qwen_payload_layer_io(s, fp, il, n, buf, NULL, err, errlen);
-    }
-    if (rc == 0 && !qwen_graph_state_walk(g, state, 1)) {
-        payload_set_err(err, errlen, "failed to copy the Qwen recurrent state");
-        rc = 1;
-    }
-    if (rc == 0) rc = payload_write_tensor_span(fp, state, 0, state_bytes, buf, DS4_SESSION_IO_CHUNK, err, errlen);
-    if (rc == 0) rc = payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen);
-    for (uint32_t i = 0; rc == 0 && i < QWEN_STATE_COPIES; i++) {
-        const qwen_state_copy *c = &s->qwen_states[i];
-        if (!qwen_payload_copy_saved(s, c)) continue;
-        rc = payload_write_u32(fp, (uint32_t)c->tokens.len, err, errlen);
-        for (int t = 0; rc == 0 && t < c->tokens.len; t++) rc = payload_write_u32(fp, (uint32_t)c->tokens.v[t], err, errlen);
-        if (rc == 0) rc = payload_write_u32(fp, c->mtp_pending ? 1u : 0u, err, errlen);
-        if (rc == 0) rc = payload_write_tensor_span(fp, c->state, 0, state_bytes, buf, DS4_SESSION_IO_CHUNK, err, errlen);
-        if (rc == 0) rc = payload_write_bytes(fp, c->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen);
+        if (!g->k_cache[il]) continue;
+        const uint32_t r = g->bkey[il] ? g_ds4_compress_ratios[il] : 0u;
+        ds4_gpu_tensor *tensors[3] = { g->k_cache[il], g->v_cache[il], g->bkey[il] };
+        const uint64_t offsets[3] = { from * row, from * row, r ? (from / r) * key : 0u };
+        const uint64_t bytes[3] = { (to - from) * row, (to - from) * row, r ? (to / r - from / r) * key : 0u };
+        const uint64_t stored[3] = { (stored_to - from) * row, (stored_to - from) * row,
+                                     r ? (stored_to / r - from / r) * key : 0u };
+        for (int i = 0; rc == 0 && i < 3; i++) {
+            if (stored[i] == 0u) continue;
+            if (!read) {
+                rc = payload_write_tensor_span(fp, tensors[i], offsets[i], bytes[i], buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                continue;
+            }
+            uint64_t remaining = bytes[i];
+            if (bytes[i]) {
+                rc = payload_read_tensor_span(fp, tensors[i], offsets[i], bytes[i], buf, DS4_SESSION_IO_CHUNK,
+                                              &remaining, err, errlen);
+            }
+            if (rc == 0 && stored[i] > bytes[i] && fseeko(fp, (off_t)(stored[i] - bytes[i]), SEEK_CUR) != 0) {
+                payload_set_err(err, errlen, "failed to skip the rest of a KV checkpoint block");
+                rc = 1;
+            }
+        }
     }
     free(buf);
-    ds4_gpu_tensor_free(state);
     return rc;
 }
 
-static int qwen_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
-                                     char *err, size_t errlen) {
+/* The i-th saved prompt state a file can hold. */
+static const qwen_state_copy *qwen_session_saved_state(ds4_session *s, size_t i) {
+    for (uint32_t k = 0; k < QWEN_STATE_COPIES; k++) {
+        const qwen_state_copy *c = &s->qwen_states[k];
+        if (c->tokens.len <= 0 || c->tokens.len >= s->checkpoint.len || c->image_count != 0 ||
+            !qwen_session_kv_holds(s, &c->tokens)) continue;
+        if (i-- == 0) return c;
+    }
+    return NULL;
+}
+
+static size_t qwen_session_state_count(ds4_session *s) {
+    size_t n = 1;
+    while (qwen_session_saved_state(s, n - 1)) n++;
+    return n;
+}
+
+static uint64_t qwen_state_blob_bytes(ds4_session *s) {
+    return sizeof(uint32_t) + qwen_graph_state_walk(&s->qwen_graph, NULL, 0) + (uint64_t)DS4_N_VOCAB * sizeof(float);
+}
+
+static int qwen_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_t errlen) {
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
-    const uint32_t n = h[3];
     const uint64_t state_bytes = qwen_graph_state_walk(g, NULL, 0);
-    if (h[2] > (uint32_t)s->ctx_size || n == 0u || n >= (uint32_t)s->ctx_size) {
-        payload_set_err(err, errlen, "KV checkpoint does not fit current context");
+    const qwen_state_copy *c = i ? qwen_session_saved_state(s, i - 1) : NULL;
+    if (i && !c) {
+        payload_set_err(err, errlen, "no such saved Qwen state");
         return 1;
     }
-    if (h[4] != DS4_N_LAYER || h[5] != DS4_N_HEAD_KV * DS4_N_HEAD_DIM || h[6] != DS4_N_VOCAB ||
-        h[7] != state_bytes || h[9] != (g->mtp ? 1u : 0u) || h[10] != DS4_N_INDEXER_HEAD_DIM ||
-        h[11] != (uint32_t)DS4_MODEL_VARIANT || h[8] > QWEN_STATE_COPIES) {
-        payload_set_err(err, errlen, "KV checkpoint was written for a different Qwen layout");
-        return 1;
-    }
-    token_vec new_checkpoint = {0};
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t tok = 0;
-        if (payload_read_u32(fp, &tok, remaining, err, errlen) != 0) {
-            token_vec_free(&new_checkpoint);
+    ds4_gpu_tensor *state = c ? c->state : NULL;
+    if (!c) {   /* the live state is walked into a staging tensor */
+        if ((uint32_t)s->checkpoint.len != g->n_tokens || state_bytes == 0u) {
+            payload_set_err(err, errlen, "Qwen session state does not match its checkpoint");
             return 1;
         }
-        token_vec_push(&new_checkpoint, (int)tok);
+        if (ds4_gpu_synchronize() == 0) {
+            payload_set_err(err, errlen, "failed to synchronize accelerator before the Qwen snapshot");
+            return 1;
+        }
+        state = ds4_gpu_tensor_alloc(state_bytes);
+        if (!state) {
+            payload_set_err(err, errlen, "failed to allocate the Qwen state staging tensor");
+            return 1;
+        }
+        if (!qwen_graph_state_walk(g, state, 1)) {
+            ds4_gpu_tensor_free(state);
+            payload_set_err(err, errlen, "failed to copy the Qwen recurrent state");
+            return 1;
+        }
     }
-    if (ds4_gpu_synchronize() == 0) {
-        token_vec_free(&new_checkpoint);
-        payload_set_err(err, errlen, "failed to synchronize accelerator before the Qwen KV restore");
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = payload_write_u32(fp, (c ? c->mtp_pending : s->qwen_mtp_pending) ? 1u : 0u, err, errlen);
+    if (rc == 0) rc = payload_write_tensor_span(fp, state, 0, state_bytes, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    if (rc == 0) rc = payload_write_bytes(fp, c ? c->logits : s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen);
+    free(buf);
+    if (!c) ds4_gpu_tensor_free(state);
+    return rc;
+}
+
+/* The live state read back replaces the session's history with
+ * tokens[0..position) (whose rows the caller already read) and retires the
+ * copies; a saved state read back becomes a copy of that history's prefix. */
+static int qwen_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position, bool live,
+                           char *err, size_t errlen) {
+    ds4_qwen_gpu_graph *g = &s->qwen_graph;
+    const uint64_t state_bytes = qwen_graph_state_walk(g, NULL, 0);
+    if (position == 0u || position >= (uint32_t)s->ctx_size) {
+        payload_set_err(err, errlen, "KV checkpoint state does not fit current context");
         return 1;
     }
-    /* from here the graph is being overwritten: the live state and every saved copy are gone */
-    s->checkpoint_valid = false;
-    s->mtp_draft_valid = false;
-    for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
-        s->qwen_states[i].tokens.len = 0;
-        s->qwen_states[i].image_count = 0;
+    qwen_state_copy *c = NULL;
+    if (live) {
+        s->checkpoint_valid = false;
+        s->mtp_draft_valid = false;
+        for (uint32_t k = 0; k < QWEN_STATE_COPIES; k++) {
+            s->qwen_states[k].tokens.len = 0;
+            s->qwen_states[k].image_count = 0;
+        }
+        s->qwen_state_next = 0;
+    } else {
+        if (!s->checkpoint_valid || position >= (uint32_t)s->checkpoint.len ||
+            memcmp(tokens, s->checkpoint.v, (size_t)position * sizeof(int)) != 0) {
+            payload_set_err(err, errlen, "a saved state must be a prefix of the restored live history");
+            return 1;
+        }
+        c = &s->qwen_states[s->qwen_state_next];
+        s->qwen_state_next = (s->qwen_state_next + 1u) % QWEN_STATE_COPIES;
+        c->tokens.len = 0;
+        free(c->images);
+        c->images = NULL;
+        c->image_count = 0;
+        if (!c->state) {
+            c->state = ds4_gpu_tensor_alloc(state_bytes);
+            if (!c->state) {
+                payload_set_err(err, errlen, "failed to allocate a Qwen saved state");
+                return 1;
+            }
+            c->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        }
     }
-    ds4_gpu_tensor *state = ds4_gpu_tensor_alloc(state_bytes);
+    ds4_gpu_tensor *state = c ? c->state : ds4_gpu_tensor_alloc(state_bytes);
     if (!state) {
-        token_vec_free(&new_checkpoint);
         payload_set_err(err, errlen, "failed to allocate the Qwen state staging tensor");
         return 1;
     }
+    uint64_t remaining = qwen_state_blob_bytes(s);
+    uint32_t pending = 0;
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-    int rc = 0;
-    for (uint32_t il = 0; rc == 0 && il <= DS4_N_LAYER; il++) {
-        if (g->k_cache[il]) rc = qwen_payload_layer_io(s, fp, il, n, buf, remaining, err, errlen);
+    int rc = payload_read_u32(fp, &pending, &remaining, err, errlen);
+    if (rc == 0) rc = payload_read_tensor_span(fp, state, 0, state_bytes, buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+    if (rc == 0) rc = payload_read_bytes(fp, c ? c->logits : s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), &remaining, err, errlen);
+    free(buf);
+    if (c) {
+        if (rc != 0) return 1;
+        for (uint32_t t = 0; t < position; t++) token_vec_push(&c->tokens, tokens[t]);
+        c->mtp_pending = pending != 0u;
+        return 0;
     }
-    if (rc == 0) rc = payload_read_tensor_span(fp, state, 0, state_bytes, buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
     if (rc == 0 && !qwen_graph_state_walk(g, state, -1)) {
         payload_set_err(err, errlen, "failed to restore the Qwen recurrent state");
         rc = 1;
     }
-    if (rc == 0) rc = payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), remaining, err, errlen);
-    for (uint32_t i = 0; rc == 0 && i < h[8]; i++) {
-        qwen_state_copy *c = &s->qwen_states[i];
-        uint32_t len = 0, pending = 0;
-        rc = payload_read_u32(fp, &len, remaining, err, errlen);
-        if (rc == 0 && (len == 0u || len > n)) {
-            payload_set_err(err, errlen, "KV checkpoint saved state has an invalid length");
-            rc = 1;
-        }
-        for (uint32_t t = 0; rc == 0 && t < len; t++) {
-            uint32_t tok = 0;
-            rc = payload_read_u32(fp, &tok, remaining, err, errlen);
-            if (rc == 0) token_vec_push(&c->tokens, (int)tok);
-        }
-        if (rc == 0) rc = payload_read_u32(fp, &pending, remaining, err, errlen);
-        if (rc == 0 && !c->state) {
-            c->state = ds4_gpu_tensor_alloc(state_bytes);
-            if (!c->state) {
-                payload_set_err(err, errlen, "failed to allocate a Qwen saved state");
-                rc = 1;
-            } else {
-                c->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-            }
-        }
-        if (rc == 0) rc = payload_read_tensor_span(fp, c->state, 0, state_bytes, buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
-        if (rc == 0) rc = payload_read_bytes(fp, c->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), remaining, err, errlen);
-        if (rc == 0) c->mtp_pending = pending != 0u;
-        else c->tokens.len = 0;
-    }
-    free(buf);
     ds4_gpu_tensor_free(state);
-    if (rc == 0 && *remaining != 0u) {
-        payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
-        rc = 1;
-    }
     if (rc == 0 && ds4_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "failed to synchronize accelerator after the Qwen KV restore");
         rc = 1;
     }
-    if (rc != 0) {
-        token_vec_free(&new_checkpoint);
-        return 1;
-    }
-    token_vec_free(&s->checkpoint);
-    s->checkpoint = new_checkpoint;
-    s->qwen_state_next = h[8] % QWEN_STATE_COPIES;
-    g->n_tokens = n;
+    if (rc != 0) return 1;
+    s->checkpoint.len = 0;
+    for (uint32_t t = 0; t < position; t++) token_vec_push(&s->checkpoint, tokens[t]);
+    g->n_tokens = position;
     s->qwen_kv_tokens.len = 0;
-    qwen_session_kv_note(s, 0, s->checkpoint.v, (int)n);
+    qwen_session_kv_note(s, 0, s->checkpoint.v, (int)position);
     qwen_session_ple_prev(s);
-    s->qwen_mtp_pending = h[12] != 0u;
+    s->qwen_mtp_pending = pending != 0u;
     s->qwen_mtp_draft = -1;
     s->checkpoint_valid = true;
     if (!qwen_session_state_save(s)) {   /* the prompt's own copy, if the live state still is one */
@@ -69428,6 +69544,81 @@ static int qwen_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h
         return 1;
     }
     return 0;
+}
+
+/* The whole checkpoint as one payload (ds4_session_save_payload): the
+ * pieces above in order, after a header of 0 magic, 1 version, 2 ctx,
+ * 3 tokens, 4 layers, 5 kv_dim, 6 vocab, 7 state bytes, 8 saved states,
+ * 9 drafter present, 10 indexer dim, 11 model variant, 12 unused. */
+static uint64_t qwen_session_payload_bytes(ds4_session *s) {
+    const uint32_t n = (uint32_t)s->checkpoint.len;
+    const size_t states = qwen_session_state_count(s);
+    return (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) + (uint64_t)n * sizeof(uint32_t) +
+           qwen_block_bytes(&s->qwen_graph, 0, n) + states * qwen_state_blob_bytes(s) +
+           (states - 1) * sizeof(uint32_t);
+}
+
+static int qwen_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    ds4_qwen_gpu_graph *g = &s->qwen_graph;
+    const uint32_t n = (uint32_t)s->checkpoint.len;
+    const size_t states = qwen_session_state_count(s);
+    const uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION, (uint32_t)s->ctx_size, n, DS4_N_LAYER,
+        DS4_N_HEAD_KV * DS4_N_HEAD_DIM, DS4_N_VOCAB, (uint32_t)qwen_graph_state_walk(g, NULL, 0),
+        (uint32_t)(states - 1), g->mtp ? 1u : 0u, DS4_N_INDEXER_HEAD_DIM, (uint32_t)DS4_MODEL_VARIANT, 0u,
+    };
+    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
+    }
+    int rc = qwen_block_io(s, fp, 0, n, n, false, err, errlen);
+    for (size_t i = 0; rc == 0 && i < states; i++) {
+        if (i) rc = payload_write_u32(fp, (uint32_t)qwen_session_saved_state(s, i - 1)->tokens.len, err, errlen);
+        if (rc == 0) rc = qwen_write_state(s, i, fp, err, errlen);
+    }
+    return rc;
+}
+
+static int qwen_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
+                                     char *err, size_t errlen) {
+    ds4_qwen_gpu_graph *g = &s->qwen_graph;
+    const uint32_t n = h[3];
+    if (h[2] > (uint32_t)s->ctx_size || n == 0u || n >= (uint32_t)s->ctx_size) {
+        payload_set_err(err, errlen, "KV checkpoint does not fit current context");
+        return 1;
+    }
+    if (h[4] != DS4_N_LAYER || h[5] != DS4_N_HEAD_KV * DS4_N_HEAD_DIM || h[6] != DS4_N_VOCAB ||
+        h[7] != qwen_graph_state_walk(g, NULL, 0) || h[9] != (g->mtp ? 1u : 0u) ||
+        h[10] != DS4_N_INDEXER_HEAD_DIM || h[11] != (uint32_t)DS4_MODEL_VARIANT || h[8] > QWEN_STATE_COPIES) {
+        payload_set_err(err, errlen, "KV checkpoint was written for a different Qwen layout");
+        return 1;
+    }
+    const uint64_t blob = qwen_state_blob_bytes(s);
+    const uint64_t body = (uint64_t)n * sizeof(uint32_t) + qwen_block_bytes(g, 0, n) +
+                          (h[8] + 1u) * blob + (uint64_t)h[8] * sizeof(uint32_t);
+    if (*remaining != body) {
+        payload_set_err(err, errlen, "KV checkpoint payload has the wrong size");
+        return 1;
+    }
+    int *tokens = xmalloc((size_t)n * sizeof(int));
+    int rc = 0;
+    for (uint32_t i = 0; rc == 0 && i < n; i++) {
+        uint32_t tok = 0;
+        rc = payload_read_u32(fp, &tok, remaining, err, errlen);
+        tokens[i] = (int)tok;
+    }
+    if (rc == 0) rc = ds4_session_read_blocks(s, fp, 0, n, n, err, errlen);
+    if (rc == 0) rc = qwen_read_state(s, fp, tokens, n, true, err, errlen);
+    for (uint32_t i = 0; rc == 0 && i < h[8]; i++) {
+        uint32_t len = 0;
+        rc = payload_read_u32(fp, &len, remaining, err, errlen);
+        if (rc == 0) rc = qwen_read_state(s, fp, tokens, len, false, err, errlen);
+    }
+    free(tokens);
+    *remaining = 0;
+    return rc;
 }
 
 static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
