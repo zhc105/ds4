@@ -11090,37 +11090,54 @@ static bool build_prompt_after_live(server *s, server_slot *slot, request *req,
     return true;
 }
 
+static void append_tokens_text(buf *b, ds4_engine *engine,
+                               const ds4_tokens *tokens, int from, int to) {
+    const ds4_tokens span = { tokens->v + from, to - from, 0 };
+    size_t len = 0;
+    char *text = render_tokens_text(engine, &span, &len);
+    buf_append(b, text, len);
+    free(text);
+}
+
 /* Continue the live graph from its own text.  The live tokenization is
  * authoritative (sampled tokens need not be what BPE makes of their text),
  * so the request's text is compared byte-wise against the text of the live
  * tokens and only the bytes past the live end are tokenized: the request's
- * own token suffix may have merged across that boundary.  With images in
- * the live prefix the tokens through the last of them are equal (`common`)
- * and the comparison starts after its block. */
+ * own token suffix may have merged across that boundary.  The live text
+ * spells its pictures the way the request does, as their markers: a
+ * picture's block has the same shape wherever it sits, so the request's
+ * block tells where the live one starts and ends. */
 static int live_text_prefix_prompt(server *s, server_slot *slot,
-                                   request *req, int common,
-                                   ds4_tokens *effective_prompt) {
+                                   request *req, ds4_tokens *effective_prompt) {
     if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len <= 0) return 0;
     if (!ds4_session_vision_prefix_matches(slot->session, req->images,
                                            req->image_count)) return 0;
-    const size_t live_images = ds4_session_vision_image_count(slot->session);
-    const request_image_place *last =
-        live_images ? &req->image_places[live_images - 1] : NULL;
-    const int base_tok = last ? last->block_end : 0;
-    const size_t base_txt = last ? last->text_end : 0;
-    if (common < base_tok) return 0;
 
-    const ds4_tokens live_tail = { live_tokens->v + base_tok,
-                                   live_tokens->len - base_tok, 0 };
-    size_t live_text_len = 0;
-    char *live_text = render_tokens_text(s->engine, &live_tail, &live_text_len);
-    const char *text = req->prompt_text + base_txt;
-    const bool ok = byte_prefix_match(text, strlen(text), live_text, live_text_len);
-    free(live_text);
-    if (!ok || !build_prompt_after_live(s, slot, req, live_tokens,
-                                        base_txt + live_text_len, effective_prompt)) {
+    buf live = {0};
+    int cursor = 0;
+    for (size_t i = 0; i < ds4_session_vision_image_count(slot->session); i++) {
+        const request_image_place *place = &req->image_places[i];
+        const int start = (int)ds4_session_vision_image_start(slot->session, i) -
+                          ((int)req->images[i].token_start - place->block_start);
+        const int end = start + (place->block_end - place->block_start);
+        if (start < cursor || end > live_tokens->len) {
+            buf_free(&live);
+            return 0;
+        }
+        append_tokens_text(&live, s->engine, live_tokens, cursor, start);
+        buf_append(&live, req->prompt_text + place->text_start,
+                   place->text_end - place->text_start);
+        cursor = end;
+    }
+    append_tokens_text(&live, s->engine, live_tokens, cursor, live_tokens->len);
+    const bool ok = byte_prefix_match(req->prompt_text, strlen(req->prompt_text),
+                                      live.ptr, live.len);
+    const size_t offset = live.len;
+    buf_free(&live);
+    if (!ok || !build_prompt_after_live(s, slot, req, live_tokens, offset,
+                                        effective_prompt)) {
         return 0;
     }
     return live_tokens->len;
@@ -12893,7 +12910,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
     if (cached == 0) {
-        int text_cached = live_text_prefix_prompt(s, slot, &j->req, common,
+        int text_cached = live_text_prefix_prompt(s, slot, &j->req,
                                                   &effective_prompt);
         if (text_cached > 0) {
             cached = text_cached;
