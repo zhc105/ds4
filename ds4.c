@@ -16311,7 +16311,10 @@ static void qwen_forward_token(
         const ds4_weights *w,
         ds4_qwen_state  *st,
         int                token,
-        uint32_t           pos) {
+        uint32_t           pos,
+        const float       *steering_dirs,
+        float              steering_attn_scale,
+        float              steering_ffn_scale) {
     if (pos >= st->ctx) ds4_die("qwen: token position exceeds the session context");
     float *x = st->x;
     float *h = st->h;
@@ -16334,6 +16337,7 @@ static void qwen_forward_token(
             const uint32_t n_sel = qwen_attention_cells(st, m, l, ls, il, h, pos);
             qwen_attention_forward(y, m, l, ls, st, h, pos, st->sel, n_sel);
         }
+        cpu_directional_steering_project_rows(y, steering_dirs, il, 1, steering_attn_scale);
         qwen_sublayer_out(st, y);
         qwen_sublayer_in(st, m, l->post_attention_norm, &l->hc_mix_ffn);
         if (ds4_qwen_is_moe()) {
@@ -16341,6 +16345,7 @@ static void qwen_forward_token(
         } else {
             qwen_ffn_forward(y, m, l, st, h);
         }
+        cpu_directional_steering_project_rows(y, steering_dirs, il, 1, steering_ffn_scale);
         qwen_sublayer_out(st, y);
         /* DS4_QWEN_TRACE=1: per-layer norms to locate a divergence against
          * tests/qwen_flash_next_ref.py, which prints the same line. */
@@ -16480,6 +16485,12 @@ typedef struct {
      * whose rows replace the token embeddings (qwen_graph_overlay_images). */
     const ds4_vision_span *images;
     size_t image_count;
+    /* Directional steering (see qwen_graph_apply_steering): one normalized
+     * DS4_N_EMBD-wide direction per layer, uploaded once from
+     * --dir-steering-file, plus the scales the engine was given. */
+    ds4_gpu_tensor *steering_dirs;
+    float steering_attn_scale;
+    float steering_ffn_scale;
 } ds4_qwen_gpu_graph;
 
 /* Tokens the QSA select kernel scores concurrently, each with its own row
@@ -16504,7 +16515,7 @@ static void qwen_graph_free(ds4_qwen_gpu_graph *g) {
                                    &g->xn, &g->xn_bf16, &g->lo, &g->hgate, &g->inject, &g->emb, &g->pkey, &g->pval, &g->pnorm,
                                    &g->ple_hist, &g->router, &g->esel, &g->selw, &g->eg, &g->eu, &g->ed, &g->sg,
                                    &g->eorder, &g->eplan, &g->hq, &g->egq, &g->ikraw, &g->iq, &g->sel, &g->n_sel, &g->skeys,
-                                   &g->mtp_hid, &g->mtp_pend, &g->mtp_khist };
+                                   &g->mtp_hid, &g->mtp_pend, &g->mtp_khist, &g->steering_dirs };
     for (size_t i = 0; i < sizeof(scratch) / sizeof(scratch[0]); i++) {
         if (*scratch[i]) ds4_gpu_tensor_free(*scratch[i]);
     }
@@ -16533,6 +16544,39 @@ static ds4_gpu_tensor *qwen_graph_tensor(uint64_t elems, bool *ok) {
     ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(elems * sizeof(float));
     if (!t) *ok = false;
     return t;
+}
+
+/* Upload --dir-steering-file into the Qwen graph.  The DeepSeek/GLM loader
+ * replicates across a placement's tiers; the Qwen graph has no placement, so
+ * one buffer holds all layers. */
+static bool qwen_graph_load_directional_steering(
+        ds4_qwen_gpu_graph *g,
+        const char         *path,
+        float               attn_scale,
+        float               ffn_scale) {
+    g->steering_attn_scale = attn_scale;
+    g->steering_ffn_scale = ffn_scale;
+    if (attn_scale == 0.0f && ffn_scale == 0.0f) return true;
+    if (!path || !path[0]) {
+        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
+        return false;
+    }
+    const uint32_t n_layers = directional_steering_layer_count();
+    if (n_layers == 0) return false;
+    const uint64_t n = (uint64_t)n_layers * DS4_N_EMBD;
+    float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
+    const bool read_ok = read_f32_binary_file(path, dirs, n);
+    if (read_ok) g->steering_dirs = ds4_gpu_tensor_alloc(n * sizeof(dirs[0]));
+    const bool ok = read_ok && g->steering_dirs &&
+                    ds4_gpu_tensor_write(g->steering_dirs, 0, dirs, n * sizeof(dirs[0])) != 0;
+    free(dirs);
+    if (!ok) {
+        fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
+        return false;
+    }
+    fprintf(stderr, "ds4: directional steering enabled: %s attn=%g ffn=%g\n",
+            path, (double)attn_scale, (double)ffn_scale);
+    return true;
 }
 
 static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_rows, uint32_t spec_rows) {
@@ -16919,6 +16963,26 @@ static bool qwen_graph_qsa_select(
 /* The token mixer's output projection through the end of the layer:
  * residual, then the FFN sub-layer (routed and shared experts, or the 2B's
  * dense FFN), then the residual again with the next layer's norm folded in. */
+/* Defined with the diagnostic hooks further down; the Qwen graph dumps its
+ * activations through the same helper so build_direction.py works unchanged. */
+static void metal_graph_debug_dump_tensor(const char *name, ds4_gpu_tensor *t,
+                                          uint64_t n_f32, uint32_t il, uint32_t pos);
+
+/* Directional steering: y -= scale * dir[il] * dot(dir[il], y).  The
+ * direction is DS4_N_EMBD wide and the edit lands on the sub-layer output,
+ * before the hyper-connection combine spreads it into the wide residual:
+ * the same place the DeepSeek and GLM graphs steer. */
+static bool qwen_graph_apply_steering(
+        ds4_qwen_gpu_graph *g,
+        ds4_gpu_tensor     *y,
+        uint32_t            il,
+        uint32_t            rows,
+        float               scale) {
+    if (!g || !g->steering_dirs || scale == 0.0f) return true;
+    return ds4_gpu_directional_steering_project_tensor(y, g->steering_dirs, il,
+                                                       DS4_N_EMBD, rows, scale) != 0;
+}
+
 static bool qwen_graph_layer_tail(
         ds4_qwen_gpu_graph    *g,
         const ds4_model         *m,
@@ -16926,8 +16990,10 @@ static bool qwen_graph_layer_tail(
         const ds4_layer_weights *next,
         const ds4_tensor        *out_proj,
         ds4_gpu_tensor          *att_bf16,
+        uint32_t                 il,
         uint32_t                 n) {
     bool ok = qwen_graph_matmul_bf16(g->y, m, out_proj, g->att, att_bf16, n);
+    if (ok) ok = qwen_graph_apply_steering(g, g->y, il, n, g->steering_attn_scale);
     if (ok) ok = qwen_graph_sublayer_out(g, m, &l->hc_mix_ffn, n);
     if (ok) ok = qwen_graph_sublayer_in(g, m, l->post_attention_norm, &l->hc_mix_ffn, n);
     if (ds4_qwen_is_moe()) {
@@ -16938,6 +17004,7 @@ static bool qwen_graph_layer_tail(
         if (ok) ok = ds4_gpu_swiglu_tensor(g->mixed, g->mixed, g->z, n * DS4_N_FF_DENSE, 0.0f, 1.0f) != 0;
         if (ok) ok = qwen_graph_matmul(g->y, m, l->ffn_down, g->mixed, n);
     }
+    if (ok) ok = qwen_graph_apply_steering(g, g->y, il, n, g->steering_ffn_scale);
     return ok && qwen_graph_sublayer_out(g, m, next ? &next->hc_mix_attn : NULL, n);
 }
 
@@ -16957,7 +17024,7 @@ static bool qwen_graph_layer_island(
         ds4_gpu_tensor          *att_bf16,
         uint32_t                 n) {
     bool ok = true;
-    if (island == 1u) return qwen_graph_layer_tail(g, m, l, next, l->attn_output, att_bf16, n);
+    if (island == 1u) return qwen_graph_layer_tail(g, m, l, next, l->attn_output, att_bf16, il, n);
     if (ds4_qwen_layer_has_ple(il)) ok = qwen_graph_ple(g, m, l, n);
     if (ok) ok = qwen_graph_sublayer_in(g, m, l->attn_norm, &l->hc_mix_attn, n);
     if (!ds4_qwen_layer_is_gdn(il)) {
@@ -16977,7 +17044,7 @@ static bool qwen_graph_layer_island(
                                     DS4_N_KDA_HEAD, DS4_N_KDA_V_HEAD, DS4_N_KDA_CONV,
                                     n, DS4_MODEL_VARIANT == DS4_VARIANT_QWEN4EXP, DS4_RMS_EPS,
                                     g->snapshot ? g->snap_ssm[il] : NULL, g->snapshot ? g->snap_conv[il] : NULL) != 0;
-    return ok && qwen_graph_layer_tail(g, m, l, next, l->ssm_out, att_bf16, n);
+    return ok && qwen_graph_layer_tail(g, m, l, next, l->ssm_out, att_bf16, il, n);
 }
 
 /* Run an island: for a single-token step through the decode graph cache
@@ -17032,7 +17099,11 @@ static bool qwen_graph_layer(
     if (trace < 0) trace = getenv("DS4_QWEN_TRACE") != NULL;
     /* decode-sized passes replay captured graphs: one variant per row count
      * and snapshot mode, since both are baked into the launches */
-    const bool graphs = n <= 8u && !trace && ds4_gpu_decode_graphs_supported();
+    /* A dump synchronizes and restarts the command batch, which replaying a
+     * captured decode graph cannot express, so requesting one disables them. */
+    const bool graphs = n <= 8u && !trace && ds4_gpu_decode_graphs_supported() &&
+                        getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL &&
+                        getenv("DS4_ROCM_GRAPH_DUMP_PREFIX") == NULL;
     bool ok = qwen_graph_layer_run_island(g, m, l, next, il, 0u, att_bf16, n, graphs);
     if (ok && !ds4_qwen_layer_is_gdn(il)) {
         const bool sparse = qwen_graph_qsa_select(g, m, l, il, n, pos0, &ok);
@@ -17046,6 +17117,9 @@ static bool qwen_graph_layer(
                                               g->ctx, pos0, n, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) != 0;
         if (ok) ok = qwen_graph_layer_run_island(g, m, l, next, il, 1u, att_bf16, n, graphs);
     }
+    /* DS4_METAL_GRAPH_DUMP_NAME=ffn_out: this layer's FFN output, the
+     * activation dir-steering/tools/build_direction.py extracts from. */
+    if (ok) metal_graph_debug_dump_tensor("ffn_out", g->y, DS4_N_EMBD, il, pos0);
     /* DS4_QWEN_TRACE=1: the CPU reference's per-layer norms for the chunk's
      * last row, to locate a divergence by layer and position. */
     if (ok && getenv("DS4_QWEN_TRACE")) {
@@ -67534,6 +67608,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s);
             return 1;
         }
+        if (!qwen_graph_load_directional_steering(&s->qwen_graph,
+                                                  e->directional_steering_file,
+                                                  e->directional_steering_attn_scale,
+                                                  e->directional_steering_ffn_scale)) {
+            qwen_graph_free(&s->qwen_graph);
+            free(s);
+            return 1;
+        }
         s->prefill_cap = rows;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
@@ -70114,7 +70196,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 }
                 qwen_forward_token(dump || i + 1 == prompt->len ? s->logits : NULL,
                                      &e->model, &e->weights, &s->qwen_state,
-                                     prompt->v[i], (uint32_t)i);
+                                     prompt->v[i], (uint32_t)i,
+                                     e->directional_steering_dirs,
+                                     e->directional_steering_attn_scale,
+                                     e->directional_steering_ffn_scale);
                 if (dump) fwrite(s->logits, sizeof(float), DS4_N_VOCAB, dump);
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
@@ -72000,7 +72085,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         ds4_engine *e = s->engine;
         if (ds4_model_is_qwen()) {
             qwen_forward_token(s->logits, &e->model, &e->weights, &s->qwen_state,
-                                 token, (uint32_t)s->checkpoint.len);
+                                 token, (uint32_t)s->checkpoint.len,
+                                 e->directional_steering_dirs,
+                                 e->directional_steering_attn_scale,
+                                 e->directional_steering_ffn_scale);
             token_vec_push(&s->checkpoint, token);
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;

@@ -23,6 +23,10 @@ from pathlib import Path
 MODEL_PROFILES = {
     "deepseek-v4-flash": (43, 4096),
     "glm-5.3-flash": (45, 4096),
+    # (n_layers, n_embd): the Qwen family (3.5-2B and 3.8-Flash-Next) has no
+    # trailing MTP block in the layer count, so every layer carries a direction.
+    "qwen3.8-flash-next": (48, 2560),
+    "qwen3.5-2b": (24, 2048),
 }
 
 
