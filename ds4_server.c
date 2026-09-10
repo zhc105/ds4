@@ -854,10 +854,12 @@ static bool responses_live_has_call_id(server *s, const char *id);
 static bool anthropic_live_has_call_id(server *s, const char *id);
 
 /* Where an image sits in a request: its marker's bytes in prompt_text and
- * its placeholder block's tokens in prompt. */
+ * its placeholder block's tokens in prompt (the span inside the block
+ * starts at span_start; the block has the same shape wherever the picture
+ * sits, so a state that holds it has its block at the same offsets). */
 typedef struct {
     size_t text_start, text_end;
-    int block_start, block_end;
+    int block_start, block_end, span_start;
 } request_image_place;
 
 typedef struct {
@@ -3571,6 +3573,7 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
             break;
         }
         place->block_end = r->prompt.len;
+        place->span_start = (int)r->images[i].token_start;
         r->image_count++;
         cursor = marker + strlen(inputs[i]->marker);
     }
@@ -11057,36 +11060,36 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                                   req && req->api == API_RESPONSES);
 }
 
-/* The effective prompt of a request continued from the live tokens: those
- * tokens, then the request's text from byte `offset` on.  The live prefix
- * holds the request's first pictures (the caller checked their identity),
- * so the markers of the others must lie past the offset; the request's
- * tokens from its first new image on are kept as tokenized, shifted by what
- * retokenizing the text before them changed.  The request's image spans
- * then describe the effective prompt: the live pictures where the live
- * tokens hold them, the new ones after the shift. */
-static bool build_prompt_after_live(server *s, server_slot *slot, request *req,
-                                    const ds4_tokens *live_tokens, size_t offset,
-                                    ds4_tokens *out) {
-    const size_t live_images = ds4_session_vision_image_count(slot->session);
+/* The effective prompt of a request continued from a state's tokens (the
+ * live history or a saved one): those tokens, then the request's text from
+ * byte `offset` on.  The state holds the request's first pictures (the
+ * caller checked their identity), so the markers of the others must lie
+ * past the offset; the request's tokens from its first new image on are
+ * kept as tokenized, shifted by what retokenizing the text before them
+ * changed.  The request's image spans then describe the effective prompt:
+ * the state's pictures where its tokens hold them, the new ones after the
+ * shift. */
+static bool build_prompt_after_state(server *s, request *req,
+                                     const ds4_vision_identity *ids, size_t n_ids,
+                                     const ds4_tokens *tokens, size_t offset,
+                                     ds4_tokens *out) {
     const request_image_place *next =
-        live_images < req->image_count ? &req->image_places[live_images] : NULL;
+        n_ids < req->image_count ? &req->image_places[n_ids] : NULL;
     if (next && next->text_start < offset) return false;
-    for (size_t i = 0; i < live_images; i++)
-        req->images[i].token_start = ds4_session_vision_image_start(slot->session, i);
+    for (size_t i = 0; i < n_ids; i++) req->images[i].token_start = ids[i].token_start;
     if (!next) {
         build_prompt_from_exact_prefix_and_text_suffix(
-            s->engine, live_tokens, req->prompt_text + offset, out);
+            s->engine, tokens, req->prompt_text + offset, out);
         return true;
     }
     char *between = xstrndup(req->prompt_text + offset, next->text_start - offset);
-    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live_tokens, between, out);
+    build_prompt_from_exact_prefix_and_text_suffix(s->engine, tokens, between, out);
     free(between);
     const int shift = out->len - next->block_start;
     for (int i = next->block_start; i < req->prompt.len; i++)
         ds4_tokens_push(out, req->prompt.v[i]);
-    for (size_t i = live_images; i < req->image_count; i++)
-        req->images[i].token_start = (uint32_t)((int)req->images[i].token_start + shift);
+    for (size_t i = n_ids; i < req->image_count; i++)
+        req->images[i].token_start = (uint32_t)(req->image_places[i].span_start + shift);
     return true;
 }
 
@@ -11099,48 +11102,80 @@ static void append_tokens_text(buf *b, ds4_engine *engine,
     free(text);
 }
 
-/* Continue the live graph from its own text.  The live tokenization is
- * authoritative (sampled tokens need not be what BPE makes of their text),
- * so the request's text is compared byte-wise against the text of the live
- * tokens and only the bytes past the live end are tokenized: the request's
- * own token suffix may have merged across that boundary.  The live text
- * spells its pictures the way the request does, as their markers: a
- * picture's block has the same shape wherever it sits, so the request's
- * block tells where the live one starts and ends. */
-static int live_text_prefix_prompt(server *s, server_slot *slot,
-                                   request *req, ds4_tokens *effective_prompt) {
-    if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
-    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
-    if (!live_tokens || live_tokens->len <= 0) return 0;
-    if (!ds4_session_vision_prefix_matches(slot->session, req->images,
-                                           req->image_count)) return 0;
+/* Continue a state (the live history or a saved one) from its own text.
+ * The state's tokenization is authoritative (sampled tokens need not be
+ * what BPE makes of their text), so the request's text is compared
+ * byte-wise against the text of the state's tokens and only the bytes past
+ * its end are tokenized: the request's own token suffix may have merged
+ * across that boundary.  The state's text spells its pictures the way the
+ * request does, as their markers, at the block offsets the request's own
+ * copy of the picture has.  Returns the state's length on a match, with
+ * the effective prompt built. */
+static int state_text_prefix_prompt(server *s, request *req,
+                                    const ds4_tokens *tokens,
+                                    const ds4_vision_identity *ids, size_t n_ids,
+                                    ds4_tokens *effective_prompt) {
+    if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
+    if (!tokens || tokens->len <= 0) return 0;
+    if (!ds4_vision_identities_prefix(ids, n_ids, req->images, req->image_count)) return 0;
 
-    buf live = {0};
+    buf text = {0};
     int cursor = 0;
-    for (size_t i = 0; i < ds4_session_vision_image_count(slot->session); i++) {
+    for (size_t i = 0; i < n_ids; i++) {
         const request_image_place *place = &req->image_places[i];
-        const int start = (int)ds4_session_vision_image_start(slot->session, i) -
-                          ((int)req->images[i].token_start - place->block_start);
+        const int start = (int)ids[i].token_start - (place->span_start - place->block_start);
         const int end = start + (place->block_end - place->block_start);
-        if (start < cursor || end > live_tokens->len) {
-            buf_free(&live);
+        if (start < cursor || end > tokens->len) {
+            buf_free(&text);
             return 0;
         }
-        append_tokens_text(&live, s->engine, live_tokens, cursor, start);
-        buf_append(&live, req->prompt_text + place->text_start,
+        append_tokens_text(&text, s->engine, tokens, cursor, start);
+        buf_append(&text, req->prompt_text + place->text_start,
                    place->text_end - place->text_start);
         cursor = end;
     }
-    append_tokens_text(&live, s->engine, live_tokens, cursor, live_tokens->len);
+    append_tokens_text(&text, s->engine, tokens, cursor, tokens->len);
     const bool ok = byte_prefix_match(req->prompt_text, strlen(req->prompt_text),
-                                      live.ptr, live.len);
-    const size_t offset = live.len;
-    buf_free(&live);
-    if (!ok || !build_prompt_after_live(s, slot, req, live_tokens, offset,
-                                        effective_prompt)) {
+                                      text.ptr, text.len);
+    const size_t offset = text.len;
+    buf_free(&text);
+    if (!ok || !build_prompt_after_state(s, req, ids, n_ids, tokens, offset,
+                                         effective_prompt)) {
         return 0;
     }
-    return live_tokens->len;
+    return tokens->len;
+}
+
+static int live_text_prefix_prompt(server *s, server_slot *slot,
+                                   request *req, ds4_tokens *effective_prompt) {
+    size_t n_ids = 0;
+    const ds4_vision_identity *ids = ds4_session_vision_identities(slot->session, &n_ids);
+    return state_text_prefix_prompt(s, req, ds4_session_tokens(slot->session),
+                                    ids, n_ids, effective_prompt);
+}
+
+/* The longest saved turn-boundary state whose text begins the request:
+ * the engine restores it when it finds the state's tokens at the start of
+ * the prompt, so the effective prompt is built on them. */
+static int saved_state_text_prefix_prompt(server *s, server_slot *slot,
+                                          request *req, ds4_tokens *effective_prompt) {
+    int best = 0;
+    const ds4_tokens *saved;
+    const ds4_vision_identity *ids;
+    size_t n_ids;
+    for (size_t i = 0; (saved = ds4_session_saved_state(slot->session, i, &ids, &n_ids)); i++) {
+        if (saved->len <= best) continue;
+        ds4_tokens candidate = {0};
+        const int n = state_text_prefix_prompt(s, req, saved, ids, n_ids, &candidate);
+        if (n > best) {
+            ds4_tokens_free(effective_prompt);
+            *effective_prompt = candidate;
+            best = n;
+        } else {
+            ds4_tokens_free(&candidate);
+        }
+    }
+    return best;
 }
 
 /* Tool-output-only Responses continuation.
@@ -11280,8 +11315,10 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
 
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
-    if (!build_prompt_after_live(s, slot, req, live_tokens, visible_len,
-                                 effective_prompt)) {
+    size_t n_ids = 0;
+    const ds4_vision_identity *ids = ds4_session_vision_identities(slot->session, &n_ids);
+    if (!build_prompt_after_state(s, req, ids, n_ids, live_tokens, visible_len,
+                                  effective_prompt)) {
         return 0;
     }
     return live_tokens->len;
@@ -12919,13 +12956,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
     }
     if (cached == 0) {
-        /* The engine resumes an edited history from the state it saved after
-         * an earlier prompt; only the accounting happens here. */
-        const int resumable = ds4_session_resumable_prefix(
-            slot->session, prompt_for_sync, j->req.images, j->req.image_count);
+        /* An edited history resumes from the state the engine saved after an
+         * earlier prompt, matched by text like the live one. */
+        const int resumable = saved_state_text_prefix_prompt(s, slot, &j->req,
+                                                             &effective_prompt);
         if (resumable > 0) {
             cached = resumable;
             cache_source = "memory-state";
+            prompt_for_sync = &effective_prompt;
         }
     }
     if (cached == 0 && old_pos > 0) {

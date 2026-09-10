@@ -197,6 +197,18 @@ typedef struct {
     ds4_vision_embedding embedding;
 } ds4_vision_span;
 
+/* An image that conditioned a state: the size of its placeholder span and
+ * the fingerprint of its embedding, plus where it sits in that history.
+ * The position is not part of the identity comparison: the token or text
+ * comparison that goes with it settles that, and the same picture sits at
+ * different token positions in the live history and in a replay that
+ * renders the turns before it differently. */
+typedef struct {
+    uint32_t token_start;
+    uint32_t token_count;
+    uint8_t fingerprint[32];
+} ds4_vision_identity;
+
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
 typedef void (*ds4_generation_done_fn)(void *ud);
 
@@ -446,10 +458,21 @@ bool ds4_session_vision_state_matches(const ds4_session *s,
 bool ds4_session_vision_prefix_matches(const ds4_session *s,
                                        const ds4_vision_span *images,
                                        size_t image_count);
-/* How many images conditioned the live checkpoint, and where the i-th of
- * them sits in the live tokens. */
-size_t ds4_session_vision_image_count(const ds4_session *s);
-uint32_t ds4_session_vision_image_start(const ds4_session *s, size_t i);
+/* Whether the first n images of a prompt are the pictures `ids` describe,
+ * in order. */
+bool ds4_vision_identities_prefix(const ds4_vision_identity *ids, size_t n,
+                                  const ds4_vision_span *images, size_t image_count);
+/* The pictures folded into the live checkpoint. */
+const ds4_vision_identity *ds4_session_vision_identities(const ds4_session *s,
+                                                         size_t *count);
+/* The i-th saved turn-boundary state that can still be resumed (Qwen
+ * sessions keep the state after the last few prompts; none elsewhere): its
+ * history and the pictures folded into it.  NULL past the last one.
+ * ds4_session_sync_multimodal() resumes from such a state when the prompt
+ * begins with its history and carries the same pictures. */
+const ds4_tokens *ds4_session_saved_state(const ds4_session *s, size_t i,
+                                          const ds4_vision_identity **images,
+                                          size_t *image_count);
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
@@ -459,11 +482,6 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         const ds4_vision_span *images, size_t image_count, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
-/* Tokens of prompt that ds4_session_sync_multimodal() would take from a
- * saved turn-boundary state instead of the live prefix (Qwen sessions keep
- * the state after the last few prompts; 0 elsewhere). */
-int ds4_session_resumable_prefix(ds4_session *s, const ds4_tokens *prompt,
-                                 const ds4_vision_span *images, size_t image_count);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,

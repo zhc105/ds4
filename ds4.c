@@ -16385,18 +16385,6 @@ static ds4_context_memory qwen_context_memory_estimate(uint32_t ctx) {
     return m;
 }
 
-/* An image that conditioned a state: the size of its placeholder span and
- * the fingerprint of its embedding, plus where it sits in that history.
- * The position is not part of the identity comparison: the token or text
- * comparison that goes with it settles that, and the same picture sits at
- * different token positions in the live history and in a replay that
- * renders the turns before it differently. */
-typedef struct {
-    uint32_t token_start;
-    uint32_t token_count;
-    uint8_t fingerprint[32];
-} ds4_vision_identity;
-
 #ifdef DS4_QWEN_GPU
 /* =========================================================================
  * Qwen3.5 CUDA Graph.
@@ -69017,7 +69005,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
  * images must be the same pictures, in order.  (A prompt whose next image
  * sits inside the state's history fails the token comparison that goes
  * with this check: the state has no placeholders there.) */
-static bool vision_identities_prefix(
+bool ds4_vision_identities_prefix(
         const ds4_vision_identity *ids,
         size_t                     n,
         const ds4_vision_span     *images,
@@ -69053,9 +69041,9 @@ bool ds4_session_vision_prefix_matches(
         size_t                 image_count) {
     if (!s || (image_count != 0 && !images)) return false;
     return !s->checkpoint_valid ||
-           vision_identities_prefix(s->checkpoint_images,
-                                    s->checkpoint_image_count,
-                                    images, image_count);
+           ds4_vision_identities_prefix(s->checkpoint_images,
+                                        s->checkpoint_image_count,
+                                        images, image_count);
 }
 
 bool ds4_session_vision_state_matches(
@@ -69067,12 +69055,10 @@ bool ds4_session_vision_state_matches(
            ds4_session_vision_prefix_matches(s, images, image_count);
 }
 
-size_t ds4_session_vision_image_count(const ds4_session *s) {
-    return s && s->checkpoint_valid ? s->checkpoint_image_count : 0;
-}
-
-uint32_t ds4_session_vision_image_start(const ds4_session *s, size_t i) {
-    return i < ds4_session_vision_image_count(s) ? s->checkpoint_images[i].token_start : 0u;
+const ds4_vision_identity *ds4_session_vision_identities(const ds4_session *s, size_t *count) {
+    const bool have = s && s->checkpoint_valid && s->checkpoint_image_count != 0;
+    *count = have ? s->checkpoint_image_count : 0;
+    return have ? s->checkpoint_images : NULL;
 }
 
 bool ds4_session_has_vision_state(const ds4_session *s) {
@@ -69164,7 +69150,7 @@ static bool qwen_session_kv_holds(const ds4_session *s, const ds4_tokens *histor
 static bool qwen_state_copy_resumes(const ds4_session *s, const qwen_state_copy *c, const ds4_tokens *prompt,
                                     const ds4_vision_span *images, size_t image_count) {
     return c->tokens.len > 0 && ds4_tokens_starts_with(prompt, &c->tokens) && qwen_session_kv_holds(s, &c->tokens) &&
-           vision_identities_prefix(c->images, c->image_count, images, image_count);
+           ds4_vision_identities_prefix(c->images, c->image_count, images, image_count);
 }
 
 static bool qwen_session_state_save(ds4_session *s) {
@@ -70961,25 +70947,26 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
-int ds4_session_resumable_prefix(ds4_session *s, const ds4_tokens *prompt,
-                                 const ds4_vision_span *images, size_t image_count) {
-    int best = 0;
+const ds4_tokens *ds4_session_saved_state(const ds4_session *s, size_t i,
+                                          const ds4_vision_identity **images, size_t *image_count) {
+    *images = NULL;
+    *image_count = 0;
 #ifdef DS4_QWEN_GPU
     if (ds4_model_is_qwen() && !ds4_session_is_cpu(s)) {
-        for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
-            const qwen_state_copy *c = &s->qwen_states[i];
-            if (c->tokens.len > best && qwen_state_copy_resumes(s, c, prompt, images, image_count)) {
-                best = c->tokens.len;
-            }
+        for (uint32_t k = 0; k < QWEN_STATE_COPIES; k++) {
+            const qwen_state_copy *c = &s->qwen_states[k];
+            if (c->tokens.len <= 0 || !qwen_session_kv_holds(s, &c->tokens)) continue;
+            if (i-- != 0) continue;
+            *images = c->images;
+            *image_count = c->image_count;
+            return &c->tokens;
         }
     }
 #else
     (void)s;
-    (void)prompt;
-    (void)images;
-    (void)image_count;
+    (void)i;
 #endif
-    return best;
+    return NULL;
 }
 
 int ds4_session_argmax(ds4_session *s) {

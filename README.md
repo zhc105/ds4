@@ -1624,8 +1624,9 @@ Images and the live state: a request that adds a picture after the live
 end continues from the live tokens like any other (the text or visible
 transcript is compared past the last picture the session already holds,
 and the new picture's placeholder tokens are placed after the retokenized
-text before it), and a saved prompt state resumes only a prompt that
-carries the same pictures it was made with.  Requests that carry images
+text before it), and a saved prompt state is matched by its text the same
+way and resumes only a prompt that carries the pictures it was made with.
+Requests that carry images
 still bypass the disk cache on every model: the disk key does not identify
 the images.
 
