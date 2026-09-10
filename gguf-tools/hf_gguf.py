@@ -29,8 +29,8 @@ GGUF_ALIGNMENT = 32
 KV_UINT32, KV_INT32, KV_FLOAT32, KV_BOOL, KV_STRING, KV_ARRAY, KV_UINT64 = 4, 5, 6, 7, 8, 9, 10
 
 # GGML tensor types we emit.
-T_F32, T_F16, T_BF16, T_NVFP4 = 0, 1, 30, 40
-TYPE_NAMES = {T_F32: "F32", T_F16: "F16", T_BF16: "BF16", T_NVFP4: "NVFP4"}
+T_F32, T_F16, T_Q8_0, T_BF16, T_NVFP4 = 0, 1, 8, 30, 40
+TYPE_NAMES = {T_F32: "F32", T_F16: "F16", T_Q8_0: "Q8_0", T_BF16: "BF16", T_NVFP4: "NVFP4"}
 
 # llama.cpp token types.
 TOK_NORMAL, TOK_CONTROL, TOK_USER_DEFINED, TOK_UNUSED = 1, 3, 4, 5
@@ -38,6 +38,9 @@ TOK_NORMAL, TOK_CONTROL, TOK_USER_DEFINED, TOK_UNUSED = 1, 3, 4, 5
 NVFP4_BLOCK = 16          # elements per E4M3 scale
 NVFP4_SUPER = 64          # elements per GGML super-block
 NVFP4_SUPER_BYTES = 36    # 4 scales + 32 packed bytes
+
+Q8_0_BLOCK = 32           # elements per block (f16 scale + 32 int8)
+Q8_0_BLOCK_BYTES = 34
 
 SAFETENSORS_DTYPES = {
     "F32": np.dtype("<f4"),
@@ -237,6 +240,39 @@ def ue4m3_to_f32(bits):
     man = (bits & 7).astype(np.float32)
     value = np.where(exp == 0, man * 2.0 ** -9, (1.0 + man / 8.0) * np.exp2(exp - 7).astype(np.float32))
     return np.where(bits == 0x7F, 0.0, value).astype(np.float32)
+
+
+def q8_0_quantize(weight):
+    """GGML q8_0: per 32-element block an f16 scale d = amax/127 then 32 int8
+    round(x/d).  Mirrors ds4q_quantize_q8_0 (gguf-tools/quants.c); C roundf is
+    half-away-from-zero and numpy's rint is half-to-even, so round explicitly."""
+    w = np.asarray(weight, dtype=np.float32)
+    if w.ndim != 2:
+        fail(f"q8_0_quantize expects a 2-D matrix, got {w.shape}")
+    out_features, n_cols = w.shape
+    if n_cols % Q8_0_BLOCK:
+        fail(f"q8_0_quantize: row length {n_cols} is not a multiple of {Q8_0_BLOCK}")
+    n_blocks = n_cols // Q8_0_BLOCK
+    blocks = w.reshape(out_features, n_blocks, Q8_0_BLOCK)
+    d = (np.max(np.abs(blocks), axis=-1) / np.float32(127.0)).astype(np.float32)
+    safe = np.where(d > 0, d, np.float32(1.0))
+    inv = np.where(d > 0, np.float32(1.0) / safe, np.float32(0.0))
+    scaled = blocks * inv[..., None]
+    qs = np.clip(np.trunc(scaled + np.copysign(np.float32(0.5), scaled)),
+                 -127.0, 127.0).astype(np.int8)
+    raw = np.empty((out_features, n_blocks, Q8_0_BLOCK_BYTES), dtype=np.uint8)
+    raw[:, :, :2] = d.astype(np.float16).view(np.uint8).reshape(out_features, n_blocks, 2)
+    raw[:, :, 2:] = qs.view(np.uint8)
+    return np.ascontiguousarray(raw.reshape(out_features, n_blocks * Q8_0_BLOCK_BYTES))
+
+
+def q8_0_dequant(raw, n_cols):
+    """Reference dequantization of the GGML q8_0 layout."""
+    out_features = raw.shape[0]
+    blocks = np.ascontiguousarray(raw).reshape(out_features, n_cols // Q8_0_BLOCK, Q8_0_BLOCK_BYTES)
+    d = np.ascontiguousarray(blocks[:, :, :2]).view(np.float16).reshape(out_features, -1).astype(np.float32)
+    qs = np.ascontiguousarray(blocks[:, :, 2:]).view(np.int8).astype(np.float32)
+    return (qs * d[..., None]).reshape(out_features, n_cols)
 
 
 def nvfp4_dequant_modelopt(weight, scale, scale2):
@@ -477,6 +513,10 @@ def tensor_nbytes(shape, qtype):
     n = int(np.prod(shape, dtype=np.int64))
     if qtype == T_F32:
         return n * 4
+    if qtype == T_Q8_0:
+        if n % Q8_0_BLOCK:
+            fail(f"q8_0 tensor {shape} is not a multiple of {Q8_0_BLOCK} elements")
+        return n // Q8_0_BLOCK * Q8_0_BLOCK_BYTES
     if qtype in (T_F16, T_BF16):
         return n * 2
     if qtype == T_NVFP4:

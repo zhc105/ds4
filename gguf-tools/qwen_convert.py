@@ -38,9 +38,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hf_gguf import (  # noqa: E402
-    GGUFWriter, SafeTensors, T_BF16, T_F16, T_F32, T_NVFP4, TYPE_NAMES, bf16_to_f32,
-    export_tokenizer, fail, ngram_header, nvfp4_quantize, nvfp4_repack, nvfp4_stack_experts,
-    reorder_heads, v_head_perm,
+    GGUFWriter, Q8_0_BLOCK, Q8_0_BLOCK_BYTES, SafeTensors, T_BF16, T_F16, T_F32, T_NVFP4,
+    T_Q8_0, TYPE_NAMES, bf16_to_f32, export_tokenizer, fail, ngram_header, nvfp4_quantize,
+    nvfp4_repack, nvfp4_stack_experts, q8_0_quantize, reorder_heads, v_head_perm,
 )
 
 FILE_TYPE_MOSTLY_BF16 = 32
@@ -63,13 +63,19 @@ def load_config(hf_dir):
 
 
 class Converter:
-    def __init__(self, hf_dir, out_path, name):
+    def __init__(self, hf_dir, out_path, name, quant_head=False, quant_gdn=False):
         self.hf_dir = hf_dir
         self.cfg = load_config(hf_dir)
         self.st = SafeTensors(hf_dir)
         self.writer = GGUFWriter(out_path)
         self.name = name
         self.uses_nvfp4 = False
+        # Bypass-layer quantization, split so each half can be built and
+        # measured alone: lm_head -> q8_0, the three big GDN projections ->
+        # fp8 e4m3 with 128x128 block scales.  Both off by default so the
+        # shipped BF16 conversion stays byte-identical.
+        self.quant_head = quant_head
+        self.quant_gdn = quant_gdn
         cfg = self.cfg
         model_type = cfg.get("model_type", "").replace("_text", "")
         if model_type not in ARCH_BY_MODEL_TYPE:
@@ -323,11 +329,14 @@ class Converter:
         # Rows above the V block are untouched: extend the permutation with an identity prefix.
         qkv_perm = np.concatenate([np.arange(qk_rows // hv), qk_rows // hv + perm])
         conv_dim = qk_rows + nv * hv
-        self.linear(f"blk.{il}.attn_qkv", f"{hf}.in_proj_qkv", row_perm=qkv_perm, row_head=hv)
-        self.linear(f"blk.{il}.attn_gate", f"{hf}.in_proj_z", row_perm=perm, row_head=hv)
+        # The three projections that dominate the decode read shrink to q8_0
+        # under --quant-gdn; alpha/beta are tiny and stay as they are.
+        proj = self.linear_q8_0 if self.quant_gdn else self.linear
+        proj(f"blk.{il}.attn_qkv", f"{hf}.in_proj_qkv", row_perm=qkv_perm, row_head=hv)
+        proj(f"blk.{il}.attn_gate", f"{hf}.in_proj_z", row_perm=perm, row_head=hv)
         self.linear(f"blk.{il}.ssm_alpha", f"{hf}.in_proj_a", row_perm=perm, row_head=1)
         self.linear(f"blk.{il}.ssm_beta", f"{hf}.in_proj_b", row_perm=perm, row_head=1)
-        self.linear(f"blk.{il}.ssm_out", f"{hf}.out_proj", col_perm=perm, col_head=hv)
+        proj(f"blk.{il}.ssm_out", f"{hf}.out_proj", col_perm=perm, col_head=hv)
         kernel = self.cfg["linear_conv_kernel_dim"]
         self.f32(f"blk.{il}.ssm_conv1d.weight", f"{hf}.conv1d.weight", shape=[conv_dim, kernel],
                  transform=lambda w: reorder_heads(w.reshape(conv_dim, kernel), 0, qkv_perm, hv))
@@ -410,7 +419,8 @@ class Converter:
         else:
             self.norm("output_norm.weight", f"{prefix}.norm.weight")
         if "lm_head.weight" in self.st and not self.cfg["tie_word_embeddings"]:
-            self.linear("output", "lm_head")
+            head = self.linear_q8_0 if self.quant_head else self.linear
+            head("output", "lm_head")
         for il in range(self.n_layer):
             self.add_block(il, f"{prefix}.layers.{il}", self.layer_types[il] == "linear_attention")
         for m in range(self.n_mtp):
@@ -512,6 +522,30 @@ class Converter:
         self.writer.add_tensor(gguf_base + ".weight", [rows, cols], T_NVFP4, rows * (cols // 64 * 36), produce)
         self.writer.add_tensor(gguf_base + ".scale", [1], T_F32, 4, lambda: scale)
 
+    def linear_q8_0(self, gguf_base, hf_base, row_perm=None, row_head=1,
+                    col_perm=None, col_head=1):
+        """A projection quantized to GGML q8_0 (the int8 lm_head, and under
+        --quant-gdn the three big GDN projections), with the same head
+        permutations the BF16 path applies."""
+        st = self.st
+        name = hf_base + ".weight"
+        if st.dtype(name) not in SOURCE_TYPES:
+            fail(f"{name}: the q8_0 path needs float weights, source dtype is {st.dtype(name)}")
+        rows, cols = st.shape(name)
+        if cols % Q8_0_BLOCK:
+            fail(f"{name}: row length {cols} is not a multiple of {Q8_0_BLOCK}")
+
+        def produce():
+            w = st.read_f32(name)
+            if row_perm is not None:
+                w = reorder_heads(w, 0, row_perm, row_head)
+            if col_perm is not None:
+                w = reorder_heads(w, 1, col_perm, col_head)
+            return q8_0_quantize(w)
+
+        self.writer.add_tensor(gguf_base + ".weight", [rows, cols], T_Q8_0,
+                               rows * (cols // Q8_0_BLOCK) * Q8_0_BLOCK_BYTES, produce)
+
     # -- n-gram sidecar ---------------------------------------------------
 
     def write_ngram_table(self, verbose):
@@ -591,12 +625,17 @@ def main():
                         help="write the Flash-Next MTP drafter alone (for ds4 --mtp-model), experts quantized to NVFP4")
     parser.add_argument("--vision", action="store_true",
                         help="write the Flash-Next vision tower alone (for ds4 --vision)")
+    parser.add_argument("--quant-head", action="store_true",
+                        help="quantize the lm_head to q8_0 (int8)")
+    parser.add_argument("--quant-gdn", action="store_true",
+                        help="quantize the three big GDN projections to q8_0 (int8)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
     if os.path.exists(args.out) and not args.dry_run:
         fail(f"output exists: {args.out}")
     name = args.name or os.path.basename(os.path.normpath(args.hf_dir))
-    Converter(args.hf_dir, args.out, name).run(args.dry_run, args.verbose, mtp=args.mtp, vision=args.vision)
+    Converter(args.hf_dir, args.out, name, quant_head=args.quant_head,
+              quant_gdn=args.quant_gdn).run(args.dry_run, args.verbose, mtp=args.mtp, vision=args.vision)
 
 
 if __name__ == "__main__":

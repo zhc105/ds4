@@ -123,7 +123,7 @@ __global__ static void qwen35_nvfp4_matvec_kernel(
 
 /* Weight storage types the Qwen graph feeds to the matmuls, as GGUF type ids
  * so ds4.c passes the tensor type straight through. */
-enum { QWEN35_W_F32 = 0, QWEN35_W_BF16 = 30, QWEN35_W_NVFP4 = 40 };
+enum { QWEN35_W_F32 = 0, QWEN35_W_Q8_0 = 8, QWEN35_W_BF16 = 30, QWEN35_W_NVFP4 = 40 };
 
 /* Prefill GEMM tile: a 256-thread block accumulates a 64x64 output tile over
  * the full input width, weights of any storage type dequantised to shared
@@ -240,6 +240,30 @@ __device__ __forceinline__ void qwen35_mma_fetch_step(
             const uint32_t *src = (const uint32_t *)(w + ((uint64_t)col * n_super + first) * 36u);
             const uint32_t n = first + 1u < n_super ? 18u : 9u;
             for (uint32_t j = 0; j < 18u; j++) f->q[j] = j < n ? src[j] : 0u;
+        }
+    } else if (wtype == QWEN35_W_Q8_0) {
+        /* One 32-element q8_0 block per thread, dequantised straight into the
+         * bf16 operand the store step copies, so the tensor cores see the same
+         * bf16 path a BF16 weight would take while the bytes stay int8. */
+        const uint32_t n_blocks = in_dim / 32u;
+        const uint32_t blk_index = 2u * b + half;
+        if (col >= out_dim || blk_index >= n_blocks) {
+            for (uint32_t j = 0; j < 4u; j++) f->wb[j] = make_uint4(0u, 0u, 0u, 0u);
+        } else {
+            const uint8_t *blk = w + ((uint64_t)col * n_blocks + blk_index) * 34u;
+            const float d = __half2float(*(const __half *)blk);
+            const int8_t *qs = (const int8_t *)(blk + 2u);
+            uint32_t v[16];
+#pragma unroll
+            for (uint32_t j = 0; j < 16u; j++) {
+                const __nv_bfloat162 p = __floats2bfloat162_rn((float)qs[2u * j] * d,
+                                                                (float)qs[2u * j + 1u] * d);
+                v[j] = *(const uint32_t *)&p;
+            }
+            f->wb[0] = make_uint4(v[0], v[1], v[2], v[3]);
+            f->wb[1] = make_uint4(v[4], v[5], v[6], v[7]);
+            f->wb[2] = make_uint4(v[8], v[9], v[10], v[11]);
+            f->wb[3] = make_uint4(v[12], v[13], v[14], v[15]);
         }
     } else if (col >= out_dim) {
         for (uint32_t j = 0; j < 4u; j++) f->wb[j] = make_uint4(0u, 0u, 0u, 0u);
@@ -487,6 +511,83 @@ static void qwen35_to_bf16(__nv_bfloat16 *dst, const float *x, uint64_t n, cudaS
     qwen35_to_bf16_kernel<<<(unsigned)((n + 1023u) / 1024u), 256, 0, stream>>>(dst, x, n);
 }
 
+/* Decode-sized q8_0 matvec, the int8 twin of the BF16 rows kernel above: a
+ * warp per output column walks the weight row once for every activation row.
+ * Each lane takes four consecutive int8 of one 32-element block, so the
+ * block's f16 scale stays a single scalar for the step and eight lanes cover
+ * a block. */
+template <int N>
+__global__ static void qwen35_matvec_q8_0_rows_kernel(
+        float *out, const uint8_t *w, const float *x, uint32_t in_dim, uint32_t out_dim) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = blockIdx.x * 8u + warp;
+    if (col >= out_dim) return;
+    float sum[N];
+#pragma unroll
+    for (int r = 0; r < N; r++) sum[r] = 0.0f;
+    const uint32_t n_blocks = in_dim / 32u;
+    const uint8_t *wrow = w + (uint64_t)col * n_blocks * 34u;
+    const uint32_t off = (lane & 7u) * 4u;
+    for (uint32_t b = lane >> 3u; b < n_blocks; b += 4u) {
+        const uint8_t *blk = wrow + (uint64_t)b * 34u;
+        const float d = __half2float(*(const __half *)blk);
+        const int8_t *qs = (const int8_t *)(blk + 2u);
+        const float w0 = (float)qs[off + 0u] * d;
+        const float w1 = (float)qs[off + 1u] * d;
+        const float w2 = (float)qs[off + 2u] * d;
+        const float w3 = (float)qs[off + 3u] * d;
+        const uint32_t k = b * 32u + off;
+#pragma unroll
+        for (int r = 0; r < N; r++) {
+            const float4 xv = *(const float4 *)(x + (uint64_t)r * in_dim + k);
+            sum[r] = fmaf(w0, xv.x, sum[r]);
+            sum[r] = fmaf(w1, xv.y, sum[r]);
+            sum[r] = fmaf(w2, xv.z, sum[r]);
+            sum[r] = fmaf(w3, xv.w, sum[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < N; r++) {
+        const float total = warp_sum_f32(sum[r]);
+        if (lane == 0u) out[(uint64_t)r * out_dim + col] = total;
+    }
+}
+
+static void qwen35_matvec_q8_0_rows(
+        float *out, const uint8_t *w, const float *x, uint32_t in_dim, uint32_t out_dim, uint32_t n_tok,
+        cudaStream_t stream) {
+    const dim3 grid((out_dim + 7u) / 8u, 1u, 1u);
+    switch (n_tok) {
+    case 1: qwen35_matvec_q8_0_rows_kernel<1><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 2: qwen35_matvec_q8_0_rows_kernel<2><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 3: qwen35_matvec_q8_0_rows_kernel<3><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 4: qwen35_matvec_q8_0_rows_kernel<4><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 5: qwen35_matvec_q8_0_rows_kernel<5><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 6: qwen35_matvec_q8_0_rows_kernel<6><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 7: qwen35_matvec_q8_0_rows_kernel<7><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    default: qwen35_matvec_q8_0_rows_kernel<8><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    }
+}
+
+/* The inverse of the above: the generic quantized matmul takes f32
+ * activations, and Flash-Next prefill keeps the token-mixer output in bf16. */
+__global__ static void qwen35_bf16_to_f32_kernel(float *dst, const __nv_bfloat16 *x, uint64_t n) {
+    const uint64_t i = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) * 4u;
+    if (i + 4u <= n) {
+        const __nv_bfloat162 lo = *(__nv_bfloat162 *)(x + i);
+        const __nv_bfloat162 hi = *(__nv_bfloat162 *)(x + i + 2u);
+        *(float4 *)(dst + i) = make_float4(__bfloat162float(lo.x), __bfloat162float(lo.y),
+                                           __bfloat162float(hi.x), __bfloat162float(hi.y));
+    } else {
+        for (uint64_t j = i; j < n; j++) dst[j] = __bfloat162float(x[j]);
+    }
+}
+
+static void qwen35_bf16_to_f32(float *dst, const __nv_bfloat16 *x, uint64_t n, cudaStream_t stream) {
+    qwen35_bf16_to_f32_kernel<<<(unsigned)((n + 1023u) / 1024u), 256, 0, stream>>>(dst, x, n);
+}
+
 /* BF16-weight prefill GEMM through cuBLAS on bf16 activations with f32
  * accumulation, scaled by alpha: the checkpoint's own recipe for these
  * projections (vLLM and SGLang run them the same way), which measured
@@ -572,8 +673,24 @@ static uint64_t qwen35_weight_bytes(uint32_t wtype, uint32_t in_dim, uint32_t ou
     case QWEN35_W_NVFP4: return in_dim % 64u == 0u ? (uint64_t)out_dim * (in_dim / 64u) * 36u : 0u;
     case QWEN35_W_BF16:  return (uint64_t)out_dim * in_dim * 2u;
     case QWEN35_W_F32:   return (uint64_t)out_dim * in_dim * 4u;
+    /* GGML q8_0: 32 elements per block, an f16 scale and 32 int8. */
+    case QWEN35_W_Q8_0:  return in_dim % 32u == 0u ? (uint64_t)out_dim * (in_dim / 32u) * 34u : 0u;
     default:             return 0u;
     }
+}
+
+/* f32 activations for a q8_0 prefill whose caller only produced the bf16
+ * copy.  Process-lifetime: at most a prefill chunk of the widest projection
+ * (~100 MiB), and only prefill-sized calls reach it (the decode islands
+ * capture at n_tok <= 8). */
+static ds4_gpu_tensor *qwen35_f32_activation_scratch(uint64_t elems) {
+    static ds4_gpu_tensor *buf = NULL;
+    static uint64_t cap = 0;
+    if (buf && cap >= elems) return buf;
+    if (buf) ds4_gpu_tensor_free(buf);
+    buf = ds4_gpu_tensor_alloc(elems * sizeof(float));
+    cap = buf ? elems : 0;
+    return buf;
 }
 
 /* out[n_tok][out_dim] = x[n_tok][in_dim] W^T times the global scale, for a
@@ -609,6 +726,53 @@ extern "C" int ds4_gpu_qwen35_matmul(
     cudaStream_t stream = cuda_decode_stream();
     float *o = (float *)out->ptr;
     const float *xp = (const float *)x->ptr;
+    /* q8_0 weights (the int8 lm_head and GDN projections) get their own
+     * kernels rather than the generic quantized matmul: that one allocates
+     * from the mmq pool, which CUDA forbids inside the captured decode
+     * graphs.  It also has no scale parameter, so a q8_0 weight must not
+     * carry one (the converter writes none). */
+    if (wtype == QWEN35_W_Q8_0) {
+        if (scale != 1.0f) {
+            fprintf(stderr, "ds4: q8_0 Qwen weight at offset %llu carries scale %g\n",
+                    (unsigned long long)weight_offset, (double)scale);
+            return 0;
+        }
+        if (in_dim % 4u != 0u) {
+            fprintf(stderr, "ds4: q8_0 Qwen weight in_dim %u is not a multiple of 4\n", in_dim);
+            return 0;
+        }
+        if (n_tok <= 8u) {
+            /* Decode reads the weight straight from the q8_0 blocks: the
+             * generic matmul below cannot, because it allocates from the mmq
+             * pool and these rows are replayed inside captured graphs. */
+            qwen35_matvec_q8_0_rows(o, (const uint8_t *)w, xp, in_dim, out_dim, n_tok, stream);
+            return cuda_ok(cudaGetLastError(), "Qwen q8_0 matvec launch");
+        }
+        /* Prefill goes through the generic quantized matmul, which reads the
+         * q8_0 weight exactly once.  It takes f32 activations: bring back the
+         * bf16 copy when that is all the caller produced (Flash-Next keeps the
+         * token-mixer output in bf16). */
+        const ds4_gpu_tensor *act = x;
+        if (x_bf16) {
+            ds4_gpu_tensor *f32 = qwen35_f32_activation_scratch((uint64_t)n_tok * in_dim);
+            if (!f32) {
+                fprintf(stderr, "ds4: Qwen q8_0 activation scratch alloc failed (%u x %u)\n",
+                        n_tok, in_dim);
+                return 0;
+            }
+            qwen35_bf16_to_f32((float *)f32->ptr, (const __nv_bfloat16 *)x_bf16->ptr,
+                               (uint64_t)n_tok * in_dim, stream);
+            if (!cuda_ok(cudaGetLastError(), "Qwen bf16 activation convert")) return 0;
+            act = f32;
+        }
+        const int mmq = ds4_gpu_matmul_quant_tensor(out, model_map, model_size, weight_offset, wtype,
+                                                    in_dim, out_dim, act, n_tok);
+        if (!mmq) {
+            fprintf(stderr, "ds4: Qwen q8_0 prefill matmul failed in=%u out=%u n_tok=%u offset=%llu\n",
+                    in_dim, out_dim, n_tok, (unsigned long long)weight_offset);
+        }
+        return mmq;
+    }
     if (n_tok > 8u) {
         if (wtype == QWEN35_W_F32) {
             /* exact f32: the handle allows TF32, which the pedantic compute
