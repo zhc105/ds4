@@ -281,9 +281,17 @@ def main() -> None:
                         pair_sum[layer][j] += value
 
     layers = []
+    signal = []
     for layer in range(n_layer):
         good_mean = [x / n for x in good_sum[layer]]
         bad_mean = [x / n for x in bad_sum[layer]]
+        # How far the two sides actually are, before normalize() throws the
+        # magnitude away: a direction built from a near-zero difference still
+        # comes out unit-norm and applies as a no-op that reports nothing.
+        ng = math.sqrt(sum(v * v for v in good_mean))
+        nb = math.sqrt(sum(v * v for v in bad_mean))
+        nd = math.sqrt(sum((good_mean[i] - bad_mean[i]) ** 2 for i in range(n_embd)))
+        signal.append(nd / ((ng + nb) / 2.0) if (ng + nb) else 0.0)
         if args.pair_normalize:
             direction = normalize([x / n for x in pair_sum[layer]])
         else:
@@ -300,6 +308,14 @@ def main() -> None:
             ])
         layers.append(direction)
 
+    step = max(1, n_layer // 8)
+    ordered = sorted(signal)
+    print("signal |good-bad| / mean activation norm, per layer:")
+    for layer in range(0, n_layer, step):
+        print(f"  layer {layer:3d}: {signal[layer] * 100:6.1f}%")
+    print(f"  median {ordered[n_layer // 2] * 100:.1f}%   max {max(signal) * 100:.1f}%"
+          "   (a few percent or less means the two sets did not separate)")
+
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -315,6 +331,7 @@ def main() -> None:
         "model": args.model_name if args.server else str(model_arg),
         "capture": ("server " + args.server) if args.server else "cli",
         "tools": [t.get("function", {}).get("name", "?") for t in tools] if tools else [],
+        "signal_rel_per_layer": [round(x, 6) for x in signal],
         "source": args.source,
         "note": "runtime positive scale suppresses this direction; negative scale amplifies it",
     }
