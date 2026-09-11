@@ -18,6 +18,7 @@ import os
 import subprocess
 import tempfile
 import urllib.request
+import hashlib
 from pathlib import Path
 
 
@@ -152,10 +153,33 @@ def run_capture_server(
         data=body,
         headers={"Content-Type": "application/json"},
     )
+    before = dump_fingerprint(dump_prefix, component, n_layer)
     with urllib.request.urlopen(request, timeout=600) as response:
         response.read()
+    if dump_fingerprint(dump_prefix, component, n_layer) == before:
+        raise SystemExit(
+            "the dump files did not change for this request, so the capture is "
+            "the previous prompt's: the server skipped the prefill (prefix cache "
+            "hit, or the live session already held this text).  Point the capture "
+            "server at a fresh --kv-disk-dir and make sure every prompt prefills."
+        )
     return read_dump_rows(Path(dump_prefix), component, n_layer, n_embd)
 
+
+
+def dump_fingerprint(dump_prefix: str, component: str, n_layer: int) -> bytes:
+    """Hash the last row of every dump file: the next request overwrites them,
+    so an unchanged fingerprint means this capture never happened."""
+    h = hashlib.blake2b(digest_size=16)
+    for layer in range(n_layer):
+        path = Path(f"{dump_prefix}_{component}-{layer}_pos0.bin")
+        try:
+            with path.open("rb") as f:
+                f.seek(max(0, path.stat().st_size - 4096))
+                h.update(f.read())
+        except OSError:
+            pass
+    return h.digest()
 
 
 def load_tools(args) -> list | None:
