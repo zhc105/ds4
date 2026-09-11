@@ -16556,10 +16556,14 @@ static bool qwen_graph_load_directional_steering(
         float               ffn_scale) {
     g->steering_attn_scale = attn_scale;
     g->steering_ffn_scale = ffn_scale;
-    if (attn_scale == 0.0f && ffn_scale == 0.0f) return true;
+    /* Loaded whenever a file is given, even at scale 0: the scales are live
+     * and a later request may raise them. */
     if (!path || !path[0]) {
-        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
-        return false;
+        if (attn_scale != 0.0f || ffn_scale != 0.0f) {
+            fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
+            return false;
+        }
+        return true;
     }
     const uint32_t n_layers = directional_steering_layer_count();
     if (n_layers == 0) return false;
@@ -19626,11 +19630,14 @@ static bool metal_graph_load_directional_steering(
         const char      *path,
         float            attn_scale,
         float            ffn_scale) {
-    if (attn_scale == 0.0f && ffn_scale == 0.0f) return true;
-
+    /* Loaded whenever a file is given, even at scale 0: the scales are live
+     * and a later request may raise them. */
     if (!path || !path[0]) {
-        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
-        return false;
+        if (attn_scale != 0.0f || ffn_scale != 0.0f) {
+            fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
+            return false;
+        }
+        return true;
     }
 
     const uint32_t n_layers = directional_steering_layer_count();
@@ -41464,16 +41471,19 @@ static void cpu_directional_steering_project_rows(
 }
 
 static bool cpu_load_directional_steering(ds4_engine *e) {
-    if (!e ||
-        (e->directional_steering_attn_scale == 0.0f &&
-         e->directional_steering_ffn_scale == 0.0f)) {
-        return true;
-    }
+    if (!e) return true;
 
+    /* The scales are live once a session exists -- an interactive /steer or a
+     * server request may raise them -- so the vectors are loaded whenever a
+     * file is given, not only when the startup scales are already nonzero. */
     const char *path = e->directional_steering_file;
     if (!path || !path[0]) {
-        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
-        return false;
+        if (e->directional_steering_attn_scale != 0.0f ||
+            e->directional_steering_ffn_scale != 0.0f) {
+            fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
+            return false;
+        }
+        return true;
     }
 
     const uint32_t n_layers = directional_steering_layer_count();
@@ -43902,13 +43912,18 @@ static bool glm_graph_load_directional_steering(
         const char        *path,
         float              attn_scale,
         float              ffn_scale) {
-    if (!g || (attn_scale == 0.0f && ffn_scale == 0.0f)) return g != NULL;
+    if (!g) return false;
+    /* Loaded whenever a file is given, even at scale 0: the scales are live
+     * and a later request may raise them. */
+    if (!path || !path[0]) {
+        if (attn_scale != 0.0f || ffn_scale != 0.0f) {
+            fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
+            return false;
+        }
+        return true;
+    }
     if (!g->glm53) {
         fprintf(stderr, "ds4: directional steering is supported only for GLM 5.3\n");
-        return false;
-    }
-    if (!path || !path[0]) {
-        fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
         return false;
     }
 
@@ -56918,6 +56933,12 @@ struct ds4_session {
     void *cancel_ud;
     uint32_t prefill_cap;
     int ctx_size;
+    /* Live directional steering scales, read at every decode step by the
+     * active backend. Owned by the session so a server slot can steer one
+     * request without touching process-global engine state. Seeded from the
+     * engine defaults at create; see ds4_session_set_directional_steering. */
+    float steering_attn;
+    float steering_ffn;
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
@@ -66787,6 +66808,10 @@ bool ds4_engine_is_qwen(ds4_engine *e) {
     return ds4_model_is_qwen();
 }
 
+bool ds4_engine_has_directional_steering(ds4_engine *e) {
+    return e && e->directional_steering_file && e->directional_steering_file[0];
+}
+
 /* Decode gate firing schedule for the TP transport (see ds4_tp_identity).
  * Resident GLM splits attention and FFN on sparse layers. Streaming keeps
  * attention replicated and exchanges only the routed FFN partial. */
@@ -67581,6 +67606,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         ds4_session *s = xcalloc(1, sizeof(*s));
         s->engine = e;
         s->ctx_size = ctx_size;
+        s->steering_attn = e->directional_steering_attn_scale;
+        s->steering_ffn = e->directional_steering_ffn_scale;
         s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
                                                      e->prefill_chunk);
         if (ds4_model_is_qwen()) {
@@ -67606,6 +67633,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
+    s->steering_attn = e->directional_steering_attn_scale;
+    s->steering_ffn = e->directional_steering_ffn_scale;
     if (ds4_model_is_qwen()) {
 #ifdef DS4_QWEN_GPU
         /* Prefill rows per graph pass: the expert GEMMs need thousands of
@@ -68029,59 +68058,92 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
     return 0;
 }
 
-float ds4_session_directional_steering_ffn(ds4_session *s) {
-    if (!s || !s->engine) return 0.0f;
-#ifndef DS4_NO_GPU
-    if (!ds4_session_is_cpu(s)) {
-        return ds4_session_is_glm(s) ?
-            s->glm_graph.directional_steering_ffn_scale :
-            s->graph.directional_steering_ffn_scale;
-    }
-#endif
-    return s->engine->directional_steering_ffn_scale;
+void ds4_session_directional_steering(ds4_session *s, float *attn, float *ffn) {
+    if (attn) *attn = s ? s->steering_attn : 0.0f;
+    if (ffn) *ffn = s ? s->steering_ffn : 0.0f;
 }
 
-int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale) {
-    if (!s || !s->engine || !isfinite(scale) ||
-        scale < -100.0f || scale > 100.0f) {
+/* Whether this session holds the direction vectors live steering needs.  They
+ * are uploaded once at create; only the scales can change afterwards. */
+static bool ds4_session_steering_dirs_loaded(ds4_session *s) {
+    if (ds4_session_is_cpu(s)) return s->engine->directional_steering_dirs != NULL;
+#ifndef DS4_NO_GPU
+#ifdef DS4_QWEN_GPU
+    if (ds4_engine_is_qwen(s->engine)) return s->qwen_graph.steering_dirs != NULL;
+#endif
+    if (ds4_session_is_glm(s)) {
+        const int tier = glm_graph_directional_steering_tier(
+                &s->glm_graph, s->glm_graph.layer_start);
+        return tier >= 0 &&
+               s->glm_graph.directional_steering_dirs_by_tier[tier] != NULL;
+    }
+    return metal_graph_directional_steering_dirs(&s->graph) != NULL;
+#else
+    return false;
+#endif
+}
+
+/* Push the live scales into whichever graph this session owns and drop the
+ * derived speculative state, which was computed under the previous values.
+ * The direction vectors themselves are uploaded once at create. */
+static void ds4_session_store_steering_scales(ds4_session *s, float attn, float ffn) {
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_cpu(s)) return;
+#ifdef DS4_QWEN_GPU
+    if (ds4_engine_is_qwen(s->engine)) {
+        s->qwen_graph.steering_attn_scale = attn;
+        s->qwen_graph.steering_ffn_scale = ffn;
+        return;
+    }
+#endif
+    if (ds4_session_is_glm(s)) {
+        s->glm_graph.directional_steering_attn_scale = attn;
+        s->glm_graph.directional_steering_ffn_scale = ffn;
+        s->glm_mtp_have = 0;
+        s->glm_mtp_rollback_valid = false;
+        return;
+    }
+    s->graph.directional_steering_attn_scale = attn;
+    s->graph.directional_steering_ffn_scale = ffn;
+    ds4_session_dspark_capture_invalidate(s);
+#else
+    (void)s; (void)attn; (void)ffn;
+#endif
+}
+
+bool ds4_session_directional_steering_mutable(ds4_session *s) {
+    return s && s->engine && !s->distributed && !s->engine->tp.active;
+}
+
+int ds4_session_set_directional_steering(ds4_session *s, float attn, float ffn) {
+    if (!s || !s->engine || !isfinite(attn) || !isfinite(ffn) ||
+        attn < -100.0f || attn > 100.0f || ffn < -100.0f || ffn > 100.0f) {
         return 1;
     }
-    if (s->distributed || s->engine->tp.active) {
+    if (!ds4_session_directional_steering_mutable(s)) {
         fprintf(stderr,
                 "ds4: live steering changes are not supported for distributed or network tensor-parallel sessions\n");
         return 1;
     }
-
-    bool loaded = s->engine->directional_steering_dirs != NULL;
-#ifndef DS4_NO_GPU
-    if (!ds4_session_is_cpu(s)) {
-        if (ds4_session_is_glm(s)) {
-            const int tier = glm_graph_directional_steering_tier(
-                    &s->glm_graph, s->glm_graph.layer_start);
-            loaded = tier >= 0 &&
-                     s->glm_graph.directional_steering_dirs_by_tier[tier] != NULL;
-        } else {
-            loaded = metal_graph_directional_steering_dirs(&s->graph) != NULL;
-        }
-    }
-#endif
-    if (scale != 0.0f && !loaded) {
+    /* Re-asserting the current scales is the common case (a server resolves
+     * every request against its defaults), so leave the derived caches alone
+     * unless a value actually moves. */
+    if (attn == s->steering_attn && ffn == s->steering_ffn) return 0;
+    if ((attn != 0.0f || ffn != 0.0f) && !ds4_session_steering_dirs_loaded(s)) {
         fprintf(stderr,
-                "ds4: live FFN steering needs a directional steering vector loaded at startup\n");
+                "ds4: live steering needs a directional steering vector loaded at startup\n");
         return 1;
     }
 
-    s->engine->directional_steering_ffn_scale = scale;
+    s->steering_attn = attn;
+    s->steering_ffn = ffn;
+    ds4_session_store_steering_scales(s, attn, ffn);
 #ifndef DS4_NO_GPU
     if (!ds4_session_is_cpu(s)) {
-        if (ds4_session_is_glm(s)) {
-            s->glm_graph.directional_steering_ffn_scale = scale;
-            s->glm_mtp_have = 0;
-            s->glm_mtp_rollback_valid = false;
-        } else {
-            s->graph.directional_steering_ffn_scale = scale;
-            ds4_session_dspark_capture_invalidate(s);
-        }
+        /* Captured decode islands freeze their kernel arguments, the steering
+         * scale among them, so a change has to retire them or the next replay
+         * would steer with the previous value.  CUDA-only; a no-op elsewhere. */
+        ds4_gpu_decode_graphs_invalidate();
     }
 #endif
     s->mtp_draft_valid = false;
@@ -70209,8 +70271,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      &e->model, &e->weights, &s->qwen_state,
                                      prompt->v[i], (uint32_t)i,
                                      e->directional_steering_dirs,
-                                     e->directional_steering_attn_scale,
-                                     e->directional_steering_ffn_scale);
+                                     s->steering_attn,
+                                     s->steering_ffn);
                 if (dump) fwrite(s->logits, sizeof(float), DS4_N_VOCAB, dump);
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
@@ -70241,8 +70303,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                                          prompt->v[i],
                                                          (uint32_t)s->checkpoint.len,
                                                          e->directional_steering_dirs,
-                                                         e->directional_steering_attn_scale,
-                                                         e->directional_steering_ffn_scale,
+                                                         s->steering_attn,
+                                                         s->steering_ffn,
                                                          &s->cpu_scratch);
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
@@ -70260,8 +70322,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                 &s->cpu_cache,
                                 prompt,
                                 e->directional_steering_dirs,
-                                e->directional_steering_attn_scale,
-                                e->directional_steering_ffn_scale);
+                                s->steering_attn,
+                                s->steering_ffn);
         ds4_tokens_copy(&s->checkpoint, prompt);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
@@ -72098,8 +72160,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             qwen_forward_token(s->logits, &e->model, &e->weights, &s->qwen_state,
                                  token, (uint32_t)s->checkpoint.len,
                                  e->directional_steering_dirs,
-                                 e->directional_steering_attn_scale,
-                                 e->directional_steering_ffn_scale);
+                                 s->steering_attn,
+                                 s->steering_ffn);
             token_vec_push(&s->checkpoint, token);
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
@@ -72113,8 +72175,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                                  token,
                                                  (uint32_t)s->checkpoint.len,
                                                  e->directional_steering_dirs,
-                                                 e->directional_steering_attn_scale,
-                                                 e->directional_steering_ffn_scale,
+                                                 s->steering_attn,
+                                                 s->steering_ffn,
                                                  &s->cpu_scratch);
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;

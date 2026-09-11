@@ -1761,15 +1761,16 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         } else if (!strncmp(cmd, "/steer", 6) &&
                    (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
             char *arg = trim_inplace(cmd + 6);
+            float attn = 0.0f, ffn = 0.0f;
+            ds4_session_directional_steering(chat.session, &attn, &ffn);
             if (!arg[0]) {
-                printf("Steering FFN: %g.\n",
-                       (double)ds4_session_directional_steering_ffn(chat.session));
+                printf("Steering FFN: %g.\n", (double)ffn);
             } else {
                 float scale = 0.0f;
                 if (!parse_steering_level(arg, &scale)) {
                     fprintf(stderr, "ds4: /steer must be between -100 and 100\n");
-                } else if (ds4_session_set_directional_steering_ffn(
-                                   chat.session, scale) == 0) {
+                } else if (ds4_session_set_directional_steering(
+                                   chat.session, attn, scale) == 0) {
                     cfg->engine.directional_steering_ffn = scale;
                     printf("Steering FFN: %g.\n", (double)scale);
                 }

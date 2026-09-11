@@ -11654,16 +11654,16 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     } else {
                         char *arg = cmd + 6;
                         while (*arg == ' ' || *arg == '\t') arg++;
+                        float attn = 0.0f, ffn = 0.0f;
+                        ds4_session_directional_steering(worker.session, &attn, &ffn);
                         if (!arg[0]) {
-                            printf("Steering FFN: %g.\n",
-                                   (double)ds4_session_directional_steering_ffn(
-                                           worker.session));
+                            printf("Steering FFN: %g.\n", (double)ffn);
                         } else {
                             float scale = 0.0f;
                             if (!parse_steering_level(arg, &scale)) {
                                 printf("usage: /steer <-100..100>\n");
-                            } else if (ds4_session_set_directional_steering_ffn(
-                                               worker.session, scale) == 0) {
+                            } else if (ds4_session_set_directional_steering(
+                                               worker.session, attn, scale) == 0) {
                                 worker.cfg->engine.directional_steering_ffn = scale;
                                 printf("Steering FFN: %g.\n", (double)scale);
                             }

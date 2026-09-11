@@ -321,6 +321,10 @@ int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen(ds4_engine *e);
+/* Whether --dir-steering-file was given at startup.  Sessions load their
+ * direction vectors from it, so a nonzero live steering scale is only
+ * meaningful when this is true. */
+bool ds4_engine_has_directional_steering(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
@@ -409,10 +413,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
-float ds4_session_directional_steering_ffn(ds4_session *s);
+/* The scales the next evaluation will use.  Either output may be NULL. */
+void ds4_session_directional_steering(ds4_session *s, float *attn, float *ffn);
 /* Change steering for future evaluation without rebuilding the existing KV
- * state. Live changes are currently limited to non-distributed sessions. */
-int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale);
+ * state: tokens already in the cache keep the scales they were computed with,
+ * only newly evaluated ones use the new values.  Live changes are currently
+ * limited to non-distributed sessions. */
+int ds4_session_set_directional_steering(ds4_session *s, float attn, float ffn);
+/* Whether this session accepts a live scale change at all.  Distributed and
+ * network tensor-parallel sessions replicate their KV across ranks, so their
+ * scales are fixed when the session is created. */
+bool ds4_session_directional_steering_mutable(ds4_session *s);
 bool ds4_session_is_distributed(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;

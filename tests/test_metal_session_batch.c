@@ -323,11 +323,24 @@ int main(void) {
     }
     if (steering_file && steering_file[0] && !tp_leader) {
         const float initial = opt.directional_steering_ffn;
-        if (ds4_session_directional_steering_ffn(batched[0]) != initial ||
-            ds4_session_set_directional_steering_ffn(batched[0], 0.0f) != 0 ||
-            ds4_session_directional_steering_ffn(batched[0]) != 0.0f ||
-            ds4_session_set_directional_steering_ffn(batched[0], initial) != 0 ||
-            ds4_session_directional_steering_ffn(batched[0]) != initial) {
+        const float initial_attn = opt.directional_steering_attn;
+        float attn = -1.0f, ffn = -1.0f;
+        ds4_session_directional_steering(batched[0], &attn, &ffn);
+        if (ffn != initial || attn != initial_attn) {
+            fail("live steering control", 0, -1);
+        }
+        if (ds4_session_set_directional_steering(batched[0], initial_attn, 0.0f) != 0) {
+            fail("live steering control", 0, -1);
+        }
+        ds4_session_directional_steering(batched[0], &attn, &ffn);
+        if (ffn != 0.0f || attn != initial_attn) {
+            fail("live steering control", 0, -1);
+        }
+        if (ds4_session_set_directional_steering(batched[0], initial_attn, initial) != 0) {
+            fail("live steering control", 0, -1);
+        }
+        ds4_session_directional_steering(batched[0], &attn, &ffn);
+        if (ffn != initial || attn != initial_attn) {
             fail("live steering control", 0, -1);
         }
     }
