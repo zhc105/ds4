@@ -16,8 +16,14 @@ The file shape depends on the model:
 
 - DeepSeek V4 Flash: `43 x 4096`.
 - GLM 5.3 Flash: `45 x 4096`. The separate MTP predictor layer is omitted.
+- Qwen 3.8-Flash-Next: `48 x 2560`.
+- Qwen 3.5-2B: `24 x 2048`.
 
 GLM 5.2 steering is not implemented.
+
+On the Qwen family the edit lands on the sub-layer output, before the
+hyper-connection combine spreads it into the wide residual: the same place in
+the layer the other families steer.
 
 ## Runtime Options
 
@@ -179,3 +185,46 @@ Style control:
 The method is not a fine-tune. It is a low-rank runtime edit, so it works best
 for coarse behavior, topic, or style directions that are consistently present in
 the activation captures.
+
+## Capturing Through a Running Server
+
+Every capture above starts a fresh `ds4`, which reloads the whole checkpoint:
+fine for a small model, but on a 70 GB one a single capture costs more than the
+extraction itself, and 100 prompt pairs takes over an hour.  `--server` reads
+the captures from a `ds4-server` that already holds the model instead, one
+request per prompt:
+
+```sh
+DS4_METAL_GRAPH_DUMP_PREFIX=/tmp/dir-dump/d \
+DS4_METAL_GRAPH_DUMP_NAME=ffn_out \
+DS4_METAL_GRAPH_DUMP_POS=0 \
+./ds4-server -m gguf/Qwen3.8-Flash-Next-NVFP4.gguf --ctx 262144 \
+  --host 0.0.0.0 --port 8000 --kv-disk-dir /tmp/ds4-kv
+
+python3 dir-steering/tools/build_direction.py \
+  --profile qwen3.8-flash-next \
+  --server http://127.0.0.1:8000 \
+  --dump-prefix /tmp/dir-dump/d \
+  --model-name qwen3.8-flash-next \
+  --good-file targets.txt \
+  --bad-file controls.txt \
+  --out dir-steering/out/qwen-direction.json \
+  --component ffn_out
+```
+
+The same 100 pairs take about a minute this way.
+
+- `--dump-prefix` must be the exact `DS4_METAL_GRAPH_DUMP_PREFIX` the server was
+  started with.  The builder reads `<prefix>_<component>-<layer>_pos0.bin` after
+  each request, so the files are copied out before the next request overwrites
+  them; run one extraction at a time.
+- The dump environment is read once, when the hooks first run, so it has to be
+  set on the server at start-up — and the server binary has to be the one built
+  with these hooks.
+- Requesting a dump disables the captured decode graphs, matching the guard the
+  batched path already uses: a dump synchronizes and restarts the command
+  batch, which a replay cannot express.
+- The capture is the **last row** of the chunk, i.e. the prompt's last token.
+  It has to be: row 0 is the prompt's first token, which a system prompt shared
+  by every prompt makes identical, and a good/bad pair of identical captures
+  normalizes to a zero direction that quietly does nothing.
