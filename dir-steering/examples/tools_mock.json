@@ -1,0 +1,45 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "read",
+      "description": "Read a file from the working directory and return its contents.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "Path of the file to read."}
+        },
+        "required": ["path"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write",
+      "description": "Write text to a file in the working directory, creating it or replacing what is there.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "Path of the file to write."},
+          "content": {"type": "string", "description": "Text to write."}
+        },
+        "required": ["path", "content"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "exec",
+      "description": "Run a shell command and return its output.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cmd": {"type": "string", "description": "Command line to run."}
+        },
+        "required": ["cmd"]
+      }
+    }
+  }
+]

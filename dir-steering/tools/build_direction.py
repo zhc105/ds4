@@ -125,6 +125,7 @@ def run_capture_server(
     component: str,
     n_layer: int,
     n_embd: int,
+    tools: list | None = None,
 ) -> list[list[float]]:
     """Capture from a ds4-server already running with the dump env set.
 
@@ -137,12 +138,15 @@ def run_capture_server(
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-    body = json.dumps({
+    payload = {
         "model": model_name,
         "messages": messages,
         "max_tokens": 1,
         "temperature": 0,
-    }).encode("utf-8")
+    }
+    if tools:
+        payload["tools"] = tools
+    body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url.rstrip("/") + "/v1/chat/completions",
         data=body,
@@ -152,6 +156,30 @@ def run_capture_server(
         response.read()
     return read_dump_rows(Path(dump_prefix), component, n_layer, n_embd)
 
+
+
+def load_tools(args) -> list | None:
+    """The tool definitions to present, or None for a plain chat request.
+
+    A direction can only be extracted over tool-calling behaviour if the model
+    is actually offered the tools: without them both prompts fall back to
+    "I can't do that" and the captures are identical.  The CLI has no way to
+    send tools, so --tools-* requires --server.
+    """
+    if args.tools_mock:
+        path = Path(__file__).resolve().parents[1] / "examples" / "tools_mock.json"
+    elif args.tools_file:
+        path = Path(args.tools_file)
+    else:
+        return None
+    tools = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(tools, list) or not tools:
+        raise SystemExit(f"{path}: expected a non-empty JSON array of tool definitions")
+    if not args.server:
+        raise SystemExit("--tools-file/--tools-mock need --server: the ds4 CLI cannot send tools")
+    print(f"presenting {len(tools)} tool(s): "
+          + ", ".join(t.get("function", {}).get("name", "?") for t in tools), flush=True)
+    return tools
 
 
 def add_rows(total: list[list[float]], rows: list[list[float]], n_layer: int) -> None:
@@ -186,6 +214,12 @@ def main() -> None:
                          "(required with --server)")
     ap.add_argument("--model-name", default="qwen3.8-flash-next",
                     help="served model name used with --server")
+    ap.add_argument("--tools-file", default="",
+                    help="JSON array of OpenAI-format tool definitions to offer the model "
+                         "while capturing (tool-calling behaviour needs them; --server only)")
+    ap.add_argument("--tools-mock", action="store_true",
+                    help="offer the bundled read/write/exec tool trio "
+                         "(dir-steering/examples/tools_mock.json)")
     ap.add_argument("--system", default="You are a helpful assistant.")
     ap.add_argument("--component", default="ffn_out",
                     choices=("ffn_out", "attn_out"),
@@ -198,6 +232,7 @@ def main() -> None:
                     help="do not remove the component parallel to the control mean")
     args = ap.parse_args()
 
+    tools = load_tools(args)
     if args.server and not args.dump_prefix:
         ap.error("--server needs --dump-prefix (the DS4_METAL_GRAPH_DUMP_PREFIX it runs with)")
     ds4 = Path(args.ds4).resolve()
@@ -225,10 +260,10 @@ def main() -> None:
             if args.server:
                 good_rows = run_capture_server(args.server, args.model_name, args.dump_prefix,
                                                good, args.system, args.component,
-                                               n_layer, n_embd)
+                                               n_layer, n_embd, tools)
                 bad_rows = run_capture_server(args.server, args.model_name, args.dump_prefix,
                                               bad, args.system, args.component,
-                                              n_layer, n_embd)
+                                              n_layer, n_embd, tools)
             else:
                 good_rows = run_capture(ds4, model, good, args.system, args.think,
                                         args.ctx, args.component, n_layer, n_embd, gw)
@@ -279,6 +314,7 @@ def main() -> None:
         "bad_file": str(Path(args.bad_file)),
         "model": args.model_name if args.server else str(model_arg),
         "capture": ("server " + args.server) if args.server else "cli",
+        "tools": [t.get("function", {}).get("name", "?") for t in tools] if tools else [],
         "source": args.source,
         "note": "runtime positive scale suppresses this direction; negative scale amplifies it",
     }

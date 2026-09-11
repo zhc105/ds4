@@ -228,3 +228,32 @@ The same 100 pairs take about a minute this way.
   It has to be: row 0 is the prompt's first token, which a system prompt shared
   by every prompt makes identical, and a good/bad pair of identical captures
   normalizes to a zero direction that quietly does nothing.
+
+### Tool-Calling Directions
+
+A direction over tool-calling behaviour only exists if the model is offered the
+tools while capturing: without them both sides of a pair fall back to "I can't
+do that" and the captures come out identical.  The `ds4` CLI has no way to send
+tools, so this works through `--server` only.
+
+- `--tools-mock` offers the bundled `read` / `write` / `exec` trio
+  (`examples/tools_mock.json`).
+- `--tools-file FILE` offers your own array in OpenAI function format.
+
+```sh
+python3 dir-steering/tools/build_direction.py \
+  --profile qwen3.8-flash-next \
+  --server http://127.0.0.1:8000 --dump-prefix /tmp/dir-dump/d \
+  --model-name qwen3.8-flash-next --tools-mock \
+  --good-file reads.txt --bad-file execs.txt \
+  --out dir-steering/out/tool-direction.json --component ffn_out
+```
+
+Check the split before extracting anything: send one prompt from each side and
+compare the responses (`finish_reason` is `tool_calls` or not).  If both sides
+emit a tool call, or both refuse, the pair carries no signal — the direction
+will come out zero and apply as a no-op that reports no error.
+
+The command above separates "read a file" from "run a command": a behaviour the
+model exercises freely, so the machinery can be validated without any content
+that is hard to check.
