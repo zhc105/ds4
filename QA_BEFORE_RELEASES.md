@@ -529,6 +529,17 @@ block. A GLM 5.2 pass does not cover these paths.
   warning-free build and one short steered GLM 5.3 Q2 prompt. Finally rerun a
   held-out target/control sweep; an effective edit that makes control answers
   repetitive or incoherent does not pass.
+- After per-request steering changes, check the HTTP path against a server
+  started with `--dir-steering-file` and `--dir-steering-ffn 1`: a request with
+  no `steering` object must match that baseline, `{"steering":{"ffn":0}}` must
+  match a server started with `--dir-steering-ffn 0`, and two concurrent
+  requests on different scales must each match their own solo run (that is the
+  check that no per-request value leaked through process-global state). A
+  request for a nonzero scale on a server started without the file, and any
+  scale change on a distributed or tensor-parallel server, must return 400.
+  On CUDA, repeat with `DS4_CUDA_DECODE_GRAPHS` enabled: a scale change has to
+  retire the captured decode islands, or the next replay would steer with the
+  previous request's value.
 - Run the two- and four-session GLM 5.3 server oracle below token 4096 on one
   M5 and physical TP. For both native single-M5 and TP paths, set
   `DS4_TEST_LOGIT_TOLERANCE=0.001`: row-batched reductions may differ from the

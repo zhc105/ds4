@@ -1897,6 +1897,31 @@ to `100` for subsequent tokens. The existing KV cache is kept. Live changes
 are currently limited to local sessions, not distributed inference or network
 tensor parallelism.
 
+A server started with `--dir-steering-*` takes those values as defaults, and a
+request may override either one for its own duration:
+
+```sh
+./ds4-server -m model.gguf --dir-steering-file direction.f32 --dir-steering-ffn 1
+curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "deepseek-v4-flash",
+  "messages": [{"role": "user", "content": "Explain TCP handshakes."}],
+  "steering": {"ffn": -1, "attn": 0}
+}'
+```
+
+Both members are independent and optional; an omitted member keeps the startup
+value. All four endpoints accept the object. A request that asks for a scale
+the server cannot honour -- no direction file was loaded, or the server is
+distributed or tensor-parallel -- is rejected with a 400 rather than silently
+running unsteered.
+
+Changing a scale applies to the tokens computed from that point on. It is
+deliberately **not** part of the KV cache identity: an already prefilled
+prefix, live or on disk, is reused unchanged, so the effect is attenuated by
+however much of the context sits in the cache, and a prefix prefilled at one
+scale and continued at another is reused rather than recomputed. Prefill and
+decode of one request always share the same scales.
+
 ## Test Vectors
 
 `tests/test-vectors` contains short and long-context continuation vectors

@@ -229,6 +229,7 @@ static void print_steering(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dir-steering-file FILE", "Load one f32 direction vector per layer.");
     opt(fp, c, "--dir-steering-ffn F", "Apply steering after FFN outputs. Default with file: 1");
     opt(fp, c, "--dir-steering-attn F", "Apply steering after attention outputs. Default: 0");
+    para(fp, c, "Positive scales remove the direction, negative scales amplify it. The scales are also the server's defaults: a request may override either one with {\"steering\":{\"ffn\":F,\"attn\":F}}. A scale change applies to the tokens computed from then on; the existing KV cache is reused unchanged.");
     fputc('\n', fp);
 }
 
@@ -346,6 +347,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
+    para(fp, c, "Requests may steer with \"steering\":{\"ffn\":F,\"attn\":F}. Members are independent and range -100..100; an omitted member keeps the --dir-steering-* value the server was started with.");
     fputc('\n', fp);
 }
 

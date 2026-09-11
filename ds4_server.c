@@ -887,6 +887,13 @@ typedef struct {
     bool top_p_set;
     bool min_p_set;
     bool top_k_set;
+    /* Per-request directional steering.  An unset member keeps the scale the
+     * server was started with; the effective values are resolved in
+     * generate_job(), not here. */
+    float steering_attn;
+    float steering_ffn;
+    bool steering_attn_set;
+    bool steering_ffn_set;
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
@@ -1075,6 +1082,59 @@ static bool request_validate_ignore_eos(const request *r,
     snprintf(err, errlen,
              "ignore_eos requires an explicit temperature of 0");
     return false;
+}
+
+/* "steering": { "ffn": F, "attn": A }.  Either member may be omitted, in which
+ * case the scale the server was started with applies; setting one to 0 turns
+ * that site off for this request.  Whether the server can honour the values at
+ * all is settled later, in server_request_steering_error(), which knows the
+ * startup configuration. */
+static bool parse_steering_object(const char **p, request *r) {
+    json_ws(p);
+    /* A non-object is a client error rather than a value to skip: silently
+     * dropping it would run the request at the default scale, which is what
+     * asking for steering was meant to avoid.  Members are optional; the
+     * object itself is not. */
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        const bool ffn_member = !strcmp(key, "ffn");
+        const bool attn_member = !strcmp(key, "attn");
+        free(key);
+        if (ffn_member || attn_member) {
+            /* json_number() is strtod(): it accepts "NaN" and "Infinity", so
+             * finiteness has to be checked explicitly. */
+            double v = 0.0;
+            if (!json_number(p, &v) || !isfinite(v) ||
+                v < -100.0 || v > 100.0) {
+                return false;
+            }
+            if (ffn_member) {
+                r->steering_ffn = (float)v;
+                r->steering_ffn_set = true;
+            } else {
+                r->steering_attn = (float)v;
+                r->steering_attn_set = true;
+            }
+        } else if (!json_skip_value(p)) {
+            return false;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
 }
 
 static void request_free(request *r) {
@@ -4020,6 +4080,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "steering")) {
+            if (!parse_steering_object(&p, r)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -4251,6 +4316,11 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "steering")) {
+            if (!parse_steering_object(&p, r)) {
                 free(key);
                 goto bad;
             }
@@ -5235,6 +5305,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "steering")) {
+            if (!parse_steering_object(&p, r)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "temperature")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -5464,6 +5539,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "steering")) {
+            if (!parse_steering_object(&p, r)) {
                 free(key);
                 goto bad;
             }
@@ -9768,6 +9848,12 @@ struct server {
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
+    /* The steering scales the server was started with.  A request that omits a
+     * member keeps these; resolving against a slot's session instead would
+     * leak one request's override into the next one that omits it. */
+    float steering_default_attn;
+    float steering_default_ffn;
+    bool steering_live_ok;
     kv_disk_cache kv;
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
@@ -9794,6 +9880,22 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+/* Why this request's steering cannot be honoured, or NULL when it can.  A
+ * request that only restates the startup scales is always acceptable, so the
+ * four endpoints share one check here rather than one per parser. */
+static const char *server_request_steering_error(server *s, const request *r) {
+    if (!r->steering_attn_set && !r->steering_ffn_set) return NULL;
+    const float attn = r->steering_attn_set ? r->steering_attn : s->steering_default_attn;
+    const float ffn = r->steering_ffn_set ? r->steering_ffn : s->steering_default_ffn;
+    if (attn == s->steering_default_attn && ffn == s->steering_default_ffn) {
+        return NULL;
+    }
+    if (s->steering_live_ok) return NULL;
+    return ds4_engine_has_directional_steering(s->engine) ?
+        "per-request steering is not supported by a distributed or tensor-parallel server" :
+        "per-request steering requires --dir-steering-file at startup";
+}
 
 static void server_inference_lock(server *s) {
     pthread_mutex_lock(&s->inference_mu);
@@ -14060,6 +14162,26 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     slot->running = j;
     pthread_mutex_unlock(&s->model_mu);
 
+    /* Resolve this request's steering against the startup defaults and install
+     * it before anything is evaluated: prefill writes the KV rows the decode
+     * then reads, so both halves of the request must see the same scales.  The
+     * values are pinned in `request`, never read back from the session, or a
+     * slot that served an override would leak it into the next request. */
+    const float steering_attn = j->req.steering_attn_set ?
+        j->req.steering_attn : s->steering_default_attn;
+    const float steering_ffn = j->req.steering_ffn_set ?
+        j->req.steering_ffn : s->steering_default_ffn;
+    if (ds4_session_set_directional_steering(slot->session,
+                                             steering_attn,
+                                             steering_ffn) != 0) {
+        /* server_request_steering_error() already refused everything the
+         * server knows it cannot honour, so this is an internal inconsistency
+         * rather than bad input.  Report it and run the request anyway instead
+         * of failing a generation that has not started emitting. */
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: request steering not applied, running with the session's current scales");
+    }
+
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
     ds4_session_set_cancel(slot->session, NULL, NULL);
@@ -14352,6 +14474,7 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"stop\","
             "\"seed\","
             "\"stream\","
+            "\"steering\","
             "\"reasoning_effort\"]}",
         ctx,
         ctx,
@@ -14571,6 +14694,12 @@ static void *client_main(void *arg) {
     }
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
+        request_free(&req);
+        goto done;
+    }
+    const char *steering_error = server_request_steering_error(s, &req);
+    if (steering_error) {
+        http_error(fd, s->enable_cors, 400, steering_error);
         request_free(&req);
         goto done;
     }
@@ -15167,6 +15296,8 @@ int main(int argc, char **argv) {
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
+    s.steering_default_attn = cfg.engine.directional_steering_attn;
+    s.steering_default_ffn = cfg.engine.directional_steering_ffn;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
@@ -15208,6 +15339,13 @@ int main(int argc, char **argv) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
     }
+    /* Whether an incoming request may move the steering scales.  The direction
+     * vectors have to exist, and the sessions have to accept a live change —
+     * distributed and network tensor-parallel sessions replicate their KV, so
+     * their scales are fixed when the session is created.  Every slot is built
+     * from the same engine and the same file, so slot 0 speaks for all. */
+    s.steering_live_ok = ds4_engine_has_directional_steering(engine) &&
+                         ds4_session_directional_steering_mutable(s.slots[0].session);
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: exact DSML tool replay disabled; tool history uses canonical JSON rendering");
@@ -16760,6 +16898,118 @@ static void test_request_defaults_use_min_p_filtering(void) {
     TEST_ASSERT(r.top_k == 0);
     TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
     TEST_ASSERT(!r.ignore_eos);
+    request_free(&r);
+}
+
+/* The parser is exercised directly: parse_*_request() tokenizes with the
+ * engine, which a unit test has no fixture for.  The bodies below then only
+ * prove each of the four key switches has the branch, by failing inside it
+ * with "invalid JSON request" before reaching tokenization. */
+static void test_request_steering_scales(void) {
+    request r;
+    server srv;
+    char err[128] = {0};
+    const char *p;
+
+    request_init(&r, REQ_CHAT, 128);
+    p = "{\"ffn\":1.5,\"attn\":-0.25}";
+    TEST_ASSERT(parse_steering_object(&p, &r));
+    TEST_ASSERT(*p == '\0');
+    TEST_ASSERT(r.steering_ffn_set && r.steering_ffn == 1.5f);
+    TEST_ASSERT(r.steering_attn_set && r.steering_attn == -0.25f);
+    request_free(&r);
+
+    /* An omitted member stays unset, so the startup scale survives. */
+    request_init(&r, REQ_CHAT, 128);
+    p = "{\"ffn\":0}";
+    TEST_ASSERT(parse_steering_object(&p, &r));
+    TEST_ASSERT(r.steering_ffn_set && r.steering_ffn == 0.0f);
+    TEST_ASSERT(!r.steering_attn_set);
+    request_free(&r);
+
+    /* Unknown members are skipped, like every other object parser here. */
+    request_init(&r, REQ_CHAT, 128);
+    p = "{\"note\":\"x\",\"attn\":2}";
+    TEST_ASSERT(parse_steering_object(&p, &r));
+    TEST_ASSERT(r.steering_attn_set && r.steering_attn == 2.0f);
+    request_free(&r);
+
+    /* A malformed member rejects the request outright -- never a silent
+     * fallback to the default scale.  "NaN" and "Infinity" are here because
+     * json_number() is strtod(), which accepts both. */
+    static const char *bad[] = {
+        "{\"ffn\":\"x\"}",
+        "{\"ffn\":101}",
+        "{\"attn\":-1e9}",
+        "{\"ffn\":NaN}",
+        "{\"ffn\":Infinity}",
+        "1.5",     /* a scalar where the object belongs */
+        "[]",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        request_init(&r, REQ_CHAT, 128);
+        p = bad[i];
+        TEST_ASSERT(!parse_steering_object(&p, &r));
+        request_free(&r);
+    }
+
+    /* Every endpoint dispatches on the key, not just /v1/chat/completions. */
+    static const struct {
+        const char *body;
+        bool        anthropic;
+        bool        responses;
+        bool        completion;
+    } wired[] = {
+        { "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+          "\"steering\":{\"ffn\":\"x\"}}", false, false, false },
+        { "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+          "\"steering\":{\"ffn\":\"x\"}}", true, false, false },
+        { "{\"input\":\"hi\",\"steering\":{\"ffn\":\"x\"}}", false, true, false },
+        { "{\"prompt\":\"hi\",\"steering\":{\"ffn\":\"x\"}}", false, false, true },
+    };
+    for (size_t i = 0; i < sizeof(wired) / sizeof(wired[0]); i++) {
+        bool ok;
+        request_init(&r, wired[i].completion ? REQ_COMPLETION : REQ_CHAT, 128);
+        if (wired[i].anthropic) {
+            ok = parse_anthropic_request(NULL, NULL, wired[i].body, 128, 32768,
+                                         &r, err, sizeof(err));
+        } else if (wired[i].responses) {
+            ok = parse_responses_request(NULL, NULL, wired[i].body, 128, 32768,
+                                         &r, err, sizeof(err));
+        } else if (wired[i].completion) {
+            ok = parse_completion_request(NULL, wired[i].body, 128, 32768,
+                                          &r, err, sizeof(err));
+        } else {
+            ok = parse_chat_request(NULL, NULL, wired[i].body, 128, 32768,
+                                    &r, err, sizeof(err));
+        }
+        TEST_ASSERT(!ok);
+        TEST_ASSERT(!strcmp(err, "invalid JSON request"));
+    }
+
+    /* Restating the startup pair is always allowed; asking for a change on a
+     * server that cannot steer is an error, not a silent fallback. */
+    memset(&srv, 0, sizeof(srv));
+    srv.steering_default_attn = 0.5f;
+    srv.steering_default_ffn = 1.0f;
+    srv.steering_live_ok = false;
+
+    request_init(&r, REQ_CHAT, 128);
+    r.steering_attn = 0.5f;
+    r.steering_attn_set = true;
+    r.steering_ffn = 1.0f;
+    r.steering_ffn_set = true;
+    TEST_ASSERT(server_request_steering_error(&srv, &r) == NULL);
+
+    r.steering_ffn = 0.0f;
+    const char *why = server_request_steering_error(&srv, &r);
+    TEST_ASSERT(why && strstr(why, "dir-steering-file") != NULL);
+
+    srv.steering_live_ok = true;
+    TEST_ASSERT(server_request_steering_error(&srv, &r) == NULL);
+
+    r.steering_ffn_set = false;
+    TEST_ASSERT(server_request_steering_error(&srv, &r) == NULL);
     request_free(&r);
 }
 
@@ -20652,6 +20902,7 @@ static void ds4_server_unit_tests_run(void) {
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
+    test_request_steering_scales();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();

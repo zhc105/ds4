@@ -33,6 +33,24 @@ the layer the other families steer.
 --dir-steering-attn F      apply steering after attention outputs; default is 0
 ```
 
+Over HTTP those scales are defaults, not constants: a request may override
+either one for its own duration, which makes a running server a convenient
+place to sweep a scale without restarting it.
+
+```sh
+"steering": {"ffn": 1.5, "attn": 0}
+```
+
+Members are independent and optional (an omitted member keeps the startup
+value), and all four server endpoints accept the object. The override reaches
+prefill as well as decode of that request, but it is deliberately not part of
+the KV cache identity: tokens already in the cache keep the scales they were
+computed with, so the observable effect is diluted in proportion to how much
+of the context is cached, and it converges as new tokens accumulate. That is
+the same contract as the interactive `/steer`, which is why a change is cheap
+and why a response depends on the scales used earlier in the same cached
+conversation.
+
 The FFN output is usually the best first target because it is late enough in
 each layer to represent behavior, style, and topic signals. Attention steering
 is available for experiments, but it can be more fragile.
