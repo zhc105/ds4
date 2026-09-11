@@ -16979,8 +16979,16 @@ static bool qwen_graph_apply_steering(
         uint32_t            rows,
         float               scale) {
     if (!g || !g->steering_dirs || scale == 0.0f) return true;
-    return ds4_gpu_directional_steering_project_tensor(y, g->steering_dirs, il,
-                                                       DS4_N_EMBD, rows, scale) != 0;
+    /* The MTP block reuses this layer code with il == DS4_N_LAYER, one past
+     * the last row of the table: the predictor carries no direction, so it
+     * runs unsteered rather than reading off the end of the tensor. */
+    if (il >= directional_steering_layer_count()) return true;
+    if (ds4_gpu_directional_steering_project_tensor(y, g->steering_dirs, il,
+                                                    DS4_N_EMBD, rows, scale) != 0) {
+        return true;
+    }
+    fprintf(stderr, "ds4: directional steering failed on layer %u\n", il);
+    return false;
 }
 
 static bool qwen_graph_layer_tail(
