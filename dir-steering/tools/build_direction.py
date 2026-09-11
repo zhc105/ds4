@@ -17,6 +17,7 @@ import math
 import os
 import subprocess
 import tempfile
+import urllib.request
 from pathlib import Path
 
 
@@ -93,9 +94,19 @@ def run_capture(
         error = result.stderr.decode("utf-8", errors="replace")
         raise RuntimeError(f"ds4 activation capture failed:\n{error}")
 
+    return read_dump_rows(work / "dump", component, n_layer, n_embd)
+
+
+def read_dump_rows(
+    stem: Path,
+    component: str,
+    n_layer: int,
+    n_embd: int,
+) -> list[list[float]]:
+    """Read one `<stem>_<component>-<layer>_pos0.bin` per layer."""
     rows: list[list[float]] = []
     for layer in range(n_layer):
-        path = work / f"dump_{component}-{layer}_pos0.bin"
+        path = Path(f"{stem}_{component}-{layer}_pos0.bin")
         data = array.array("f")
         with path.open("rb") as f:
             data.fromfile(f, path.stat().st_size // 4)
@@ -103,6 +114,44 @@ def run_capture(
             raise RuntimeError(f"bad dump shape for {path}: {len(data)} floats")
         rows.append(list(data[-n_embd:]))
     return rows
+
+
+def run_capture_server(
+    url: str,
+    model_name: str,
+    dump_prefix: str,
+    prompt: str,
+    system: str,
+    component: str,
+    n_layer: int,
+    n_embd: int,
+) -> list[list[float]]:
+    """Capture from a ds4-server already running with the dump env set.
+
+    The server keeps the model resident, so a prompt costs one prefill instead
+    of a full reload: start it with DS4_METAL_GRAPH_DUMP_PREFIX=<dump_prefix>,
+    DS4_METAL_GRAPH_DUMP_NAME=<component> and DS4_METAL_GRAPH_DUMP_POS=0, and
+    read the files back after each request (the next one overwrites them).
+    """
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    body = json.dumps({
+        "model": model_name,
+        "messages": messages,
+        "max_tokens": 1,
+        "temperature": 0,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        url.rstrip("/") + "/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=600) as response:
+        response.read()
+    return read_dump_rows(Path(dump_prefix), component, n_layer, n_embd)
+
 
 
 def add_rows(total: list[list[float]], rows: list[list[float]], n_layer: int) -> None:
@@ -129,6 +178,14 @@ def main() -> None:
     ap.add_argument("--source", default="",
                     help="optional corpus source or provenance note")
     ap.add_argument("--ctx", type=int, default=512)
+    ap.add_argument("--server", default="",
+                    help="capture through this ds4-server URL instead of spawning the CLI; "
+                         "the server must be running with the DS4_METAL_GRAPH_DUMP_* env set")
+    ap.add_argument("--dump-prefix", default="",
+                    help="the DS4_METAL_GRAPH_DUMP_PREFIX the server was started with "
+                         "(required with --server)")
+    ap.add_argument("--model-name", default="qwen3.8-flash-next",
+                    help="served model name used with --server")
     ap.add_argument("--system", default="You are a helpful assistant.")
     ap.add_argument("--component", default="ffn_out",
                     choices=("ffn_out", "attn_out"),
@@ -141,6 +198,8 @@ def main() -> None:
                     help="do not remove the component parallel to the control mean")
     args = ap.parse_args()
 
+    if args.server and not args.dump_prefix:
+        ap.error("--server needs --dump-prefix (the DS4_METAL_GRAPH_DUMP_PREFIX it runs with)")
     ds4 = Path(args.ds4).resolve()
     model_arg = Path(args.model)
     model = model_arg.resolve()
@@ -163,10 +222,18 @@ def main() -> None:
             bw = root / f"bad-{i}"
             gw.mkdir()
             bw.mkdir()
-            good_rows = run_capture(ds4, model, good, args.system, args.think,
-                                    args.ctx, args.component, n_layer, n_embd, gw)
-            bad_rows = run_capture(ds4, model, bad, args.system, args.think,
-                                   args.ctx, args.component, n_layer, n_embd, bw)
+            if args.server:
+                good_rows = run_capture_server(args.server, args.model_name, args.dump_prefix,
+                                               good, args.system, args.component,
+                                               n_layer, n_embd)
+                bad_rows = run_capture_server(args.server, args.model_name, args.dump_prefix,
+                                              bad, args.system, args.component,
+                                              n_layer, n_embd)
+            else:
+                good_rows = run_capture(ds4, model, good, args.system, args.think,
+                                        args.ctx, args.component, n_layer, n_embd, gw)
+                bad_rows = run_capture(ds4, model, bad, args.system, args.think,
+                                       args.ctx, args.component, n_layer, n_embd, bw)
             add_rows(good_sum, good_rows, n_layer)
             add_rows(bad_sum, bad_rows, n_layer)
             if args.pair_normalize:
@@ -210,7 +277,8 @@ def main() -> None:
         "orthogonalize_control_mean": not args.no_orthogonalize,
         "good_file": str(Path(args.good_file)),
         "bad_file": str(Path(args.bad_file)),
-        "model": str(model_arg),
+        "model": args.model_name if args.server else str(model_arg),
+        "capture": ("server " + args.server) if args.server else "cli",
         "source": args.source,
         "note": "runtime positive scale suppresses this direction; negative scale amplifies it",
     }

@@ -17118,8 +17118,11 @@ static bool qwen_graph_layer(
         if (ok) ok = qwen_graph_layer_run_island(g, m, l, next, il, 1u, att_bf16, n, graphs);
     }
     /* DS4_METAL_GRAPH_DUMP_NAME=ffn_out: this layer's FFN output, the
-     * activation dir-steering/tools/build_direction.py extracts from. */
-    if (ok) metal_graph_debug_dump_tensor("ffn_out", g->y, DS4_N_EMBD, il, pos0);
+     * activation dir-steering/tools/build_direction.py extracts from.  The
+     * whole chunk goes out, not just the first row: row 0 is the prompt's
+     * first token, which a shared system prompt makes identical for every
+     * prompt, and the builder reads the last row (the prompt's last token). */
+    if (ok) metal_graph_debug_dump_tensor("ffn_out", g->y, (uint64_t)n * DS4_N_EMBD, il, pos0);
     /* DS4_QWEN_TRACE=1: the CPU reference's per-layer norms for the chunk's
      * last row, to locate a divergence by layer and position. */
     if (ok && getenv("DS4_QWEN_TRACE")) {
