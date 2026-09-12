@@ -16423,7 +16423,11 @@ static bool qwen_layer_has_kv(bool mtp, uint32_t il) {
     return (il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER && !ds4_qwen_layer_is_gdn(il)) || (mtp && il == DS4_N_LAYER);
 }
 
-static void qwen_kv_pool_init(qwen_kv_pool *p, bool mtp, uint64_t limit_bytes) {
+static void qwen_kv_pool_give(qwen_kv_pool *p, ds4_gpu_tensor *page);
+
+/* With a limit every page is allocated here, so a session can only run
+ * out of pages, never into a device allocation failing mid-request. */
+static bool qwen_kv_pool_init(qwen_kv_pool *p, bool mtp, uint64_t limit_bytes) {
     memset(p, 0, sizeof(*p));
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     uint64_t at = 0;
@@ -16446,6 +16450,16 @@ static void qwen_kv_pool_init(qwen_kv_pool *p, bool mtp, uint64_t limit_bytes) {
     }
     fprintf(stderr, "ds4: Qwen KV pages of %.1f MiB (%u positions), pool limit %u pages (0: none)\n",
             (double)at * 2.0 / 1048576.0, QWEN_BLOCK_POSITIONS, p->limit);
+    for (uint32_t i = 0; i < p->limit; i++) {
+        ds4_gpu_tensor *page = ds4_gpu_tensor_alloc(at * 2u);
+        if (!page) {
+            fprintf(stderr, "ds4: failed to allocate KV page %u of %u\n", i + 1u, p->limit);
+            return false;
+        }
+        p->n_pages++;
+        qwen_kv_pool_give(p, page);
+    }
+    return true;
 }
 
 static ds4_gpu_tensor *qwen_kv_pool_take(qwen_kv_pool *p) {
@@ -67973,7 +67987,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          * session's is handed to the engine, the others alias it (their
          * own when it does not fit, at the cost of the batch). */
         ds4_qwen_gpu_graph *ws = e->share_session_prefill_workspace ? &e->qwen_workspace : NULL;
-        if (!e->qwen_pool.elems) qwen_kv_pool_init(&e->qwen_pool, e->mtp_ready, e->kv_pool_mb << 20);
+        if (!e->qwen_pool.elems && !qwen_kv_pool_init(&e->qwen_pool, e->mtp_ready, e->kv_pool_mb << 20)) {
+            qwen_kv_pool_free(&e->qwen_pool);
+            free(s);
+            return 1;
+        }
         if (!qwen_graph_alloc(&s->qwen_graph, (uint32_t)ctx_size, rows,
                               e->mtp_ready ? (uint32_t)e->mtp_draft_tokens + 1u : 0u,
                               &e->qwen_pool, ws && ws->slots ? ws : NULL)) {
