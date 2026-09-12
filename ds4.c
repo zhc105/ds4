@@ -16417,6 +16417,8 @@ typedef struct qwen_kv_pool {
     uint32_t idle_cap;
     uint32_t n_pages;                   /* allocated in all */
     uint32_t limit;                     /* pages, 0 for none */
+    ds4_kv_reclaim_fn reclaim;          /* the server's eviction, asked when the limit is hit */
+    void *reclaim_ud;
 } qwen_kv_pool;
 
 static bool qwen_layer_has_kv(bool mtp, uint32_t il) {
@@ -16428,7 +16430,11 @@ static void qwen_kv_pool_give(qwen_kv_pool *p, ds4_gpu_tensor *page);
 /* With a limit every page is allocated here, so a session can only run
  * out of pages, never into a device allocation failing mid-request. */
 static bool qwen_kv_pool_init(qwen_kv_pool *p, bool mtp, uint64_t limit_bytes) {
+    const ds4_kv_reclaim_fn reclaim = p->reclaim;   /* set before the first session */
+    void *reclaim_ud = p->reclaim_ud;
     memset(p, 0, sizeof(*p));
+    p->reclaim = reclaim;
+    p->reclaim_ud = reclaim_ud;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     uint64_t at = 0;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -16465,6 +16471,10 @@ static bool qwen_kv_pool_init(qwen_kv_pool *p, bool mtp, uint64_t limit_bytes) {
 static ds4_gpu_tensor *qwen_kv_pool_take(qwen_kv_pool *p) {
     if (p->n_idle) return p->idle[--p->n_idle];
     if (p->limit && p->n_pages >= p->limit) {
+        /* the pool is full: the server may evict an idle session (its
+         * pages come back through qwen_kv_pool_give) as often as it can */
+        while (p->reclaim && p->n_idle == 0u && p->reclaim(p->reclaim_ud)) {}
+        if (p->n_idle) return p->idle[--p->n_idle];
         fprintf(stderr, "ds4: KV page pool exhausted (%u pages of %.0f MiB)\n",
                 p->n_pages, (double)p->elems * 2.0 / 1048576.0);
         return NULL;
@@ -79201,6 +79211,33 @@ void ds4_session_invalidate(ds4_session *s) {
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     ds4_session_glm_reset_dense_cache(s);
+#endif
+}
+
+void ds4_engine_set_kv_reclaim(ds4_engine *e, ds4_kv_reclaim_fn fn, void *ud) {
+    if (!e) return;
+#ifdef DS4_QWEN_GPU
+    e->qwen_pool.reclaim = fn;
+    e->qwen_pool.reclaim_ud = ud;
+#else
+    (void)fn;
+    (void)ud;
+#endif
+}
+
+void ds4_session_drop_kv(ds4_session *s) {
+    if (!s) return;
+    ds4_session_invalidate(s);
+#ifdef DS4_QWEN_GPU
+    if (ds4_model_is_qwen() && !ds4_session_is_cpu(s)) {
+        /* the pages go back to the pool; the saved prompt states resumed
+         * rows that are gone, so they retire with the row history */
+        (void)qwen_graph_reset(&s->qwen_graph);
+        s->qwen_kv_tokens.len = 0;
+        for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) s->qwen_states[i].tokens.len = 0;
+        s->qwen_mtp_pending = false;
+        s->qwen_mtp_draft = -1;
+    }
 #endif
 }
 

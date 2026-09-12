@@ -595,6 +595,16 @@ bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
+/* Called on the inference thread when the Qwen K/V page pool has no page
+ * for a session that needs one: free some (ds4_session_drop_kv on an idle
+ * session, after saving it) and return true, or false when nothing can go.
+ * The engine retries the page after each true. */
+typedef bool (*ds4_kv_reclaim_fn)(void *ud);
+void ds4_engine_set_kv_reclaim(ds4_engine *e, ds4_kv_reclaim_fn fn, void *ud);
+/* Drop a session's live K/V and recurrent state; its pages return to the
+ * pool and its next prompt starts over (or loads from disk). */
+void ds4_session_drop_kv(ds4_session *s);
+
 /* Low-level graph slice entry points used by distributed inference.  The
  * transport/session routing logic lives in ds4_distributed.c. */
 int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen);

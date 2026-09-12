@@ -9851,6 +9851,7 @@ struct server_slot {
     int decode_ntok;
     int decode_rc;
     char decode_err[160];
+    double last_used;   /* when a job was last dispatched to or finished on the slot */
 };
 
 static bool id_list_contains(const stop_list *ids, const char *id);
@@ -10944,18 +10945,21 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
-                                            const char *cache_text_key) {
+                                            const char *cache_text_key,
+                                            bool inference_locked) {
     if (!s || !slot) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    pthread_mutex_lock(&s->inference_mu);
+    /* inference_locked: the caller is the inference thread itself (the
+     * engine's page reclaim), which already holds the lock */
+    if (!inference_locked) pthread_mutex_lock(&s->inference_mu);
     /* The payload contains image-conditioned KV rows, but the disk key and
      * trailer do not contain image fingerprints. Never let generic image
      * placeholder tokens become a cache hit for a different image.
      * sync_image_count covers progress-callback writes during prefill;
      * checkpoint_image_count covers completed sessions. */
     if (ds4_session_has_vision_state(slot->session)) {
-        pthread_mutex_unlock(&s->inference_mu);
+        if (!inference_locked) pthread_mutex_unlock(&s->inference_mu);
         return false;
     }
     const ds4_kvstore_store_request req = {
@@ -10971,10 +10975,12 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     pthread_mutex_lock(&s->kv_mu);
     char *path = ds4_kvstore_store(&s->kv, s->engine, slot->session, &req, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
-    pthread_mutex_unlock(&s->inference_mu);
+    if (!inference_locked) pthread_mutex_unlock(&s->inference_mu);
     if (path) {
         free(slot->kv_path);
         slot->kv_path = path;
+    } else if (err[0]) {
+        server_log(DS4_LOG_WARNING, "ds4-server: kv cache store (%s) failed: %s", reason, err);
     }
     return path != NULL;
 }
@@ -10983,7 +10989,7 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
-                                           NULL, 0, NULL);
+                                           NULL, 0, NULL, false);
 }
 
 /* Before the live session is stored away for another conversation, mark
@@ -11002,7 +11008,7 @@ static void kv_cache_touch_prompt_file(server *s, const char *prompt_text) {
 }
 
 static void kv_cache_store_current(server *s, server_slot *slot,
-                                   const char *reason) {
+                                   const char *reason, bool inference_locked) {
     if (!s || !slot) return;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
@@ -11035,13 +11041,49 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * key that payload by the visible protocol transcript, not by rendering the
      * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
      * tokenizes only the visible suffix that follows this key. */
-    if (visible_text) {
-        kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
-        free(visible_text);
-    } else {
-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
+    kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
+                                    visible_text, visible_ext, visible_key,
+                                    inference_locked);
+    free(visible_text);
+}
+
+/* The engine's K/V page pool ran dry on the inference thread, which holds
+ * inference_mu: put the least recently used idle slot's conversation on
+ * disk (its next request loads it back) and drop its live state, so its
+ * pages return to the pool.  The slot counts as busy meanwhile, so no job
+ * is dispatched onto it; a generating slot is never taken. */
+static void dispatch_jobs_locked(server *s);
+
+static bool server_kv_reclaim(void *ud) {
+    server *s = ud;
+    pthread_mutex_lock(&s->mu);
+    server_slot *victim = NULL;
+    for (int i = 0; i < s->slot_count; i++) {
+        server_slot *slot = &s->slots[i];
+        if (slot->busy || slot->assigned || slot->running) continue;
+        if (ds4_session_pos(slot->session) == 0) continue;
+        if (!victim || slot->last_used < victim->last_used) victim = slot;
     }
+    if (victim) victim->busy = true;
+    pthread_mutex_unlock(&s->mu);
+    if (!victim) {
+        server_log(DS4_LOG_WARNING, "ds4-server: kv pool full and every slot is generating");
+        return false;
+    }
+    const int tokens = ds4_session_pos(victim->session);
+    if (s->kv.enabled && tokens >= s->kv.opt.min_tokens) {
+        kv_cache_store_current(s, victim, "kv-pool", true);
+    }
+    ds4_session_drop_kv(victim->session);
+    free(victim->kv_path);
+    victim->kv_path = NULL;
+    server_log(DS4_LOG_DEFAULT, "ds4-server: kv pool full: evicted slot %d (%d tokens) to disk",
+               victim->id, tokens);
+    pthread_mutex_lock(&s->mu);
+    victim->busy = false;
+    dispatch_jobs_locked(s);
+    pthread_mutex_unlock(&s->mu);
+    return true;
 }
 
 #ifdef DS4_SERVER_TEST
@@ -13145,7 +13187,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         kv_cache_touch_prompt_file(s, j->req.prompt_text);
-        kv_cache_store_current(s, slot, "evict");
+        kv_cache_store_current(s, slot, "evict", false);
     }
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
@@ -14325,6 +14367,7 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
+        chosen_slot->last_used = now_sec();
         pthread_cond_broadcast(&s->cv);
     }
 }
@@ -14394,6 +14437,7 @@ static void *slot_worker_main(void *arg) {
 
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
+        slot->last_used = now_sec();
         dispatch_jobs_locked(s);
         pthread_mutex_unlock(&s->mu);
     }
@@ -15340,6 +15384,7 @@ int main(int argc, char **argv) {
 
     server s = {0};
     s.engine = engine;
+    ds4_engine_set_kv_reclaim(engine, server_kv_reclaim, &s);
     s.tp_leader = tp_leader;
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
@@ -15536,7 +15581,7 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting resident KV cache before shutdown slot=%d tokens=%d",
                    i, tokens->len);
-        kv_cache_store_current(&s, slot, "shutdown");
+        kv_cache_store_current(&s, slot, "shutdown", false);
     }
     server_close_resources(&s);
     return 0;
