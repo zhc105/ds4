@@ -12175,11 +12175,13 @@ static int server_session_sync(server *s, server_slot *slot,
         return rc;
     }
 
+    /* The first piece must reach past where the engine resumes from (the
+     * live frontier, or a saved turn-boundary state when the prompt edits
+     * the history), or the engine sees a prompt no saved state begins and
+     * recomputes everything from the start, one piece at a time. */
     pthread_mutex_lock(&s->inference_mu);
-    int live = ds4_session_pos(slot->session);
-    int common = ds4_session_common_prefix(slot->session, prompt);
+    int done = ds4_session_resume_pos(slot->session, prompt);
     pthread_mutex_unlock(&s->inference_mu);
-    int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
 
     while (!g_stop_requested && !slot_job_cancelled(slot) &&

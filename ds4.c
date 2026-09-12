@@ -79214,6 +79214,27 @@ void ds4_session_invalidate(ds4_session *s) {
 #endif
 }
 
+int ds4_session_resume_pos(ds4_session *s, const ds4_tokens *prompt) {
+    if (!s || !prompt) return 0;
+    const int live = s->checkpoint_valid ? s->checkpoint.len : 0;
+    if (live > 0 && prompt->len >= live && ds4_tokens_starts_with(prompt, &s->checkpoint)) return live;
+#ifdef DS4_QWEN_GPU
+    if (ds4_model_is_qwen() && !ds4_session_is_cpu(s)) {
+        /* the copies a sync would restore (qwen_session_state_restore) */
+        int best = 0;
+        for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
+            const qwen_state_copy *c = &s->qwen_states[i];
+            if (c->tokens.len > best &&
+                qwen_state_copy_resumes(s, c, prompt, s->sync_images, s->sync_image_count)) {
+                best = c->tokens.len;
+            }
+        }
+        return best;
+    }
+#endif
+    return 0;
+}
+
 void ds4_engine_set_kv_reclaim(ds4_engine *e, ds4_kv_reclaim_fn fn, void *ud) {
     if (!e) return;
 #ifdef DS4_QWEN_GPU

@@ -604,6 +604,11 @@ void ds4_engine_set_kv_reclaim(ds4_engine *e, ds4_kv_reclaim_fn fn, void *ud);
 /* Drop a session's live K/V and recurrent state; its pages return to the
  * pool and its next prompt starts over (or loads from disk). */
 void ds4_session_drop_kv(ds4_session *s);
+/* The position ds4_session_sync would resume `prompt` from without
+ * recomputing: the live frontier when the prompt extends it, else the
+ * longest saved state that begins it, else 0.  A caller feeding the
+ * prompt in pieces must start its first piece past this. */
+int ds4_session_resume_pos(ds4_session *s, const ds4_tokens *prompt);
 
 /* Low-level graph slice entry points used by distributed inference.  The
  * transport/session routing logic lives in ds4_distributed.c. */
