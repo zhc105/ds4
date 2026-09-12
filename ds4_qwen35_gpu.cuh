@@ -443,54 +443,98 @@ __global__ static void qwen35_gemm_mma_kernel(
     qwen35_mma_tile(out, out_dim, scale, orow, xr, w, wtype, in_dim, col0, smem);
 }
 
-/* Decode-sized BF16 matvec: a warp per output column walks the weight row
- * once and dots it with every activation row (up to 8, a speculative
- * batch), so the bandwidth-bound weight read is not repeated per token. */
-template <int N>
+/* Decode-sized BF16 matvec: W warps share an output column (split-K, the
+ * block reduces their partials), each lane taking eight weights (one
+ * 16-byte load) per step, and every activation row of a speculative batch
+ * (up to 8) is dotted from the same weight read.  W follows the shape
+ * (qwen35_matvec_split): a narrow output leaves too few warps to cover
+ * the DRAM latency with one warp per column, a short row too few steps. */
+template <int N, int W>
 __global__ static void qwen35_matvec_bf16_rows_kernel(
         float *out, const uint16_t *weights, const float *x, uint32_t in_dim, uint32_t out_dim) {
+    __shared__ float part[8][N];
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t col = blockIdx.x * 8u + warp;
+    const uint32_t col = blockIdx.x * (8u / W) + warp / W;
+    const uint32_t kw = warp % W;
     if (col >= out_dim) return;
     float sum[N];
 #pragma unroll
     for (int r = 0; r < N; r++) sum[r] = 0.0f;
-    /* four weights (8 bytes) and four activations (16 bytes) per lane per step */
-    const uint2 *wrow = (const uint2 *)(weights + (uint64_t)col * in_dim);
-    for (uint32_t i = lane; i < in_dim / 4u; i += 32u) {
-        const uint2 wq = wrow[i];
+    const uint4 *wrow = (const uint4 *)(weights + (uint64_t)col * in_dim);
+    for (uint32_t i = kw * 32u + lane; i < in_dim / 8u; i += 32u * W) {
+        const uint4 wq = wrow[i];
         const float w0 = __uint_as_float(wq.x << 16), w1 = __uint_as_float(wq.x & 0xffff0000u);
         const float w2 = __uint_as_float(wq.y << 16), w3 = __uint_as_float(wq.y & 0xffff0000u);
+        const float w4 = __uint_as_float(wq.z << 16), w5 = __uint_as_float(wq.z & 0xffff0000u);
+        const float w6 = __uint_as_float(wq.w << 16), w7 = __uint_as_float(wq.w & 0xffff0000u);
 #pragma unroll
         for (int r = 0; r < N; r++) {
-            const float4 xv = *(const float4 *)(x + (uint64_t)r * in_dim + i * 4u);
-            sum[r] = fmaf(w0, xv.x, sum[r]);
-            sum[r] = fmaf(w1, xv.y, sum[r]);
-            sum[r] = fmaf(w2, xv.z, sum[r]);
-            sum[r] = fmaf(w3, xv.w, sum[r]);
+            const float4 *xs = (const float4 *)(x + (uint64_t)r * in_dim + i * 8u);
+            const float4 xa = xs[0], xb = xs[1];
+            sum[r] = fmaf(w0, xa.x, sum[r]);
+            sum[r] = fmaf(w1, xa.y, sum[r]);
+            sum[r] = fmaf(w2, xa.z, sum[r]);
+            sum[r] = fmaf(w3, xa.w, sum[r]);
+            sum[r] = fmaf(w4, xb.x, sum[r]);
+            sum[r] = fmaf(w5, xb.y, sum[r]);
+            sum[r] = fmaf(w6, xb.z, sum[r]);
+            sum[r] = fmaf(w7, xb.w, sum[r]);
         }
     }
 #pragma unroll
     for (int r = 0; r < N; r++) {
         const float total = warp_sum_f32(sum[r]);
-        if (lane == 0u) out[(uint64_t)r * out_dim + col] = total;
+        if (W == 1) {
+            if (lane == 0u) out[(uint64_t)r * out_dim + col] = total;
+        } else if (lane == 0u) {
+            part[warp][r] = total;
+        }
+    }
+    if (W == 1) return;
+    __syncthreads();
+    if (kw == 0u && lane == 0u) {
+#pragma unroll
+        for (int r = 0; r < N; r++) {
+            float total = 0.0f;
+            for (int j = 0; j < W; j++) total += part[warp + j][r];
+            out[(uint64_t)r * out_dim + col] = total;
+        }
+    }
+}
+
+/* Warps per output column for a decode matvec of this shape (measured on
+ * GB10, DRAM-honest): short rows are best unsplit, a row of 2560 or more
+ * with up to 2560 columns wants the full eight, wider outputs four. */
+static uint32_t qwen35_matvec_split(uint32_t in_dim, uint32_t out_dim) {
+    if (in_dim <= 1024u) return 1u;
+    return out_dim <= 2560u ? 8u : 4u;
+}
+
+template <int N>
+static void qwen35_matvec_bf16_split(
+        float *out, const uint16_t *w, const float *x, uint32_t in_dim, uint32_t out_dim, cudaStream_t stream) {
+    const uint32_t W = qwen35_matvec_split(in_dim, out_dim);
+    const dim3 grid((out_dim + 8u / W - 1u) / (8u / W), 1u, 1u);
+    switch (W) {
+    case 1: qwen35_matvec_bf16_rows_kernel<N, 1><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 4: qwen35_matvec_bf16_rows_kernel<N, 4><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    default: qwen35_matvec_bf16_rows_kernel<N, 8><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
     }
 }
 
 static void qwen35_matvec_bf16_rows(
         float *out, const uint16_t *w, const float *x, uint32_t in_dim, uint32_t out_dim, uint32_t n_tok,
         cudaStream_t stream) {
-    const dim3 grid((out_dim + 7u) / 8u, 1u, 1u);
     switch (n_tok) {
-    case 1: qwen35_matvec_bf16_rows_kernel<1><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
-    case 2: qwen35_matvec_bf16_rows_kernel<2><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
-    case 3: qwen35_matvec_bf16_rows_kernel<3><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
-    case 4: qwen35_matvec_bf16_rows_kernel<4><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
-    case 5: qwen35_matvec_bf16_rows_kernel<5><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
-    case 6: qwen35_matvec_bf16_rows_kernel<6><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
-    case 7: qwen35_matvec_bf16_rows_kernel<7><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
-    default: qwen35_matvec_bf16_rows_kernel<8><<<grid, 256, 0, stream>>>(out, w, x, in_dim, out_dim); break;
+    case 1: qwen35_matvec_bf16_split<1>(out, w, x, in_dim, out_dim, stream); break;
+    case 2: qwen35_matvec_bf16_split<2>(out, w, x, in_dim, out_dim, stream); break;
+    case 3: qwen35_matvec_bf16_split<3>(out, w, x, in_dim, out_dim, stream); break;
+    case 4: qwen35_matvec_bf16_split<4>(out, w, x, in_dim, out_dim, stream); break;
+    case 5: qwen35_matvec_bf16_split<5>(out, w, x, in_dim, out_dim, stream); break;
+    case 6: qwen35_matvec_bf16_split<6>(out, w, x, in_dim, out_dim, stream); break;
+    case 7: qwen35_matvec_bf16_split<7>(out, w, x, in_dim, out_dim, stream); break;
+    default: qwen35_matvec_bf16_split<8>(out, w, x, in_dim, out_dim, stream); break;
     }
 }
 
@@ -838,19 +882,20 @@ __device__ __forceinline__ void qwen35_unpack8(uint32_t a, uint32_t b, float *f)
     f[6] = (float)(int8_t)((b >> 16) & 0xffu); f[7] = (float)(int8_t)(b >> 24);
 }
 
-/* Decode matvec over the packed layout: two warps per output column split
- * the row, a lane takes 16 quants (one 16-byte load, half a block) per
- * step, so a warp step streams 512 weights, and the activation rows of a
- * speculative batch are dotted from the same weights.  Measured at the
- * device's plain-read bandwidth on every bypass shape. */
-template <int N>
+/* Decode matvec over the packed layout: W warps per output column split
+ * the row (four up to 2560 columns, two beyond), a lane takes 16 quants
+ * (one 16-byte load, half a block) per step, so a warp step streams 512
+ * weights, and the activation rows of a speculative batch are dotted from
+ * the same weights.  Measured at the device's plain-read bandwidth on
+ * every bypass shape. */
+template <int N, int W>
 __global__ static void qwen35_matvec_q8p_rows_kernel(
         float *out, const int8_t *q, const __half *s, const float *x, uint32_t in_dim, uint32_t out_dim) {
     __shared__ float part[8][N];
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t col = blockIdx.x * 4u + (warp >> 1u);
-    const uint32_t kw = warp & 1u;
+    const uint32_t col = blockIdx.x * (8u / W) + warp / W;
+    const uint32_t kw = warp % W;
     if (col >= out_dim) return;
     const uint4 *qrow = (const uint4 *)(q + (uint64_t)col * in_dim);
     const __half *srow = s + (uint64_t)col * (in_dim / 32u);
@@ -858,7 +903,7 @@ __global__ static void qwen35_matvec_q8p_rows_kernel(
     float sum[N];
 #pragma unroll
     for (int r = 0; r < N; r++) sum[r] = 0.0f;
-    for (uint32_t i = kw * 32u + lane; i < steps; i += 64u) {
+    for (uint32_t i = kw * 32u + lane; i < steps; i += 32u * W) {
         const uint4 wq = qrow[i];
         const float d = __half2float(srow[i >> 1]);
         float wf[16];
@@ -884,24 +929,37 @@ __global__ static void qwen35_matvec_q8p_rows_kernel(
     __syncthreads();
     if (kw == 0u && lane == 0u) {
 #pragma unroll
-        for (int r = 0; r < N; r++) out[(uint64_t)r * out_dim + col] = part[warp][r] + part[warp + 1u][r];
+        for (int r = 0; r < N; r++) {
+            float total = 0.0f;
+            for (int j = 0; j < W; j++) total += part[warp + j][r];
+            out[(uint64_t)r * out_dim + col] = total;
+        }
+    }
+}
+
+template <int N>
+static void qwen35_matvec_q8p_split(
+        float *out, const qwen35_q8_pack *p, const float *x, cudaStream_t stream) {
+    const int8_t *q = p->quants;
+    const __half *s = p->scales;
+    if (p->out_dim <= 2560u) {
+        qwen35_matvec_q8p_rows_kernel<N, 4><<<(p->out_dim + 1u) / 2u, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim);
+    } else {
+        qwen35_matvec_q8p_rows_kernel<N, 2><<<(p->out_dim + 3u) / 4u, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim);
     }
 }
 
 static void qwen35_matvec_q8p_rows(
         float *out, const qwen35_q8_pack *p, const float *x, uint32_t n_tok, cudaStream_t stream) {
-    const dim3 grid((p->out_dim + 3u) / 4u, 1u, 1u);
-    const int8_t *q = p->quants;
-    const __half *s = p->scales;
     switch (n_tok) {
-    case 1: qwen35_matvec_q8p_rows_kernel<1><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
-    case 2: qwen35_matvec_q8p_rows_kernel<2><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
-    case 3: qwen35_matvec_q8p_rows_kernel<3><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
-    case 4: qwen35_matvec_q8p_rows_kernel<4><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
-    case 5: qwen35_matvec_q8p_rows_kernel<5><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
-    case 6: qwen35_matvec_q8p_rows_kernel<6><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
-    case 7: qwen35_matvec_q8p_rows_kernel<7><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
-    default: qwen35_matvec_q8p_rows_kernel<8><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
+    case 1: qwen35_matvec_q8p_split<1>(out, p, x, stream); break;
+    case 2: qwen35_matvec_q8p_split<2>(out, p, x, stream); break;
+    case 3: qwen35_matvec_q8p_split<3>(out, p, x, stream); break;
+    case 4: qwen35_matvec_q8p_split<4>(out, p, x, stream); break;
+    case 5: qwen35_matvec_q8p_split<5>(out, p, x, stream); break;
+    case 6: qwen35_matvec_q8p_split<6>(out, p, x, stream); break;
+    case 7: qwen35_matvec_q8p_split<7>(out, p, x, stream); break;
+    default: qwen35_matvec_q8p_split<8>(out, p, x, stream); break;
     }
 }
 
@@ -1103,7 +1161,7 @@ extern "C" int ds4_gpu_qwen35_matmul(
     /* The BF16 matvec (9 GiB of bypass weights per Flash-Next decode step)
      * runs at the memory bandwidth; every weight is read once for all the
      * rows of a speculative batch. */
-    if (wtype == QWEN35_W_BF16 && in_dim % 4u == 0u) {
+    if (wtype == QWEN35_W_BF16 && in_dim % 8u == 0u) {
         qwen35_matvec_bf16_rows(o, (const uint16_t *)w, xp, in_dim, out_dim, n_tok, stream);
     } else if (wtype == QWEN35_W_BF16) {
         const dim3 grid((out_dim + 7u) / 8u, n_tok, 1u);
