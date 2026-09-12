@@ -693,6 +693,288 @@ static ds4_gpu_tensor *qwen35_f32_activation_scratch(uint64_t elems) {
     return buf;
 }
 
+/* ---- Load-time q8 -----------------------------------------------------
+ * Bypass projections the engine quantises as it loads them (ds4.c decides
+ * which): int8 quants [out][in] contiguous and the fp16 block scales
+ * [out][in/32] apart, GGML q8_0's numbers (a block of 32, d = amax/127,
+ * q = round(x/d)) in a layout the decode kernel can stream with 16-byte
+ * loads.  GGML q8_0 interleaves the 2-byte scale with every 32 quants, so
+ * a row is only 2-byte aligned and its kernel loads bytes: 200 GB/s where
+ * this layout reaches the 245 GB/s of a plain read.  A q8_0 tensor in the
+ * file is re-laid identically, a bf16 one quantised; the source span is
+ * then not cached on the device (ds4_gpu_model_range_replaced). */
+
+struct qwen35_q8_pack {
+    const void *map;
+    uint64_t    offset;
+    uint32_t    in_dim;
+    uint32_t    out_dim;
+    int8_t     *quants;
+    __half     *scales;
+};
+
+static std::vector<qwen35_q8_pack> g_qwen35_q8_packs;
+
+static const qwen35_q8_pack *qwen35_q8_pack_find(const void *map, uint64_t offset) {
+    for (const qwen35_q8_pack &p : g_qwen35_q8_packs) {
+        if (p.map == map && p.offset == offset) return &p;
+    }
+    return NULL;
+}
+
+static int qwen35_q8_pack_replaces(const void *map, uint64_t offset) {
+    return qwen35_q8_pack_find(map, offset) != NULL;
+}
+
+/* One thread per block of 32: quantise a bf16 row segment (the converter's
+ * q8_0_quantize: half-away-from-zero rounding, d = amax / 127 in f32). */
+__global__ static void qwen35_q8_pack_bf16_kernel(
+        int8_t *q, __half *s, const uint16_t *src, uint32_t in_dim, uint64_t n_blocks) {
+    const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const uint2 *w = (const uint2 *)(src + b * 32u);
+    float v[32];
+    for (uint32_t i = 0; i < 8u; i++) {
+        const uint2 p = w[i];
+        v[i * 4u] = __uint_as_float(p.x << 16); v[i * 4u + 1u] = __uint_as_float(p.x & 0xffff0000u);
+        v[i * 4u + 2u] = __uint_as_float(p.y << 16); v[i * 4u + 3u] = __uint_as_float(p.y & 0xffff0000u);
+    }
+    float amax = 0.0f;
+    for (uint32_t i = 0; i < 32u; i++) amax = fmaxf(amax, fabsf(v[i]));
+    const float d = amax / 127.0f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    s[b] = __float2half(d);
+    uint32_t packed[8];
+    for (uint32_t i = 0; i < 8u; i++) {
+        uint32_t word = 0;
+        for (uint32_t j = 0; j < 4u; j++) {
+            const float x = v[i * 4u + j] * id;
+            const float r = truncf(x + copysignf(0.5f, x));
+            const int qi = (int)fminf(fmaxf(r, -127.0f), 127.0f);
+            word |= ((uint32_t)qi & 0xffu) << (8u * j);
+        }
+        packed[i] = word;
+    }
+    ((uint4 *)q)[b * 2u] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+    ((uint4 *)q)[b * 2u + 1u] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+    (void)in_dim;
+}
+
+/* One thread per block: split a GGML q8_0 block (2-byte scale, 32 quants). */
+__global__ static void qwen35_q8_pack_q8_0_kernel(
+        int8_t *q, __half *s, const uint8_t *src, uint64_t n_blocks) {
+    const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const uint8_t *blk = src + b * 34u;
+    uint16_t bits;
+    memcpy(&bits, blk, 2);
+    s[b] = __ushort_as_half(bits);
+    for (uint32_t i = 0; i < 32u; i++) q[b * 32u + i] = (int8_t)blk[2u + i];
+}
+
+extern "C" int ds4_gpu_qwen35_q8_pack(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    offset,
+        uint32_t    wtype,
+        uint32_t    in_dim,
+        uint32_t    out_dim,
+        const char *name) {
+    const uint64_t bytes = qwen35_weight_bytes(wtype, in_dim, out_dim);
+    if (!model_map || bytes == 0u || in_dim % 32u != 0u || offset > model_size || bytes > model_size - offset ||
+        (wtype != QWEN35_W_BF16 && wtype != QWEN35_W_Q8_0)) {
+        return 0;
+    }
+    if (qwen35_q8_pack_find(model_map, offset)) return 1;
+    const uint64_t n_blocks = (uint64_t)out_dim * (in_dim / 32u);
+    qwen35_q8_pack p = { model_map, offset, in_dim, out_dim, NULL, NULL };
+    if (cudaMalloc(&p.quants, n_blocks * 32u) != cudaSuccess ||
+        cudaMalloc(&p.scales, n_blocks * sizeof(__half)) != cudaSuccess) {
+        fprintf(stderr, "ds4: failed to allocate the packed q8 %s\n", name ? name : "weight");
+        if (p.quants) (void)cudaFree(p.quants);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    /* the source comes through host memory in row chunks: it may live in
+     * nothing but the file mapping, since its span is never cached */
+    const uint64_t row_bytes = bytes / out_dim;
+    const uint64_t chunk_rows = (256ull << 20) / row_bytes > 0u ? (256ull << 20) / row_bytes : 1u;
+    void *stage = NULL;
+    if (cudaMalloc(&stage, chunk_rows * row_bytes) != cudaSuccess) {
+        (void)cudaFree(p.quants); (void)cudaFree(p.scales); (void)cudaGetLastError();
+        return 0;
+    }
+    const char *src = (const char *)model_map + offset;
+    bool ok = true;
+    for (uint64_t r0 = 0; ok && r0 < out_dim; r0 += chunk_rows) {
+        const uint64_t rows = out_dim - r0 < chunk_rows ? out_dim - r0 : chunk_rows;
+        const uint64_t blocks = rows * (in_dim / 32u);
+        const uint64_t b0 = r0 * (in_dim / 32u);
+        ok = cudaMemcpy(stage, src + r0 * row_bytes, rows * row_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+        if (!ok) break;
+        const unsigned grid = (unsigned)((blocks + 255u) / 256u);
+        if (wtype == QWEN35_W_BF16) {
+            qwen35_q8_pack_bf16_kernel<<<grid, 256>>>(p.quants + b0 * 32u, p.scales + b0, (const uint16_t *)stage, in_dim, blocks);
+        } else {
+            qwen35_q8_pack_q8_0_kernel<<<grid, 256>>>(p.quants + b0 * 32u, p.scales + b0, (const uint8_t *)stage, blocks);
+        }
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    if (ok) ok = cudaDeviceSynchronize() == cudaSuccess;
+    (void)cudaFree(stage);
+    if (!ok) {
+        fprintf(stderr, "ds4: packing q8 %s failed: %s\n", name ? name : "weight", cudaGetErrorString(cudaGetLastError()));
+        (void)cudaFree(p.quants); (void)cudaFree(p.scales);
+        return 0;
+    }
+    g_qwen35_q8_packs.push_back(p);
+    return 1;
+}
+
+__device__ __forceinline__ void qwen35_unpack8(uint32_t a, uint32_t b, float *f) {
+    f[0] = (float)(int8_t)(a & 0xffu); f[1] = (float)(int8_t)((a >> 8) & 0xffu);
+    f[2] = (float)(int8_t)((a >> 16) & 0xffu); f[3] = (float)(int8_t)(a >> 24);
+    f[4] = (float)(int8_t)(b & 0xffu); f[5] = (float)(int8_t)((b >> 8) & 0xffu);
+    f[6] = (float)(int8_t)((b >> 16) & 0xffu); f[7] = (float)(int8_t)(b >> 24);
+}
+
+/* Decode matvec over the packed layout: two warps per output column split
+ * the row, a lane takes 16 quants (one 16-byte load, half a block) per
+ * step, so a warp step streams 512 weights, and the activation rows of a
+ * speculative batch are dotted from the same weights.  Measured at the
+ * device's plain-read bandwidth on every bypass shape. */
+template <int N>
+__global__ static void qwen35_matvec_q8p_rows_kernel(
+        float *out, const int8_t *q, const __half *s, const float *x, uint32_t in_dim, uint32_t out_dim) {
+    __shared__ float part[8][N];
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t col = blockIdx.x * 4u + (warp >> 1u);
+    const uint32_t kw = warp & 1u;
+    if (col >= out_dim) return;
+    const uint4 *qrow = (const uint4 *)(q + (uint64_t)col * in_dim);
+    const __half *srow = s + (uint64_t)col * (in_dim / 32u);
+    const uint32_t steps = in_dim / 16u;
+    float sum[N];
+#pragma unroll
+    for (int r = 0; r < N; r++) sum[r] = 0.0f;
+    for (uint32_t i = kw * 32u + lane; i < steps; i += 64u) {
+        const uint4 wq = qrow[i];
+        const float d = __half2float(srow[i >> 1]);
+        float wf[16];
+        qwen35_unpack8(wq.x, wq.y, wf);
+        qwen35_unpack8(wq.z, wq.w, wf + 8);
+#pragma unroll
+        for (int r = 0; r < N; r++) {
+            const float4 *xs = (const float4 *)(x + (uint64_t)r * in_dim + i * 16u);
+            const float4 x0 = xs[0], x1 = xs[1], x2 = xs[2], x3 = xs[3];
+            float acc = 0.0f;
+            acc = fmaf(wf[0], x0.x, acc); acc = fmaf(wf[1], x0.y, acc); acc = fmaf(wf[2], x0.z, acc); acc = fmaf(wf[3], x0.w, acc);
+            acc = fmaf(wf[4], x1.x, acc); acc = fmaf(wf[5], x1.y, acc); acc = fmaf(wf[6], x1.z, acc); acc = fmaf(wf[7], x1.w, acc);
+            acc = fmaf(wf[8], x2.x, acc); acc = fmaf(wf[9], x2.y, acc); acc = fmaf(wf[10], x2.z, acc); acc = fmaf(wf[11], x2.w, acc);
+            acc = fmaf(wf[12], x3.x, acc); acc = fmaf(wf[13], x3.y, acc); acc = fmaf(wf[14], x3.z, acc); acc = fmaf(wf[15], x3.w, acc);
+            sum[r] = fmaf(d, acc, sum[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < N; r++) {
+        const float total = warp_sum_f32(sum[r]);
+        if (lane == 0u) part[warp][r] = total;
+    }
+    __syncthreads();
+    if (kw == 0u && lane == 0u) {
+#pragma unroll
+        for (int r = 0; r < N; r++) out[(uint64_t)r * out_dim + col] = part[warp][r] + part[warp + 1u][r];
+    }
+}
+
+static void qwen35_matvec_q8p_rows(
+        float *out, const qwen35_q8_pack *p, const float *x, uint32_t n_tok, cudaStream_t stream) {
+    const dim3 grid((p->out_dim + 3u) / 4u, 1u, 1u);
+    const int8_t *q = p->quants;
+    const __half *s = p->scales;
+    switch (n_tok) {
+    case 1: qwen35_matvec_q8p_rows_kernel<1><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
+    case 2: qwen35_matvec_q8p_rows_kernel<2><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
+    case 3: qwen35_matvec_q8p_rows_kernel<3><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
+    case 4: qwen35_matvec_q8p_rows_kernel<4><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
+    case 5: qwen35_matvec_q8p_rows_kernel<5><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
+    case 6: qwen35_matvec_q8p_rows_kernel<6><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
+    case 7: qwen35_matvec_q8p_rows_kernel<7><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
+    default: qwen35_matvec_q8p_rows_kernel<8><<<grid, 256, 0, stream>>>(out, q, s, x, p->in_dim, p->out_dim); break;
+    }
+}
+
+/* Prefill dequantises a slice of rows back to bf16 for the tensor-core
+ * GEMM: the same bf16 x bf16 recipe as an unquantised bypass weight, with
+ * the weights carrying q8_0's rounding. */
+__global__ static void qwen35_q8p_to_bf16_kernel(
+        __nv_bfloat16 *dst, const int8_t *q, const __half *s, uint64_t n_blocks) {
+    const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const float d = __half2float(s[b]);
+    const uint4 *src = (const uint4 *)(q + b * 32u);
+    for (uint32_t h = 0; h < 2u; h++) {
+        const uint4 w = src[h];
+        float f[16];
+        qwen35_unpack8(w.x, w.y, f);
+        qwen35_unpack8(w.z, w.w, f + 8);
+        __nv_bfloat162 *o = (__nv_bfloat162 *)(dst + b * 32u + h * 16u);
+        for (uint32_t i = 0; i < 8u; i++) o[i] = __floats2bfloat162_rn(f[2u * i] * d, f[2u * i + 1u] * d);
+    }
+}
+
+static int qwen35_matmul_q8p(
+        float *out, const qwen35_q8_pack *p, const float *x, const __nv_bfloat16 *x_bf16,
+        uint32_t n_tok, int tier, cudaStream_t stream) {
+    if (n_tok <= 8u) {
+        qwen35_matvec_q8p_rows(out, p, x, n_tok, stream);
+        return cuda_ok(cudaGetLastError(), "Qwen packed q8 matvec launch");
+    }
+    if (!g_cublas_ready) return 0;
+    const __nv_bfloat16 *a = x_bf16;
+    if (!a) {
+        const uint64_t n = (uint64_t)n_tok * p->in_dim;
+        __nv_bfloat16 *buf = (__nv_bfloat16 *)cuda_tmp_alloc_on(tier, n * sizeof(__nv_bfloat16), "Qwen bf16 activations");
+        if (!buf) return 0;
+        qwen35_to_bf16(buf, x, n, stream);
+        if (!cuda_ok(cudaGetLastError(), "Qwen bf16 convert launch")) return 0;
+        a = buf;
+    }
+    /* row slices of at most 64 MiB of bf16 weights through one scratch */
+    static __nv_bfloat16 *scratch = NULL;
+    static uint64_t scratch_elems = 0;
+    const uint32_t slice_rows = p->in_dim ? (uint32_t)((32ull << 20) / p->in_dim) : 0u;
+    const uint64_t need = (uint64_t)(slice_rows < p->out_dim ? slice_rows : p->out_dim) * p->in_dim;
+    if (slice_rows == 0u) return 0;
+    if (scratch_elems < need) {
+        if (scratch) (void)cudaFree(scratch);
+        scratch = NULL;
+        scratch_elems = 0;
+        if (cudaMalloc(&scratch, need * sizeof(__nv_bfloat16)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        scratch_elems = need;
+    }
+    const float alpha = 1.0f, beta = 0.0f;
+    for (uint32_t c0 = 0; c0 < p->out_dim; c0 += slice_rows) {
+        const uint32_t rows = p->out_dim - c0 < slice_rows ? p->out_dim - c0 : slice_rows;
+        const uint64_t b0 = (uint64_t)c0 * (p->in_dim / 32u);
+        const uint64_t blocks = (uint64_t)rows * (p->in_dim / 32u);
+        qwen35_q8p_to_bf16_kernel<<<(unsigned)((blocks + 255u) / 256u), 256, 0, stream>>>(
+            scratch, p->quants + b0 * 32u, p->scales + b0, blocks);
+        if (!cuda_ok(cudaGetLastError(), "Qwen packed q8 dequant launch")) return 0;
+        const cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(tier), CUBLAS_OP_T, CUBLAS_OP_N,
+                                               (int)rows, (int)n_tok, (int)p->in_dim,
+                                               &alpha, scratch, CUDA_R_16BF, (int)p->in_dim, a, CUDA_R_16BF, (int)p->in_dim,
+                                               &beta, out + c0, CUDA_R_32F, (int)p->out_dim,
+                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "Qwen packed q8 GEMM")) return 0;
+    }
+    return 1;
+}
+
 /* out[n_tok][out_dim] = x[n_tok][in_dim] W^T times the global scale, for a
  * weight of any storage type the loader accepts.  Decode-sized batches use
  * one warp or block per output column on f32 activations; larger ones the
@@ -719,6 +1001,17 @@ extern "C" int ds4_gpu_qwen35_matmul(
         out->bytes < (uint64_t)n_tok * out_dim * sizeof(float) ||
         (x_bf16 && x_bf16->bytes < (uint64_t)n_tok * in_dim * sizeof(__nv_bfloat16))) {
         return 0;
+    }
+    /* a weight the loader packed to q8 lives only in its packed buffers */
+    if (const qwen35_q8_pack *pack = qwen35_q8_pack_find(model_map, weight_offset)) {
+        if (pack->in_dim != in_dim || pack->out_dim != out_dim || scale != 1.0f) {
+            fprintf(stderr, "ds4: packed q8 weight at offset %llu does not match its use (%u x %u, scale %g)\n",
+                    (unsigned long long)weight_offset, in_dim, out_dim, (double)scale);
+            return 0;
+        }
+        return qwen35_matmul_q8p((float *)out->ptr, pack, (const float *)x->ptr,
+                                 x_bf16 ? (const __nv_bfloat16 *)x_bf16->ptr : NULL, n_tok,
+                                 ds4_tensor_device_idx(out), cuda_decode_stream());
     }
     const char *w = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes,
                                             ds4_tensor_device_idx(out), "Qwen weight");

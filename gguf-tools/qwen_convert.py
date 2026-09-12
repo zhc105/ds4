@@ -72,8 +72,10 @@ class Converter:
         self.uses_nvfp4 = False
         # Bypass-layer quantization, split so each half can be built and
         # measured alone: lm_head -> q8_0, the three big GDN projections ->
-        # fp8 e4m3 with 128x128 block scales.  Both off by default so the
-        # shipped BF16 conversion stays byte-identical.
+        # q8_0.  Both off by default so the shipped BF16 conversion stays
+        # byte-identical; the engine now applies the same q8_0 as it loads
+        # a BF16 file (ds4.c qwen_pack_bypass_weights), so these are only
+        # for producing a file that carries it.
         self.quant_head = quant_head
         self.quant_gdn = quant_gdn
         cfg = self.cfg

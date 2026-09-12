@@ -3209,6 +3209,16 @@ int ds4_gpu_qwen35_matmul(
         const ds4_gpu_tensor *x_bf16,
         uint32_t              n_tok);
 int ds4_gpu_qwen35_bf16(ds4_gpu_tensor *dst, const ds4_gpu_tensor *x, uint64_t n);
+/* Quantise (bf16) or re-lay (q8_0) a bypass weight into the packed q8
+ * buffers the decode kernels stream; its span is then not cached. */
+int ds4_gpu_qwen35_q8_pack(
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              wtype,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const char           *name);
 int ds4_gpu_qwen35_warm(ds4_gpu_tensor *f32, ds4_gpu_tensor *bf16, ds4_gpu_tensor *out);
 /* The Qwen kernels that touch per-session state take a ds4_qwen_batch_slot
  * row table (`slots`, rows from `slot0`) and a `batched` flag: a sequential

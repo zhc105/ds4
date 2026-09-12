@@ -65908,6 +65908,80 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL);
 }
 
+#ifdef DS4_QWEN_GPU
+/* The bypass projections quantised to q8 as they load
+ * (ds4_gpu_qwen35_q8_pack).  Flash-Next's recipe takes the three GDN
+ * projections and the lm_head by default, the largest of the decode read
+ * (q8_0 there was measured within the vLLM agreement noise); the 2B, the CPU
+ * reference's guard, stays as its file has it.  DS4_QWEN_Q8 overrides with
+ * a list of gdn, head, attn, shexp, hc, or all or none. */
+static bool qwen_q8_group_selected(const char *sel, const char *group) {
+    if (!strcmp(sel, "all")) return true;
+    const size_t n = strlen(group);
+    for (const char *p = sel; (p = strstr(p, group)) != NULL; p += n) {
+        if ((p == sel || p[-1] == ',') && (p[n] == '\0' || p[n] == ',')) return true;
+    }
+    return false;
+}
+
+static void qwen_pack_tensor(const ds4_model *m, const ds4_tensor *t, const char *what,
+                             uint64_t *before, uint64_t *after, uint32_t *count) {
+    if (!t || t->ndim != 2 || t->scale != 1.0f ||
+        (t->type != DS4_TENSOR_BF16 && t->type != DS4_TENSOR_Q8_0)) {
+        return;
+    }
+    if (!ds4_gpu_qwen35_q8_pack(m->map, m->size, t->abs_offset, t->type,
+                                (uint32_t)t->dim[0], (uint32_t)t->dim[1], what)) {
+        return;
+    }
+    *before += t->bytes;
+    *after += t->elements + t->elements / 16u;   /* int8 plus an f16 scale per 32 */
+    (*count)++;
+}
+
+static void qwen_pack_bypass_weights(ds4_engine *e) {
+    const char *sel = getenv("DS4_QWEN_Q8");
+    if (!sel || !sel[0]) sel = DS4_MODEL_VARIANT == DS4_VARIANT_QWEN4EXP ? "gdn,head" : "none";
+    if (!strcmp(sel, "none")) return;
+    const ds4_model *m = &e->model;
+    const bool gdn = qwen_q8_group_selected(sel, "gdn");
+    const bool attn = qwen_q8_group_selected(sel, "attn");
+    const bool shexp = qwen_q8_group_selected(sel, "shexp");
+    const bool hc = qwen_q8_group_selected(sel, "hc");
+    const double t0 = now_sec();
+    uint64_t before = 0, after = 0;
+    uint32_t count = 0;
+    for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &e->weights.layer[il];
+        if (gdn) {
+            qwen_pack_tensor(m, l->attn_qkv, "attn_qkv", &before, &after, &count);
+            qwen_pack_tensor(m, l->attn_gate, "attn_gate", &before, &after, &count);
+            qwen_pack_tensor(m, l->ssm_out, "ssm_out", &before, &after, &count);
+        }
+        if (attn) {
+            qwen_pack_tensor(m, l->attn_q, "attn_q", &before, &after, &count);
+            qwen_pack_tensor(m, l->attn_k, "attn_k", &before, &after, &count);
+            qwen_pack_tensor(m, l->attn_v, "attn_v", &before, &after, &count);
+            qwen_pack_tensor(m, l->attn_output, "attn_output", &before, &after, &count);
+        }
+        if (shexp) {
+            qwen_pack_tensor(m, l->ffn_gate_shexp, "ffn_gate_shexp", &before, &after, &count);
+            qwen_pack_tensor(m, l->ffn_up_shexp, "ffn_up_shexp", &before, &after, &count);
+            qwen_pack_tensor(m, l->ffn_down_shexp, "ffn_down_shexp", &before, &after, &count);
+        }
+        if (hc) {
+            qwen_pack_tensor(m, l->hc_mix_attn.down, "hc_attn_down", &before, &after, &count);
+            qwen_pack_tensor(m, l->hc_mix_attn.up, "hc_attn_up", &before, &after, &count);
+            qwen_pack_tensor(m, l->hc_mix_ffn.down, "hc_ffn_down", &before, &after, &count);
+            qwen_pack_tensor(m, l->hc_mix_ffn.up, "hc_ffn_up", &before, &after, &count);
+        }
+    }
+    if (qwen_q8_group_selected(sel, "head")) qwen_pack_tensor(m, e->weights.output, "output", &before, &after, &count);
+    fprintf(stderr, "ds4: Qwen packed %u bypass tensors to q8 (%s): %.2f GiB -> %.2f GiB in %.1fs\n",
+            count, sel, (double)before / 1073741824.0, (double)after / 1073741824.0, now_sec() - t0);
+}
+#endif
+
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg) {
@@ -66719,6 +66793,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (void)ds4_gpu_build_derived_artifacts(e->model.map,
                                                   e->model.size,
                                                   opt->model_path);
+        }
+#endif
+#ifdef DS4_QWEN_GPU
+        if (e->backend == DS4_BACKEND_CUDA && ds4_model_is_qwen() && !load_slice && !tp_shard) {
+            qwen_pack_bypass_weights(e);
         }
 #endif
         int model_map_ok = 0;

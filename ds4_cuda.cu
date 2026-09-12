@@ -4573,10 +4573,14 @@ extern "C" int ds4_gpu_build_derived_artifacts(
     return (int)g_derived_ranges.size();
 }
 
+/* Defined with the Qwen kernels (ds4_qwen35_gpu.cuh, included at the end). */
+static int qwen35_q8_pack_replaces(const void *map, uint64_t offset);
+
 extern "C" int ds4_gpu_model_range_replaced(
         const void *model_map,
         uint64_t offset,
         uint64_t bytes) {
+    if (bytes != 0 && qwen35_q8_pack_replaces(model_map, offset)) return 1;
     if (!cuda_model_map_replaces_complete(model_map) || bytes == 0) return 0;
     for (const cuda_derived_range &range : g_derived_ranges) {
         if (range.host_base == model_map &&
