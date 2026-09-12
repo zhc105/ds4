@@ -77531,9 +77531,18 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
     /* The DeepSeek CUDA graph uses one default stream per device plus ordered
      * cross-device events.  Encoding several independent graphs before the
      * final synchronization lets their packets fill different pipeline stages
-     * while preserving the exact one-token kernels and per-session KV order. */
+     * while preserving the exact one-token kernels and per-session KV order.
+     *
+     * Qwen is excluded because everything below encodes the DeepSeek
+     * ds4_gpu_graph, and a Qwen session owns a ds4_qwen_gpu_graph instead:
+     * ds4_session_create returns from its Qwen branch before any of the
+     * DeepSeek graph is allocated, so s->graph is zeroed and
+     * metal_graph_encode_token_raw_swa fails with "raw KV cache is not
+     * allocated".  Until the Qwen row batch lands, fall through to the
+     * serialized loop, which is correct and only slower. */
     if (e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(first) &&
+        !ds4_model_is_qwen() &&
         e->support_kind == DS4_SUPPORT_NONE) {
         bool ok = ds4_gpu_begin_commands() != 0;
         for (int i = 0; ok && i < count; i++) {
