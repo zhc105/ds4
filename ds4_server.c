@@ -12194,7 +12194,10 @@ static int server_session_sync(server *s, server_slot *slot,
         ds4_tokens prefix = *prompt;
         prefix.len = target;
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        /* a piece short of the prompt is not a turn: the engine archives no state at its end */
+        ds4_session_set_sync_partial(slot->session, target < prompt->len);
         int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
+        ds4_session_set_sync_partial(slot->session, false);
         if (rc == 0) done = ds4_session_pos(slot->session);
         server_prefill_leave(s);
         called = true;

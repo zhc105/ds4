@@ -3,7 +3,9 @@ state.  P1 -> answer, P2 (P1 + a turn) -> answer, then B = P1 + a different
 turn: the server must resume B from the state saved after P1, not recompute
 P1.  The batched prefill loop used to feed the engine 2048-token pieces
 from position 0 in that case, so the log showed "prefill chunk 0/N" for
-every piece of P1.  Reads the server log.
+every piece of P1; and every piece archived a state, so P1's six pieces
+flushed the five-entry archive and P1's own turn-boundary state with it.
+Reads the server log.
 
 usage: qwen_batched_resume_test.py http://HOST:8010 MODEL STORY.txt SERVER.log
 Server: --batched-session 2 (any model).
@@ -32,8 +34,8 @@ def log_since(mark):
     return lines[mark:], len(lines)
 
 
-p1 = [{"role": "user", "content": "Read this:\n" + STORY[:24000] + "\n\nSay 'one'."}]
-r1 = ask(p1, "P1 (about 5500 tokens)")
+p1 = [{"role": "user", "content": "Read this:\n" + STORY[:50000] + "\n\nSay 'one'."}]
+r1 = ask(p1, "P1 (about 11000 tokens, six pieces)")
 p2 = p1 + [r1, {"role": "user", "content": "Now say 'two'."}]
 ask(p2, "P2 extends P1")
 mark = len(open(LOG, errors="replace").read().splitlines())

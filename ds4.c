@@ -57289,6 +57289,7 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+    bool sync_partial;   /* the prompt being synced is a piece, not a turn: archive no state at its end */
 };
 
 #ifndef DS4_NO_GPU
@@ -68611,6 +68612,10 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
     s->cancel_ud = ud;
 }
 
+void ds4_session_set_sync_partial(ds4_session *s, bool partial) {
+    if (s) s->sync_partial = partial;
+}
+
 static bool ds4_session_cancelled(ds4_session *s) {
     return s && s->cancel && s->cancel(s->cancel_ud);
 }
@@ -70296,7 +70301,8 @@ static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, ch
     s->mtp_draft_valid = false;
     s->greedy_splitkv_segment.len = 0;
     s->greedy_splitkv_anchor_valid = false;
-    if (!qwen_session_state_save(s)) {
+    /* a piece of a prompt fed in pieces ends mid-turn: the archive keeps turns */
+    if (!s->sync_partial && !qwen_session_state_save(s)) {
         snprintf(err, errlen, "Qwen state save failed");
         return 1;
     }
