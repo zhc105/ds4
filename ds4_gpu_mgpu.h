@@ -66,6 +66,27 @@ typedef struct {
 } ds4_gpu_attention_decode_row;
 #endif
 
+/* One row of a Qwen graph pass (see the Qwen3.5 CUDA graph in ds4.c).  The
+ * kernels that touch per-session state read it from a device-side table of
+ * these instead of their launch arguments, so a captured decode island
+ * serves every session that shares the activation scratch: the table's
+ * address is baked, its rows are rewritten before each pass.  p0 is always
+ * the sliding history a row's kernel kind maintains (GDN conv taps, QSA raw
+ * keys, PLE conv window) or the K cache; p1 the GDN recurrent state, the
+ * block keys, or the V cache.  A sequential pass (one session, n tokens)
+ * reads row 0; a batched pass (n sessions, one token each) reads row t. */
+#ifndef DS4_QWEN_BATCH_SLOT_DEFINED
+#define DS4_QWEN_BATCH_SLOT_DEFINED
+#define DS4_QWEN_BATCH_ROWS 8u
+typedef struct {
+    uint64_t p0;
+    uint64_t p1;
+    uint32_t pos;       /* the row's first position */
+    uint32_t ctx;       /* the row's cache capacity in positions */
+    uint64_t reserved;  /* a paged layout's block table */
+} ds4_qwen_batch_slot;
+#endif
+
 /* Tagged so headers (notably ds4.h) can forward-declare `struct
  * ds4_gpu_config` without dragging in this entire header. */
 typedef struct ds4_gpu_config {

@@ -826,14 +826,91 @@ extern "C" int ds4_gpu_qwen35_matmul(
     return cuda_ok(cudaGetLastError(), "Qwen matvec launch");
 }
 
+/* ---- Row table ------------------------------------------------------------
+ * Every kernel below that reads or writes per-session state (the GDN
+ * histories and recurrent state, the K/V and block-key caches, the PLE
+ * window) takes a ds4_qwen_batch_slot row table instead of the state
+ * buffers themselves, so the captured decode islands serve every session
+ * sharing the scratch (ds4_gpu_mgpu.h).  A pass is sequential (one
+ * session, its n tokens in order, row 0) or batched (n sessions, one token
+ * each, row t); `tl` below is a token's index within its own session's
+ * pass, so a batched token sees no earlier tokens and only its history. */
+
+static const ds4_qwen_batch_slot *qwen35_slots(
+        const ds4_gpu_tensor *table, uint32_t first, uint32_t n_tokens, uint32_t batched) {
+    const uint64_t rows = batched ? n_tokens : 1u;
+    if (!table || n_tokens == 0u || (batched && n_tokens > DS4_QWEN_BATCH_ROWS) ||
+        table->bytes < ((uint64_t)first + rows) * sizeof(ds4_qwen_batch_slot)) {
+        return NULL;
+    }
+    return (const ds4_qwen_batch_slot *)table->ptr + first;
+}
+
+/* Slide a history (row.p0, n_hist rows of dim) forward over the pass's rows:
+ * the one history of a sequential pass, or each row's own by its single
+ * token.  Each thread owns one channel and walks rows in increasing order,
+ * so the in-place shift is hazard free. */
+__global__ static void qwen35_history_slide_kernel(
+        const ds4_qwen_batch_slot *slots, const float *rows, uint32_t dim, uint32_t n_hist,
+        uint32_t n_tokens, uint32_t batched) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (c >= dim) return;
+    float *hist = (float *)slots[row].p0;
+    const float *src_rows = rows + (uint64_t)(batched ? row : 0u) * dim;
+    const uint32_t n = batched ? 1u : n_tokens;
+    for (uint32_t w = 0; w < n_hist; w++) {
+        const int32_t src = (int32_t)n - (int32_t)n_hist + (int32_t)w;
+        hist[(uint64_t)w * dim + c] = src >= 0
+            ? src_rows[(uint64_t)src * dim + c]
+            : hist[(uint64_t)(uint32_t)(src + (int32_t)n_hist) * dim + c];
+    }
+}
+
+static void qwen35_history_slide(
+        const ds4_qwen_batch_slot *slots, const float *rows, uint32_t dim, uint32_t n_hist,
+        uint32_t n_tokens, uint32_t batched, cudaStream_t stream) {
+    qwen35_history_slide_kernel<<<dim3((dim + 255u) / 256u, batched ? n_tokens : 1u, 1u), 256, 0, stream>>>(
+        slots, rows, dim, n_hist, n_tokens, batched);
+}
+
+/* The history a sequential pass leaves after each of its tokens (for
+ * speculative verification, whose rejected tail must be undone): snap[t] is
+ * the last n_hist rows of the history followed by rows 0..t, the state
+ * qwen35_history_slide would leave after t + 1 tokens. */
+__global__ static void qwen35_history_snapshots_kernel(
+        float *snap, const ds4_qwen_batch_slot *slots, const float *rows, uint32_t dim, uint32_t n_hist, uint32_t n_tokens) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (c >= dim || t >= n_tokens) return;
+    const float *hist = (const float *)slots[0].p0;
+    float *dst = snap + (uint64_t)t * n_hist * dim;
+    for (uint32_t w = 0; w < n_hist; w++) {
+        const int32_t src = (int32_t)t + 1 - (int32_t)n_hist + (int32_t)w;
+        dst[(uint64_t)w * dim + c] = src >= 0
+            ? rows[(uint64_t)src * dim + c]
+            : hist[(uint64_t)(uint32_t)(src + (int32_t)n_hist) * dim + c];
+    }
+}
+
+static int qwen35_history_snapshots(
+        const ds4_gpu_tensor *snap, const ds4_qwen_batch_slot *slots, const float *rows, uint32_t dim, uint32_t n_hist,
+        uint32_t n_tokens, cudaStream_t stream) {
+    if (!snap) return 1;
+    if (snap->bytes < (uint64_t)n_tokens * n_hist * dim * sizeof(float)) return 0;
+    qwen35_history_snapshots_kernel<<<dim3((dim + 255u) / 256u, n_tokens, 1u), 256, 0, stream>>>(
+        (float *)snap->ptr, slots, rows, dim, n_hist, n_tokens);
+    return 1;
+}
+
 /* ---- Gated DeltaNet ------------------------------------------------------ */
 
 /* Causal conv + SiLU over the qkv projection, then L2-normalise the q and k
- * heads.  One block per (token, head slot); taps older than the batch read
+ * heads.  One block per (token, head slot); taps older than the pass read
  * the conv history.  Slots: n_k q heads, n_k k heads, n_v v heads. */
 __global__ static void qwen35_gdn_conv_kernel(
-        float *mixed, const float *qkv, const float *hist, const float *conv_w,
-        uint32_t n_k, uint32_t n_v, uint32_t n_conv, uint32_t n_tokens, float eps) {
+        float *mixed, const float *qkv, const ds4_qwen_batch_slot *slots, const float *conv_w,
+        uint32_t n_k, uint32_t n_v, uint32_t n_conv, uint32_t n_tokens, uint32_t batched, float eps) {
     __shared__ float scratch[32];
     const uint32_t t = blockIdx.x;
     const uint32_t slot = blockIdx.y;
@@ -842,12 +919,14 @@ __global__ static void qwen35_gdn_conv_kernel(
     const uint32_t conv_dim = (2u * n_k + n_v) * hd;
     const uint32_t c = slot * hd + tid;
     if (t >= n_tokens || c >= conv_dim) return;
+    const float *hist = (const float *)slots[batched ? t : 0u].p0;
+    const uint32_t tl = batched ? 0u : t;
     const float *taps = conv_w + (uint64_t)c * n_conv;
     float acc = taps[n_conv - 1u] * qkv[(uint64_t)t * conv_dim + c];
     for (uint32_t w = 0; w + 1u < n_conv; w++) {
-        const int32_t src = (int32_t)t + (int32_t)w - (int32_t)(n_conv - 1u);
+        const int32_t src = (int32_t)tl + (int32_t)w - (int32_t)(n_conv - 1u);
         const float v = src >= 0
-            ? qkv[(uint64_t)src * conv_dim + c]
+            ? qkv[(uint64_t)(t - tl + (uint32_t)src) * conv_dim + c]
             : hist[(uint64_t)(uint32_t)(src + (int32_t)(n_conv - 1u)) * conv_dim + c];
         acc = fmaf(taps[w], v, acc);
     }
@@ -859,50 +938,9 @@ __global__ static void qwen35_gdn_conv_kernel(
     mixed[(uint64_t)t * conv_dim + c] = val;
 }
 
-/* Slide the conv history forward by n_tokens.  Each thread owns one channel
- * and walks rows in increasing order, so the in-place shift is hazard free. */
-__global__ static void qwen35_gdn_conv_state_kernel(
-        float *hist, const float *qkv, uint32_t conv_dim, uint32_t n_hist, uint32_t n_tokens) {
-    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= conv_dim) return;
-    for (uint32_t w = 0; w < n_hist; w++) {
-        const int32_t src = (int32_t)n_tokens - (int32_t)n_hist + (int32_t)w;
-        hist[(uint64_t)w * conv_dim + c] = src >= 0
-            ? qkv[(uint64_t)src * conv_dim + c]
-            : hist[(uint64_t)(uint32_t)(src + (int32_t)n_hist) * conv_dim + c];
-    }
-}
-
-/* The history a batch leaves after each of its tokens (for speculative
- * verification, whose rejected tail must be undone): snap[t] is the last
- * n_hist rows of hist followed by rows 0..t, the state qwen35_gdn_conv_state
- * would leave after t + 1 tokens. */
-__global__ static void qwen35_history_snapshots_kernel(
-        float *snap, const float *hist, const float *rows, uint32_t dim, uint32_t n_hist, uint32_t n_tokens) {
-    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t t = blockIdx.y;
-    if (c >= dim || t >= n_tokens) return;
-    float *dst = snap + (uint64_t)t * n_hist * dim;
-    for (uint32_t w = 0; w < n_hist; w++) {
-        const int32_t src = (int32_t)t + 1 - (int32_t)n_hist + (int32_t)w;
-        dst[(uint64_t)w * dim + c] = src >= 0
-            ? rows[(uint64_t)src * dim + c]
-            : hist[(uint64_t)(uint32_t)(src + (int32_t)n_hist) * dim + c];
-    }
-}
-
-static int qwen35_history_snapshots(
-        const ds4_gpu_tensor *snap, const float *hist, const float *rows, uint32_t dim, uint32_t n_hist,
-        uint32_t n_tokens, cudaStream_t stream) {
-    if (!snap) return 1;
-    if (snap->bytes < (uint64_t)n_tokens * n_hist * dim * sizeof(float)) return 0;
-    qwen35_history_snapshots_kernel<<<dim3((dim + 255u) / 256u, n_tokens, 1u), 256, 0, stream>>>(
-        (float *)snap->ptr, hist, rows, dim, n_hist, n_tokens);
-    return 1;
-}
-
-/* Recurrent delta rule.  Block per (v head, 4 value rows); each warp owns one
- * value row of S with four key columns per lane, and walks the tokens. */
+/* Recurrent delta rule.  Block per (v head, 4 value rows, row of a batched
+ * pass); each warp owns one value row of S with four key columns per lane,
+ * and walks the tokens of its row's pass. */
 /* Warp-sum eight values at once by halving the set at every shuffle
  * distance: after xor 16 each lane keeps four columns (its half), after
  * xor 8 two, then one, which the last two steps finish.  Nine shuffles
@@ -927,9 +965,9 @@ __device__ __forceinline__ float qwen35_gdn_reduce8(const float v[8], uint32_t l
 }
 
 __global__ static void qwen35_gdn_recurrence_kernel(
-        float *o, float *state, float *snap, const float *mixed, const float *alpha, const float *beta,
+        float *o, const ds4_qwen_batch_slot *slots, float *snap, const float *mixed, const float *alpha, const float *beta,
         const float *a_neg, const float *dt_bias,
-        uint32_t n_k, uint32_t n_v, uint32_t n_tokens, float q_scale) {
+        uint32_t n_k, uint32_t n_v, uint32_t n_tokens, uint32_t batched, float q_scale) {
     const uint32_t hd = QWEN35_CUDA_GDN_DIM;
     const uint32_t hv = blockIdx.x;
     const uint32_t v0 = blockIdx.y * 32u + (threadIdx.x >> 5u) * 8u;   /* this warp's eight value columns */
@@ -937,6 +975,15 @@ __global__ static void qwen35_gdn_recurrence_kernel(
     if (hv >= n_v || v0 >= hd) return;
     const uint32_t hk = hv % n_k;
     const uint32_t conv_dim = (2u * n_k + n_v) * hd;
+    /* a batched row walks its single token over its own state */
+    const uint32_t row = blockIdx.z;
+    float *state = (float *)slots[row].p1;
+    const uint32_t tok0 = batched ? row : 0u;
+    if (batched) n_tokens = 1u;
+    mixed += (uint64_t)tok0 * conv_dim;
+    alpha += (uint64_t)tok0 * n_v;
+    beta += (uint64_t)tok0 * n_v;
+    o += (uint64_t)tok0 * n_v * hd;
     const uint32_t k0 = lane * 4u;
     const float a_head = a_neg[hv];
     const float dt_head = dt_bias[hv];
@@ -1016,8 +1063,8 @@ extern "C" int ds4_gpu_qwen35_gdn(
         ds4_gpu_tensor       *out,          /* [n_tok][v_dim] */
         ds4_gpu_tensor       *out_bf16,     /* optional: the output goes there in bf16 instead (prefill) */
         ds4_gpu_tensor       *mixed,        /* [n_tok][conv_dim] scratch */
-        ds4_gpu_tensor       *conv_state,   /* [n_conv-1][conv_dim] */
-        ds4_gpu_tensor       *ssm_state,    /* [n_v][hd][hd] */
+        const ds4_gpu_tensor *slots,        /* row table: p0 the conv history [n_conv-1][conv_dim], p1 the state [n_v][hd][hd] */
+        uint32_t              slot0,
         const ds4_gpu_tensor *qkv,          /* [n_tok][conv_dim] */
         const ds4_gpu_tensor *z,            /* [n_tok][v_dim] */
         const ds4_gpu_tensor *alpha,        /* [n_tok][n_v] */
@@ -1032,14 +1079,16 @@ extern "C" int ds4_gpu_qwen35_gdn(
         uint32_t              n_v,
         uint32_t              n_conv,
         uint32_t              n_tokens,
+        int                   batched,      /* one session per row rather than one session's n_tok tokens */
         int                   sigmoid_gate,
         float                 eps,
-        const ds4_gpu_tensor *snap_ssm,     /* optional: the state after each token, [n_tok][n_v][hd][hd] */
-        const ds4_gpu_tensor *snap_conv) {  /* optional: the conv history after each token */
+        const ds4_gpu_tensor *snap_ssm,     /* optional (sequential): the state after each token, [n_tok][n_v][hd][hd] */
+        const ds4_gpu_tensor *snap_conv) {  /* optional (sequential): the conv history after each token */
     const uint32_t hd = QWEN35_CUDA_GDN_DIM;
-    if (!out || !mixed || !conv_state || !ssm_state || !qkv || !z || !alpha || !beta ||
+    const ds4_qwen_batch_slot *rows = qwen35_slots(slots, slot0, n_tokens, batched != 0);
+    if (!out || !mixed || !rows || !qkv || !z || !alpha || !beta ||
         !model_map || n_k == 0u || n_v == 0u || n_v % n_k != 0u || n_conv < 2u ||
-        n_tokens == 0u) {
+        (batched && (snap_ssm || snap_conv))) {
         return 0;
     }
     const uint64_t conv_dim = (uint64_t)(2u * n_k + n_v) * hd;
@@ -1049,9 +1098,7 @@ extern "C" int ds4_gpu_qwen35_gdn(
         z->bytes < n_tokens * v_dim * sizeof(float) ||
         out->bytes < n_tokens * v_dim * sizeof(float) ||
         alpha->bytes < (uint64_t)n_tokens * n_v * sizeof(float) ||
-        beta->bytes < (uint64_t)n_tokens * n_v * sizeof(float) ||
-        conv_state->bytes < (uint64_t)(n_conv - 1u) * conv_dim * sizeof(float) ||
-        ssm_state->bytes < v_dim * hd * sizeof(float)) {
+        beta->bytes < (uint64_t)n_tokens * n_v * sizeof(float)) {
         return 0;
     }
     const int tier = ds4_tensor_device_idx(out);
@@ -1066,19 +1113,18 @@ extern "C" int ds4_gpu_qwen35_gdn(
     if (!conv_w || !a_neg || !dt_bias || !norm_w) return 0;
     cudaStream_t stream = cuda_decode_stream();
 
+    const uint32_t b = batched != 0;
     qwen35_gdn_conv_kernel<<<dim3(n_tokens, 2u * n_k + n_v, 1u), hd, 0, stream>>>(
-        (float *)mixed->ptr, (const float *)qkv->ptr, (const float *)conv_state->ptr,
-        conv_w, n_k, n_v, n_conv, n_tokens, eps);
-    if (!qwen35_history_snapshots(snap_conv, (const float *)conv_state->ptr, (const float *)qkv->ptr,
+        (float *)mixed->ptr, (const float *)qkv->ptr, rows,
+        conv_w, n_k, n_v, n_conv, n_tokens, b, eps);
+    if (!qwen35_history_snapshots(snap_conv, rows, (const float *)qkv->ptr,
                                   (uint32_t)conv_dim, n_conv - 1u, n_tokens, stream)) return 0;
     if (snap_ssm && snap_ssm->bytes < (uint64_t)n_tokens * v_dim * hd * sizeof(float)) return 0;
-    qwen35_gdn_conv_state_kernel<<<(unsigned)((conv_dim + 255u) / 256u), 256, 0, stream>>>(
-        (float *)conv_state->ptr, (const float *)qkv->ptr, (uint32_t)conv_dim,
-        n_conv - 1u, n_tokens);
-    qwen35_gdn_recurrence_kernel<<<dim3(n_v, hd / 32u, 1u), 128, 0, stream>>>(
-        (float *)out->ptr, (float *)ssm_state->ptr, snap_ssm ? (float *)snap_ssm->ptr : NULL, (const float *)mixed->ptr,
+    qwen35_history_slide(rows, (const float *)qkv->ptr, (uint32_t)conv_dim, n_conv - 1u, n_tokens, b, stream);
+    qwen35_gdn_recurrence_kernel<<<dim3(n_v, hd / 32u, b ? n_tokens : 1u), 128, 0, stream>>>(
+        (float *)out->ptr, rows, snap_ssm ? (float *)snap_ssm->ptr : NULL, (const float *)mixed->ptr,
         (const float *)alpha->ptr, (const float *)beta->ptr, a_neg, dt_bias,
-        n_k, n_v, n_tokens, rsqrtf((float)hd));
+        n_k, n_v, n_tokens, b, rsqrtf((float)hd));
     if (out_bf16 && out_bf16->bytes < (uint64_t)n_tokens * n_v * hd * sizeof(__nv_bfloat16)) return 0;
     qwen35_gdn_norm_gate_kernel<<<dim3(n_tokens, n_v, 1u), hd, 0, stream>>>(
         (float *)out->ptr, out_bf16 ? (__nv_bfloat16 *)out_bf16->ptr : NULL, (const float *)z->ptr, norm_w,
@@ -1102,16 +1148,24 @@ __device__ __forceinline__ void qwen35_split_f32(float x, __nv_bfloat16 *hi, __n
  * caches are bf16 (the CPU reference rounds its rows the same way).  With
  * qh/ql (prefill) the finished queries are also written split into bf16 for
  * the tensor-core attention. */
+/* The K/V cache row of position pos in a slot's caches: the one place the
+ * cache layout is spelled out (a paged layout changes only this). */
+__device__ __forceinline__ uint64_t qwen35_kv_row(const ds4_qwen_batch_slot &row, uint32_t pos, uint64_t kv_stride) {
+    return (uint64_t)pos * kv_stride;
+}
+
 __global__ static void qwen35_attn_prepare_kernel(
-        float *qg, __nv_bfloat16 *k_cache, __nv_bfloat16 *v_cache, const float *k, const float *v,
+        float *qg, const ds4_qwen_batch_slot *slots, const float *k, const float *v,
         const float *q_norm, const float *k_norm, __nv_bfloat16 *qh, __nv_bfloat16 *ql,
         uint32_t n_head, uint32_t n_kv, uint32_t hd, uint32_t n_rot,
-        uint32_t pos0, uint32_t n_tokens, float freq_base, float eps) {
+        uint32_t n_tokens, uint32_t batched, float freq_base, float eps) {
     __shared__ float scratch[32];
     const uint32_t t = blockIdx.x;
     const uint32_t slot = blockIdx.y;
     const uint32_t tid = threadIdx.x;
     if (t >= n_tokens || tid >= hd) return;
+    const ds4_qwen_batch_slot row = slots[batched ? t : 0u];
+    const uint32_t pos = batched ? row.pos : row.pos + t;
     float *head;
     const float *norm_w;
     __nv_bfloat16 *dst = NULL;
@@ -1122,10 +1176,11 @@ __global__ static void qwen35_attn_prepare_kernel(
         const uint32_t h = slot - n_head;
         head = (float *)k + ((uint64_t)t * n_kv + h) * hd;
         norm_w = k_norm;
-        dst = k_cache + ((uint64_t)(pos0 + t) * n_kv + h) * hd;
+        dst = (__nv_bfloat16 *)row.p0 + qwen35_kv_row(row, pos, (uint64_t)n_kv * hd) + (uint64_t)h * hd;
     } else {
         const uint32_t h = slot - n_head - n_kv;
-        v_cache[((uint64_t)(pos0 + t) * n_kv + h) * hd + tid] =
+        __nv_bfloat16 *v_cache = (__nv_bfloat16 *)row.p1;
+        v_cache[qwen35_kv_row(row, pos, (uint64_t)n_kv * hd) + (uint64_t)h * hd + tid] =
             __float2bfloat16(v[((uint64_t)t * n_kv + h) * hd + tid]);
         return;
     }
@@ -1135,7 +1190,7 @@ __global__ static void qwen35_attn_prepare_kernel(
     __syncthreads();
     const uint32_t half = n_rot / 2u;
     if (tid < half) {
-        const float theta = (float)(pos0 + t) *
+        const float theta = (float)pos *
             powf(freq_base, -(float)(2u * tid) / (float)n_rot);
         const float c = cosf(theta);
         const float s = sinf(theta);
@@ -1160,11 +1215,39 @@ __global__ static void qwen35_attn_prepare_kernel(
  * and qwen35_attention_merge_kernel combines them.  Decode uses splits
  * because n_tokens * n_head blocks alone cannot fill the GPU while scanning
  * a long cache. */
+/* Key splits of a decode-sized pass over n_keys keys (host and device agree
+ * on this, the host for the grid, the device per row). */
+__host__ __device__ __forceinline__ uint32_t qwen35_attn_splits(uint32_t n_keys) {
+    uint32_t n = (n_keys + 127u) / 128u;
+    if (n > QWEN35_ATTN_SPLIT_MAX) n = QWEN35_ATTN_SPLIT_MAX;
+    return n == 0u ? 1u : n;
+}
+
+/* A batched row's keys under QSA: a row that sees no more completed blocks
+ * than the budget (at most dense_keys keys) attends to its causal prefix
+ * exactly as it would serially, whatever the pass's longest row decided;
+ * the others take their selected cells.  A sequential pass follows the
+ * host's one decision. */
+__device__ __forceinline__ const int32_t *qwen35_attn_row_cells(
+        const int32_t *sel, uint32_t max_sel, uint32_t dense_keys, uint32_t t, uint32_t pos, uint32_t batched) {
+    if (!sel || (batched && pos + 1u <= dense_keys)) return NULL;
+    return sel + (uint64_t)t * max_sel;
+}
+
+/* A row's split plan: a sequential pass plans once over its whole key range
+ * (pos_end keys) for every token, a batched row over its own; max_splits ==
+ * 1 is the tensor-core-less prefill, unsplit. */
+__device__ __forceinline__ uint32_t qwen35_attn_row_splits(
+        uint32_t max_splits, const int32_t *cells, uint32_t max_sel, uint32_t pos, uint32_t pos_end, uint32_t batched) {
+    if (max_splits == 1u) return 1u;
+    return qwen35_attn_splits(cells ? max_sel : (batched ? pos + 1u : pos_end));
+}
+
 __global__ static void qwen35_attention_kernel(
-        float *att, float *part, const float *qg, const __nv_bfloat16 *k_cache, const __nv_bfloat16 *v_cache,
-        const int32_t *sel, const uint32_t *n_sel, uint32_t max_sel,
-        uint32_t n_head, uint32_t n_kv, uint32_t hd, uint32_t pos0, uint32_t n_tokens,
-        uint32_t n_splits) {
+        float *att, float *part, const float *qg, const ds4_qwen_batch_slot *slots,
+        const int32_t *sel, const uint32_t *n_sel, uint32_t max_sel, uint32_t dense_keys,
+        uint32_t n_head, uint32_t n_kv, uint32_t hd, uint32_t pos_end, uint32_t n_tokens, uint32_t batched,
+        uint32_t max_splits) {
     extern __shared__ float scores[];
     __shared__ float scratch[32];
     const uint32_t t = blockIdx.x;
@@ -1175,11 +1258,17 @@ __global__ static void qwen35_attention_kernel(
     const uint32_t warp = tid >> 5u;
     const uint32_t n_warps = blockDim.x >> 5u;
     if (t >= n_tokens || h >= n_head) return;
+    const ds4_qwen_batch_slot row = slots[batched ? t : 0u];
+    const uint32_t pos = batched ? row.pos : row.pos + t;
+    const int32_t *cells = qwen35_attn_row_cells(sel, max_sel, dense_keys, t, pos, batched);
+    const uint32_t n_splits = qwen35_attn_row_splits(max_splits, cells, max_sel, pos, pos_end, batched);
+    if (split >= n_splits) return;
+    const __nv_bfloat16 *k_cache = (const __nv_bfloat16 *)row.p0;
+    const __nv_bfloat16 *v_cache = (const __nv_bfloat16 *)row.p1;
     const float *q = qg + ((uint64_t)t * n_head + h) * 2u * hd;
     const float *gate = q + hd;
     const uint32_t kvh = h / (n_head / n_kv);
-    const uint32_t n_keys = sel ? n_sel[t] : pos0 + t + 1u;
-    const int32_t *cells = sel ? sel + (uint64_t)t * max_sel : NULL;
+    const uint32_t n_keys = cells ? n_sel[t] : pos + 1u;
     const uint32_t chunk = (n_keys + n_splits - 1u) / n_splits;
     const uint32_t key0 = split * chunk;
     const uint32_t key1 = key0 + chunk < n_keys ? key0 + chunk : n_keys;
@@ -1191,7 +1280,7 @@ __global__ static void qwen35_attention_kernel(
     for (uint32_t i = 0; i < per; i++) qv[i] = q[lane * per + i];
     for (uint32_t key = warp; key < n_local; key += n_warps) {
         const uint32_t cell = cells ? (uint32_t)cells[key0 + key] : key0 + key;
-        const __nv_bfloat162 *kr = (const __nv_bfloat162 *)(k_cache + cell * kv_stride + kvh * hd + lane * per);
+        const __nv_bfloat162 *kr = (const __nv_bfloat162 *)(k_cache + qwen35_kv_row(row, cell, kv_stride) + kvh * hd + lane * per);
         float dot = 0.0f;
         for (uint32_t i = 0; i < per / 2u; i++) {
             const float2 kk = __bfloat1622float2(kr[i]);
@@ -1222,13 +1311,13 @@ __global__ static void qwen35_attention_kernel(
     const __nv_bfloat16 *vc = v_cache + kvh * hd + tid;
     for (uint32_t key = 0; key < n_local; key++) {
         const uint32_t cell = cells ? (uint32_t)cells[key0 + key] : key0 + key;
-        acc = fmaf(scores[key], __bfloat162float(vc[cell * kv_stride]), acc);
+        acc = fmaf(scores[key], __bfloat162float(vc[qwen35_kv_row(row, cell, kv_stride)]), acc);
     }
     if (n_splits == 1u) {
         att[((uint64_t)t * n_head + h) * hd + tid] = acc / sum * qwen35_cuda_sigmoid(gate[tid]);
         return;
     }
-    float *dst = part + (((uint64_t)t * n_head + h) * n_splits + split) * (hd + 2u);
+    float *dst = part + (((uint64_t)t * n_head + h) * max_splits + split) * (hd + 2u);
     dst[tid] = acc;
     if (tid == 0u) {
         dst[hd] = max;
@@ -1237,13 +1326,19 @@ __global__ static void qwen35_attention_kernel(
 }
 
 __global__ static void qwen35_attention_merge_kernel(
-        float *att, const float *part, const float *qg,
-        uint32_t n_head, uint32_t hd, uint32_t n_tokens, uint32_t n_splits) {
+        float *att, const float *part, const float *qg, const ds4_qwen_batch_slot *slots,
+        const int32_t *sel, uint32_t max_sel, uint32_t dense_keys,
+        uint32_t n_head, uint32_t hd, uint32_t pos_end, uint32_t n_tokens, uint32_t batched, uint32_t max_splits) {
     const uint32_t t = blockIdx.x;
     const uint32_t h = blockIdx.y;
     const uint32_t tid = threadIdx.x;
     if (t >= n_tokens || h >= n_head) return;
-    const float *base = part + ((uint64_t)t * n_head + h) * n_splits * (hd + 2u);
+    const ds4_qwen_batch_slot row = slots[batched ? t : 0u];
+    const uint32_t pos = batched ? row.pos : row.pos + t;
+    const int32_t *cells = qwen35_attn_row_cells(sel, max_sel, dense_keys, t, pos, batched);
+    const uint32_t n_splits = qwen35_attn_row_splits(max_splits, cells, max_sel, pos, pos_end, batched);
+    if (n_splits == 1u) return;   /* the attention kernel finalised this row itself */
+    const float *base = part + ((uint64_t)t * n_head + h) * max_splits * (hd + 2u);
     float max = -INFINITY;
     for (uint32_t s = 0; s < n_splits; s++) max = fmaxf(max, base[s * (hd + 2u) + hd]);
     float sum = 0.0f;
@@ -1303,9 +1398,9 @@ __device__ __forceinline__ void qwen35_ldsm_x4(uint32_t *r, const void *p) {
 template <bool SPLIT>
 __global__ static void __launch_bounds__(256, 2) qwen35_attention_tc_kernel(
         float *att, __nv_bfloat16 *att_bf16, const float *qg, const __nv_bfloat16 *qh, const __nv_bfloat16 *ql,
-        const __nv_bfloat16 *k_cache, const __nv_bfloat16 *v_cache,
+        const ds4_qwen_batch_slot *slots,
         const int32_t *sel, const uint32_t *n_sel, uint32_t max_sel,
-        uint32_t n_head, uint32_t n_kv, uint32_t pos0, uint32_t n_tokens) {
+        uint32_t n_head, uint32_t n_kv, uint32_t n_tokens) {
     constexpr uint32_t hd = 256u;
     constexpr uint32_t NP = SPLIT ? 2u : 1u;                                        /* query and probability parts */
     __shared__ __align__(16) __nv_bfloat16 ks[QWEN35_TC_KEYS][QWEN35_TC_LD];      /* [key][dim] */
@@ -1319,7 +1414,10 @@ __global__ static void __launch_bounds__(256, 2) qwen35_attention_tc_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
-    const uint32_t n_cells = sel ? n_sel[t] : pos0 + t + 1u;
+    const ds4_qwen_batch_slot row = slots[0];   /* a prefill chunk: one session, sequential */
+    const __nv_bfloat16 *k_cache = (const __nv_bfloat16 *)row.p0;
+    const __nv_bfloat16 *v_cache = (const __nv_bfloat16 *)row.p1;
+    const uint32_t n_cells = sel ? n_sel[t] : row.pos + t + 1u;
     const int32_t *cells = sel ? sel + (uint64_t)t * max_sel : NULL;
     const uint64_t kv_stride = (uint64_t)n_kv * hd;
     const float scale = rsqrtf((float)hd);
@@ -1355,8 +1453,8 @@ __global__ static void __launch_bounds__(256, 2) qwen35_attention_tc_kernel(
             const uint32_t e = (tid & 15u) * 16u;
             const uint32_t c = c0 + key;
             const bool valid = c < n_cells;
-            const uint64_t row = valid ? (uint64_t)(cells ? (uint32_t)cells[c] : c) * kv_stride + kvh * hd + e : 0u;
-            const __nv_bfloat16 *src[2] = { k_cache + row, v_cache + row };
+            const uint64_t off = valid ? qwen35_kv_row(row, cells ? (uint32_t)cells[c] : c, kv_stride) + kvh * hd + e : 0u;
+            const __nv_bfloat16 *src[2] = { k_cache + off, v_cache + off };
             __nv_bfloat16 *dst[2] = { &ks[key][e], &vs[key][e] };
             const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
             for (uint32_t a = 0; a < 2u; a++) {
@@ -1460,13 +1558,14 @@ extern "C" int ds4_gpu_qwen35_attention(
         ds4_gpu_tensor       *part,         /* split partials, see QWEN35_ATTN_SPLIT_MAX */
         ds4_gpu_tensor       *split,        /* prefill: bf16 hi/lo copies of the queries, see below */
         ds4_gpu_tensor       *qg,           /* [n_tok][n_head * 2 * hd], modified in place */
-        ds4_gpu_tensor       *k_cache,      /* bf16 [ctx][n_kv * hd] */
-        ds4_gpu_tensor       *v_cache,
+        const ds4_gpu_tensor *slots,        /* row table: p0 the bf16 K cache [ctx][n_kv * hd], p1 the V cache */
+        uint32_t              slot0,
         const ds4_gpu_tensor *k,            /* [n_tok][n_kv * hd] */
         const ds4_gpu_tensor *v,
         const ds4_gpu_tensor *sel,          /* QSA: int32 [n_tok][max_sel] cells per token, or NULL for the causal prefix */
         const ds4_gpu_tensor *n_sel,        /* QSA: uint32 [n_tok] */
         uint32_t              max_sel,
+        uint32_t              dense_keys,   /* QSA, batched: rows with at most this many keys attend to their prefix instead */
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              q_norm_offset,
@@ -1476,23 +1575,24 @@ extern "C" int ds4_gpu_qwen35_attention(
         uint32_t              hd,
         uint32_t              n_rot,
         uint32_t              ctx,
-        uint32_t              pos0,
+        uint32_t              pos_end,      /* one past the highest position of the pass */
         uint32_t              n_tokens,
+        int                   batched,
         float                 freq_base,
         float                 eps) {
-    if (!att || !part || !qg || !k_cache || !v_cache || !k || !v || !model_map ||
+    const uint32_t b = batched != 0;
+    const ds4_qwen_batch_slot *rows = qwen35_slots(slots, slot0, n_tokens, b);
+    if (!att || !part || !qg || !rows || !k || !v || !model_map ||
         n_head == 0u || n_kv == 0u || n_head % n_kv != 0u || hd == 0u || hd > 256u ||
         hd % 32u != 0u || n_rot == 0u || n_rot % 2u != 0u || n_rot > hd ||
-        n_tokens == 0u || pos0 + n_tokens > ctx) {
+        pos_end == 0u || pos_end > ctx || (!b && pos_end < n_tokens)) {
         return 0;
     }
     const uint64_t kv_dim = (uint64_t)n_kv * hd;
     if (qg->bytes < (uint64_t)n_tokens * n_head * 2u * hd * sizeof(float) ||
         att->bytes < (uint64_t)n_tokens * n_head * hd * sizeof(float) ||
         k->bytes < n_tokens * kv_dim * sizeof(float) ||
-        v->bytes < n_tokens * kv_dim * sizeof(float) ||
-        k_cache->bytes < (uint64_t)ctx * kv_dim * sizeof(__nv_bfloat16) ||
-        v_cache->bytes < (uint64_t)ctx * kv_dim * sizeof(__nv_bfloat16)) {
+        v->bytes < n_tokens * kv_dim * sizeof(float)) {
         return 0;
     }
     if (sel && (!n_sel || max_sel == 0u ||
@@ -1516,42 +1616,41 @@ extern "C" int ds4_gpu_qwen35_attention(
         ql = qh + q_elems;
     }
     qwen35_attn_prepare_kernel<<<dim3(n_tokens, n_head + 2u * n_kv, 1u), hd, 0, stream>>>(
-        (float *)qg->ptr, (__nv_bfloat16 *)k_cache->ptr, (__nv_bfloat16 *)v_cache->ptr,
-        (const float *)k->ptr, (const float *)v->ptr, q_norm, k_norm, qh, ql,
-        n_head, n_kv, hd, n_rot, pos0, n_tokens, freq_base, eps);
+        (float *)qg->ptr, rows, (const float *)k->ptr, (const float *)v->ptr, q_norm, k_norm, qh, ql,
+        n_head, n_kv, hd, n_rot, n_tokens, b, freq_base, eps);
     if (tc) {
         if (att_bf16 && att_bf16->bytes < (uint64_t)n_tokens * n_head * hd * sizeof(__nv_bfloat16)) return 0;
         const dim3 grid(n_tokens, n_kv, 1u);
         float *out = (float *)att->ptr;
         __nv_bfloat16 *out_bf16 = att_bf16 ? (__nv_bfloat16 *)att_bf16->ptr : NULL;
-        const __nv_bfloat16 *kc = (const __nv_bfloat16 *)k_cache->ptr;
-        const __nv_bfloat16 *vc = (const __nv_bfloat16 *)v_cache->ptr;
         const int32_t *cells = sel ? (const int32_t *)sel->ptr : NULL;
         const uint32_t *n_cells = sel ? (const uint32_t *)n_sel->ptr : NULL;
         if (exact) {
             qwen35_attention_tc_kernel<true><<<grid, 256, 0, stream>>>(
-                out, out_bf16, (const float *)qg->ptr, qh, ql, kc, vc, cells, n_cells, max_sel,
-                n_head, n_kv, pos0, n_tokens);
+                out, out_bf16, (const float *)qg->ptr, qh, ql, rows, cells, n_cells, max_sel,
+                n_head, n_kv, n_tokens);
         } else {
             qwen35_attention_tc_kernel<false><<<grid, 256, 0, stream>>>(
-                out, out_bf16, (const float *)qg->ptr, qh, ql, kc, vc, cells, n_cells, max_sel,
-                n_head, n_kv, pos0, n_tokens);
+                out, out_bf16, (const float *)qg->ptr, qh, ql, rows, cells, n_cells, max_sel,
+                n_head, n_kv, n_tokens);
         }
         return cuda_ok(cudaGetLastError(), "Qwen tensor-core attention launch");
     }
-    /* Decode-sized batches split the key range so enough blocks are in flight. */
-    const uint32_t n_keys = sel ? max_sel : pos0 + n_tokens;
-    uint32_t n_splits = 1u;
-    if (n_tokens <= QWEN35_ATTN_SPLIT_ROWS) {
-        n_splits = (n_keys + 127u) / 128u;
-        if (n_splits > QWEN35_ATTN_SPLIT_MAX) n_splits = QWEN35_ATTN_SPLIT_MAX;
-        if (n_splits == 0u) n_splits = 1u;
-    }
-    if (n_splits > 1u &&
-        part->bytes < (uint64_t)n_tokens * n_head * n_splits * (hd + 2u) * sizeof(float)) {
+    /* Decode-sized passes split the key range so enough blocks are in
+     * flight; the grid covers the longest row's plan and each row follows
+     * its own (qwen35_attn_row_splits).  The scores of a row's split fit
+     * its chunk: a row shorter than the longest plans fewer splits, so its
+     * chunk is at most 128 keys unless the split count saturates, when it
+     * is at most the longest row's. */
+    const uint32_t n_keys = sel ? max_sel : pos_end;
+    const uint32_t max_splits = n_tokens <= QWEN35_ATTN_SPLIT_ROWS ? qwen35_attn_splits(n_keys) : 1u;
+    if (max_splits > 1u &&
+        part->bytes < (uint64_t)n_tokens * n_head * max_splits * (hd + 2u) * sizeof(float)) {
         return 0;
     }
-    const size_t smem = (size_t)((n_keys + n_splits - 1u) / n_splits) * sizeof(float);
+    uint32_t chunk = (n_keys + max_splits - 1u) / max_splits;
+    if (b && chunk < 128u) chunk = 128u;
+    const size_t smem = (size_t)chunk * sizeof(float);
     static size_t smem_limit = 0;
     if (smem > smem_limit) {
         if (cudaFuncSetAttribute(qwen35_attention_kernel,
@@ -1563,15 +1662,15 @@ extern "C" int ds4_gpu_qwen35_attention(
         }
         smem_limit = smem;
     }
-    qwen35_attention_kernel<<<dim3(n_tokens, n_head, n_splits), hd, smem, stream>>>(
-        (float *)att->ptr, (float *)part->ptr, (const float *)qg->ptr, (const __nv_bfloat16 *)k_cache->ptr,
-        (const __nv_bfloat16 *)v_cache->ptr, sel ? (const int32_t *)sel->ptr : NULL,
-        sel ? (const uint32_t *)n_sel->ptr : NULL, max_sel,
-        n_head, n_kv, hd, pos0, n_tokens, n_splits);
-    if (n_splits > 1u) {
+    qwen35_attention_kernel<<<dim3(n_tokens, n_head, max_splits), hd, smem, stream>>>(
+        (float *)att->ptr, (float *)part->ptr, (const float *)qg->ptr, rows,
+        sel ? (const int32_t *)sel->ptr : NULL, sel ? (const uint32_t *)n_sel->ptr : NULL, max_sel, dense_keys,
+        n_head, n_kv, hd, pos_end, n_tokens, b, max_splits);
+    if (max_splits > 1u) {
         qwen35_attention_merge_kernel<<<dim3(n_tokens, n_head, 1u), hd, 0, stream>>>(
-            (float *)att->ptr, (const float *)part->ptr, (const float *)qg->ptr,
-            n_head, hd, n_tokens, n_splits);
+            (float *)att->ptr, (const float *)part->ptr, (const float *)qg->ptr, rows,
+            sel ? (const int32_t *)sel->ptr : NULL, max_sel, dense_keys,
+            n_head, hd, pos_end, n_tokens, b, max_splits);
     }
     return cuda_ok(cudaGetLastError(), "Qwen3.5 attention launch");
 }
@@ -2282,19 +2381,21 @@ extern "C" int ds4_gpu_qwen4exp_ple_gate(
  * (kernel-1-k)*dilation tokens back, from the batch or the history (oldest
  * first).  x += gated + SiLU(conv). */
 __global__ static void qwen4exp_ple_conv_kernel(
-        __nv_bfloat16 *x, const float *gated, const float *pnorm, const float *hist, const float *taps,
-        uint32_t hc_dim, uint32_t kern, uint32_t dil, uint32_t rows) {
+        __nv_bfloat16 *x, const float *gated, const float *pnorm, const ds4_qwen_batch_slot *slots, const float *taps,
+        uint32_t hc_dim, uint32_t kern, uint32_t dil, uint32_t rows, uint32_t batched) {
     const uint32_t ch = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t t = blockIdx.y;
     if (ch >= hc_dim || t >= rows) return;
+    const float *hist = (const float *)slots[batched ? t : 0u].p0;
+    const uint32_t tl = batched ? 0u : t;
     const float *tp = taps + (uint64_t)ch * kern;
     const int32_t hist_rows = (int32_t)((kern - 1u) * dil);
     const uint64_t cur = (uint64_t)t * hc_dim + ch;
     float acc = tp[kern - 1u] * pnorm[cur];
     for (uint32_t k = 0; k + 1u < kern; k++) {
-        const int32_t src = (int32_t)t - (int32_t)((kern - 1u - k) * dil);
+        const int32_t src = (int32_t)tl - (int32_t)((kern - 1u - k) * dil);
         const float v = src >= 0
-            ? pnorm[(uint64_t)src * hc_dim + ch]
+            ? pnorm[(uint64_t)(t - tl + (uint32_t)src) * hc_dim + ch]
             : hist[(uint64_t)(hist_rows + src) * hc_dim + ch];
         acc = fmaf(tp[k], v, acc);
     }
@@ -2305,7 +2406,8 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv(
         ds4_gpu_tensor       *x,            /* [rows][hc_dim] */
         const ds4_gpu_tensor *gated,        /* [rows][hc_dim] */
         const ds4_gpu_tensor *pnorm,        /* [rows][hc_dim] */
-        ds4_gpu_tensor       *hist,         /* [(kernel-1)*dilation][hc_dim], slid forward afterwards */
+        const ds4_gpu_tensor *slots,        /* row table: p0 the conv history [(kernel-1)*dilation][hc_dim], slid forward afterwards */
+        uint32_t              slot0,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              taps_offset,  /* [hc_dim][kernel] f32 */
@@ -2313,12 +2415,14 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv(
         uint32_t              kern,
         uint32_t              dil,
         uint32_t              rows,
-        const ds4_gpu_tensor *snap_hist) {  /* optional: the conv history after each token */
+        int                   batched,
+        const ds4_gpu_tensor *snap_hist) {  /* optional (sequential): the conv history after each token */
     const uint64_t n = (uint64_t)rows * hc_dim;
     const uint32_t hist_rows = (kern - 1u) * dil;
-    if (!model_map || n == 0u || kern < 2u || dil == 0u || !qwen4exp_bf16_fit(x, n) ||
-        !qwen4exp_elems_fit(gated, n) || !qwen4exp_elems_fit(pnorm, n) ||
-        !qwen4exp_elems_fit(hist, (uint64_t)hist_rows * hc_dim)) {
+    const uint32_t b = batched != 0;
+    const ds4_qwen_batch_slot *table = qwen35_slots(slots, slot0, rows, b);
+    if (!model_map || n == 0u || kern < 2u || dil == 0u || !table || (b && snap_hist) || !qwen4exp_bf16_fit(x, n) ||
+        !qwen4exp_elems_fit(gated, n) || !qwen4exp_elems_fit(pnorm, n)) {
         return 0;
     }
     const float *taps = glm53_cuda_weight_f32(model_map, model_size, taps_offset, (uint64_t)hc_dim * kern,
@@ -2326,11 +2430,10 @@ extern "C" int ds4_gpu_qwen4exp_ple_conv(
     if (!taps) return 0;
     cudaStream_t stream = cuda_decode_stream();
     qwen4exp_ple_conv_kernel<<<dim3((hc_dim + 255u) / 256u, rows, 1u), 256, 0, stream>>>(
-        (__nv_bfloat16 *)x->ptr, (const float *)gated->ptr, (const float *)pnorm->ptr, (const float *)hist->ptr,
-        taps, hc_dim, kern, dil, rows);
-    if (!qwen35_history_snapshots(snap_hist, (const float *)hist->ptr, (const float *)pnorm->ptr, hc_dim, hist_rows, rows, stream)) return 0;
-    qwen35_gdn_conv_state_kernel<<<(hc_dim + 255u) / 256u, 256, 0, stream>>>(
-        (float *)hist->ptr, (const float *)pnorm->ptr, hc_dim, hist_rows, rows);
+        (__nv_bfloat16 *)x->ptr, (const float *)gated->ptr, (const float *)pnorm->ptr, table,
+        taps, hc_dim, kern, dil, rows, b);
+    if (!qwen35_history_snapshots(snap_hist, table, (const float *)pnorm->ptr, hc_dim, hist_rows, rows, stream)) return 0;
+    qwen35_history_slide(table, (const float *)pnorm->ptr, hc_dim, hist_rows, rows, b, stream);
     return cuda_ok(cudaGetLastError(), "Flash-Next PLE conv launch");
 }
 
@@ -2369,18 +2472,23 @@ __device__ __forceinline__ void qwen4exp_rope_shared(float *head, uint32_t n_rot
  * cache holds the keys in bf16, the scoring GEMM's operand, so a long
  * context is never re-converted per token. */
 __global__ static void qwen4exp_block_key_kernel(
-        __nv_bfloat16 *bkey, const float *raw, const float *hist, const float *k_norm,
-        uint32_t d, uint32_t r, uint32_t n_rot, uint32_t pos0, uint32_t n_tokens, float freq_base, float eps) {
+        const ds4_qwen_batch_slot *slots, const float *raw, const float *k_norm,
+        uint32_t d, uint32_t r, uint32_t n_rot, uint32_t n_tokens, uint32_t batched, float freq_base, float eps) {
     __shared__ float scratch[32];
     __shared__ float kb[QWEN4EXP_INDEXER_MAX_DIM];
     const uint32_t t = blockIdx.x;
     const uint32_t tid = threadIdx.x;
-    const uint32_t pos = pos0 + t;
-    if (t >= n_tokens || pos % r != r - 1u) return;
+    if (t >= n_tokens) return;
+    const ds4_qwen_batch_slot row = slots[batched ? t : 0u];
+    const uint32_t pos = batched ? row.pos : row.pos + t;
+    if (pos % r != r - 1u) return;
+    const float *hist = (const float *)row.p0;
+    __nv_bfloat16 *bkey = (__nv_bfloat16 *)row.p1;
+    const uint32_t tl = batched ? 0u : t;
     float acc = 0.0f;
     for (uint32_t j = 0; j < r; j++) {
-        const int32_t src = (int32_t)t - (int32_t)(r - 1u) + (int32_t)j;
-        acc += src >= 0 ? raw[(uint64_t)src * d + tid] : hist[(uint64_t)(int32_t)(r - 1u + src) * d + tid];
+        const int32_t src = (int32_t)tl - (int32_t)(r - 1u) + (int32_t)j;
+        acc += src >= 0 ? raw[(uint64_t)(t - tl + (uint32_t)src) * d + tid] : hist[(uint64_t)(int32_t)(r - 1u + src) * d + tid];
     }
     const float v = acc / (float)r;
     const float total = qwen35_cuda_block_sum(v * v, scratch);
@@ -2392,9 +2500,9 @@ __global__ static void qwen4exp_block_key_kernel(
 }
 
 extern "C" int ds4_gpu_qwen4exp_block_keys(
-        ds4_gpu_tensor       *bkey,
+        const ds4_gpu_tensor *slots,        /* row table: p0 the raw-key history [r-1][d] (slid forward afterwards), p1 the bf16 block keys [ctx / r][d] */
+        uint32_t              slot0,
         const ds4_gpu_tensor *raw,          /* [n_tok][d] raw indexer keys of the chunk */
-        ds4_gpu_tensor       *hist,         /* [r-1][d], slid forward afterwards */
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              k_norm_offset,
@@ -2402,64 +2510,69 @@ extern "C" int ds4_gpu_qwen4exp_block_keys(
         uint32_t              r,
         uint32_t              n_rot,
         uint32_t              ctx,
-        uint32_t              pos0,
+        uint32_t              pos_end,
         uint32_t              n_tokens,
+        int                   batched,
         float                 freq_base,
         float                 eps,
-        const ds4_gpu_tensor *snap_hist) {  /* optional: the raw-key history after each token */
-    if (!model_map || d == 0u || d > QWEN4EXP_INDEXER_MAX_DIM || d % 32u != 0u || r < 2u || n_rot == 0u ||
-        n_rot % 2u != 0u || n_rot > d || n_tokens == 0u || pos0 + n_tokens > ctx ||
-        !qwen4exp_bf16_fit(bkey, (uint64_t)(ctx / r) * d) || !qwen4exp_elems_fit(raw, (uint64_t)n_tokens * d) ||
-        !qwen4exp_elems_fit(hist, (uint64_t)(r - 1u) * d)) {
+        const ds4_gpu_tensor *snap_hist) {  /* optional (sequential): the raw-key history after each token */
+    const uint32_t b = batched != 0;
+    const ds4_qwen_batch_slot *rows = qwen35_slots(slots, slot0, n_tokens, b);
+    if (!model_map || !rows || d == 0u || d > QWEN4EXP_INDEXER_MAX_DIM || d % 32u != 0u || r < 2u || n_rot == 0u ||
+        n_rot % 2u != 0u || n_rot > d || pos_end == 0u || pos_end > ctx || (!b && pos_end < n_tokens) ||
+        (b && snap_hist) || !qwen4exp_elems_fit(raw, (uint64_t)n_tokens * d)) {
         return 0;
     }
     const float *k_norm = glm53_cuda_weight_f32(model_map, model_size, k_norm_offset, d,
-                                                ds4_tensor_device_idx(bkey), "indexer k norm");
+                                                ds4_tensor_device_idx(raw), "indexer k norm");
     if (!k_norm) return 0;
     cudaStream_t stream = cuda_decode_stream();
     qwen4exp_block_key_kernel<<<n_tokens, d, 0, stream>>>(
-        (__nv_bfloat16 *)bkey->ptr, (const float *)raw->ptr, (const float *)hist->ptr, k_norm,
-        d, r, n_rot, pos0, n_tokens, freq_base, eps);
-    if (!qwen35_history_snapshots(snap_hist, (const float *)hist->ptr, (const float *)raw->ptr, d, r - 1u, n_tokens, stream)) return 0;
-    qwen35_gdn_conv_state_kernel<<<(d + 255u) / 256u, 256, 0, stream>>>(
-        (float *)hist->ptr, (const float *)raw->ptr, d, r - 1u, n_tokens);
+        rows, (const float *)raw->ptr, k_norm, d, r, n_rot, n_tokens, b, freq_base, eps);
+    if (!qwen35_history_snapshots(snap_hist, rows, (const float *)raw->ptr, d, r - 1u, n_tokens, stream)) return 0;
+    qwen35_history_slide(rows, (const float *)raw->ptr, d, r - 1u, n_tokens, b, stream);
     return cuda_ok(cudaGetLastError(), "Flash-Next block key launch");
 }
 
 /* Per (token, indexer head): RMS-normalise and rotate the query in place. */
 __global__ static void qwen4exp_indexer_query_kernel(
-        float *q, const float *q_norm, uint32_t n_head, uint32_t d, uint32_t n_rot,
-        uint32_t pos0, uint32_t n_tokens, float freq_base, float eps) {
+        float *q, const ds4_qwen_batch_slot *slots, const float *q_norm, uint32_t n_head, uint32_t d, uint32_t n_rot,
+        uint32_t n_tokens, uint32_t batched, float freq_base, float eps) {
     __shared__ float scratch[32];
     __shared__ float qh[QWEN4EXP_INDEXER_MAX_DIM];
     const uint32_t t = blockIdx.x;
     const uint32_t h = blockIdx.y;
     const uint32_t tid = threadIdx.x;
     if (t >= n_tokens || h >= n_head) return;
+    const uint32_t pos = batched ? slots[t].pos : slots[0].pos + t;
     float *head = q + ((uint64_t)t * n_head + h) * d;
     const float x = head[tid];
     const float total = qwen35_cuda_block_sum(x * x, scratch);
     qh[tid] = x * rsqrtf(total / (float)d + eps) * q_norm[tid];
     __syncthreads();
-    qwen4exp_rope_shared(qh, n_rot, pos0 + t, freq_base);
+    qwen4exp_rope_shared(qh, n_rot, pos, freq_base);
     __syncthreads();
     head[tid] = qh[tid];
 }
 
 extern "C" int ds4_gpu_qwen4exp_indexer_query(
         ds4_gpu_tensor       *q,            /* [n_tok][n_head][d], modified in place */
+        const ds4_gpu_tensor *slots,        /* row table, for the positions */
+        uint32_t              slot0,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              q_norm_offset,
         uint32_t              n_head,
         uint32_t              d,
         uint32_t              n_rot,
-        uint32_t              pos0,
         uint32_t              n_tokens,
+        int                   batched,
         float                 freq_base,
         float                 eps) {
-    if (!model_map || n_head == 0u || d == 0u || d > QWEN4EXP_INDEXER_MAX_DIM || d % 32u != 0u ||
-        n_rot == 0u || n_rot % 2u != 0u || n_rot > d || n_tokens == 0u ||
+    const uint32_t b = batched != 0;
+    const ds4_qwen_batch_slot *rows = qwen35_slots(slots, slot0, n_tokens, b);
+    if (!model_map || !rows || n_head == 0u || d == 0u || d > QWEN4EXP_INDEXER_MAX_DIM || d % 32u != 0u ||
+        n_rot == 0u || n_rot % 2u != 0u || n_rot > d ||
         !qwen4exp_elems_fit(q, (uint64_t)n_tokens * n_head * d)) {
         return 0;
     }
@@ -2467,7 +2580,7 @@ extern "C" int ds4_gpu_qwen4exp_indexer_query(
                                                 ds4_tensor_device_idx(q), "indexer q norm");
     if (!q_norm) return 0;
     qwen4exp_indexer_query_kernel<<<dim3(n_tokens, n_head, 1u), d, 0, cuda_decode_stream()>>>(
-        (float *)q->ptr, q_norm, n_head, d, n_rot, pos0, n_tokens, freq_base, eps);
+        (float *)q->ptr, rows, q_norm, n_head, d, n_rot, n_tokens, b, freq_base, eps);
     return cuda_ok(cudaGetLastError(), "Flash-Next indexer query launch");
 }
 
@@ -2484,14 +2597,26 @@ extern "C" int ds4_gpu_qwen4exp_indexer_query(
 #define QWEN4EXP_SCORE_LD (QWEN4EXP_INDEXER_MAX_DIM + 8u)   /* bf16 per staged key row */
 
 __global__ static void __launch_bounds__(256, 2) qwen4exp_indexer_score_kernel(
-        uint64_t *keys, uint64_t keys_stride, const __nv_bfloat16 *q, const __nv_bfloat16 *bkey,
-        uint32_t n_head, uint32_t d, uint32_t n_tokens, uint32_t n_blocks) {
+        uint64_t *keys, uint64_t keys_stride, const __nv_bfloat16 *q, const ds4_qwen_batch_slot *slots,
+        uint32_t n_head, uint32_t d, uint32_t r, uint32_t n_tokens, uint32_t n_blocks, uint32_t batched) {
     __shared__ __align__(16) __nv_bfloat16 bs[QWEN4EXP_SCORE_COLS][QWEN4EXP_SCORE_LD];
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
     const uint32_t t0 = blockIdx.y * QWEN4EXP_SCORE_ROWS;
     const uint32_t b0 = blockIdx.x * QWEN4EXP_SCORE_COLS;
+    /* a batched row scores its one token against its own block keys, in
+     * its own tile (the grid's z); the tile columns past its blocks are idle */
+    const uint32_t row = blockIdx.z;
+    const ds4_qwen_batch_slot slot = slots[row];
+    const __nv_bfloat16 *bkey = (const __nv_bfloat16 *)slot.p1;
+    if (batched) {
+        n_blocks = (slot.pos + 1u) / r;
+        n_tokens = 1u;
+        q += (uint64_t)row * n_head * d;
+        keys += (uint64_t)row * keys_stride;
+    }
+    if (b0 >= n_blocks) return;
     const uint32_t wr = (warp >> 2u) * 16u;
     const uint32_t wc = (warp & 3u) * 32u;
     const uint32_t qd = n_head * d;                      /* query row length */
@@ -2548,8 +2673,8 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_indexer_score_kernel(
  * and expanded to cells, then the tail cells.  Deterministic, and the same
  * choice as the CPU's repeated argmax with ties to the older block. */
 __global__ static void qwen4exp_qsa_select_kernel(
-        int32_t *sel, uint32_t *n_sel, const uint64_t *keys_scratch, uint64_t keys_stride,
-        uint32_t r, uint32_t budget, uint32_t max_sel, uint32_t pos0, uint32_t n_tokens) {
+        int32_t *sel, uint32_t *n_sel, const uint64_t *keys_scratch, uint64_t keys_stride, const ds4_qwen_batch_slot *slots,
+        uint32_t r, uint32_t budget, uint32_t max_sel, uint32_t pos0, uint32_t n_tokens, uint32_t batched) {
     __shared__ uint32_t hist[256];
     __shared__ uint32_t scan[QWEN4EXP_SELECT_THREADS];
     __shared__ uint32_t s_bin, s_k;
@@ -2559,7 +2684,7 @@ __global__ static void qwen4exp_qsa_select_kernel(
     if (t >= n_tokens) return;
     const uint64_t *keys = keys_scratch + (uint64_t)t * keys_stride;
     {
-        const uint32_t pos = pos0 + t;
+        const uint32_t pos = batched ? slots[t].pos : pos0 + t;
         const uint32_t n_blocks = (pos + 1u) / r;
         int32_t *out = sel + (uint64_t)t * max_sel;
         if (n_blocks <= budget) {
@@ -2625,22 +2750,27 @@ extern "C" int ds4_gpu_qwen4exp_qsa_select(
         ds4_gpu_tensor       *keys,         /* uint64 [keys_rows][ctx / r] scratch, one row per concurrent token */
         uint32_t              keys_rows,
         const ds4_gpu_tensor *q,            /* [n_tok][n_head][d] normalised, rotated */
-        const ds4_gpu_tensor *bkey,         /* bf16 [ctx / r][d] */
+        const ds4_gpu_tensor *slots,        /* row table: p1 the bf16 block keys [ctx / r][d] */
+        uint32_t              slot0,
         uint32_t              n_head,
         uint32_t              d,
         uint32_t              r,
         uint32_t              budget,
         uint32_t              max_sel,
         uint32_t              ctx,
-        uint32_t              pos0,
-        uint32_t              n_tokens) {
+        uint32_t              pos_end,
+        uint32_t              n_tokens,
+        int                   batched) {
     const uint64_t max_blocks = ctx / r;
-    if (n_head == 0u || d == 0u || n_head * d > QWEN4EXP_INDEXER_MAX_Q || r < 2u || budget == 0u ||
-        max_sel < budget * r + r - 1u || n_tokens == 0u || pos0 + n_tokens > ctx || keys_rows == 0u ||
+    const uint32_t b = batched != 0;
+    const ds4_qwen_batch_slot *rows = qwen35_slots(slots, slot0, n_tokens, b);
+    if (!rows || n_head == 0u || d == 0u || n_head * d > QWEN4EXP_INDEXER_MAX_Q || r < 2u || budget == 0u ||
+        max_sel < budget * r + r - 1u || pos_end == 0u || pos_end > ctx || (!b && pos_end < n_tokens) ||
+        keys_rows == 0u || (b && n_tokens > keys_rows) ||
         !sel || sel->bytes < (uint64_t)n_tokens * max_sel * sizeof(int32_t) ||
         !n_sel || n_sel->bytes < (uint64_t)n_tokens * sizeof(uint32_t) ||
         !keys || keys->bytes < (uint64_t)keys_rows * max_blocks * sizeof(uint64_t) ||
-        !qwen4exp_elems_fit(q, (uint64_t)n_tokens * n_head * d) || !qwen4exp_bf16_fit(bkey, max_blocks * d)) {
+        !qwen4exp_elems_fit(q, (uint64_t)n_tokens * n_head * d)) {
         return 0;
     }
     if (d % 16u != 0u || d > QWEN4EXP_INDEXER_MAX_DIM) return 0;
@@ -2650,20 +2780,23 @@ extern "C" int ds4_gpu_qwen4exp_qsa_select(
     const uint64_t qn = (uint64_t)n_tokens * n_head * d;
     __nv_bfloat16 *qb = (__nv_bfloat16 *)cuda_tmp_alloc_on(tier, qn * sizeof(__nv_bfloat16), "indexer queries");
     if (!qb) return 0;
-    const __nv_bfloat16 *kb = (const __nv_bfloat16 *)bkey->ptr;
     qwen35_to_bf16(qb, (const float *)q->ptr, qn, stream);
-    /* tokens go in groups of keys_rows, each scoring into its own scratch row */
+    const uint32_t pos0 = b ? 0u : pos_end - n_tokens;
+    /* tokens go in groups of keys_rows, each scoring into its own scratch
+     * row; a batched pass is one group of one-token tiles */
     for (uint32_t g0 = 0; g0 < n_tokens; g0 += keys_rows) {
         const uint32_t ng = n_tokens - g0 < keys_rows ? n_tokens - g0 : keys_rows;
-        const uint32_t nb = (pos0 + g0 + ng) / r;              /* blocks the group's last token sees */
+        const uint32_t nb = (b ? pos_end : pos0 + g0 + ng) / r;   /* blocks the group's furthest token sees */
         if (nb) {
-            const dim3 grid((nb + QWEN4EXP_SCORE_COLS - 1u) / QWEN4EXP_SCORE_COLS, (ng + QWEN4EXP_SCORE_ROWS - 1u) / QWEN4EXP_SCORE_ROWS, 1u);
+            const dim3 grid((nb + QWEN4EXP_SCORE_COLS - 1u) / QWEN4EXP_SCORE_COLS,
+                            b ? 1u : (ng + QWEN4EXP_SCORE_ROWS - 1u) / QWEN4EXP_SCORE_ROWS,
+                            b ? ng : 1u);
             qwen4exp_indexer_score_kernel<<<grid, 256, 0, stream>>>(
-                (uint64_t *)keys->ptr, max_blocks, qb + (uint64_t)g0 * n_head * d, kb, n_head, d, ng, nb);
+                (uint64_t *)keys->ptr, max_blocks, qb + (uint64_t)g0 * n_head * d, rows, n_head, d, r, ng, nb, b);
         }
         qwen4exp_qsa_select_kernel<<<ng, QWEN4EXP_SELECT_THREADS, 0, stream>>>(
             (int32_t *)sel->ptr + (uint64_t)g0 * max_sel, (uint32_t *)n_sel->ptr + g0, (const uint64_t *)keys->ptr, max_blocks,
-            r, budget, max_sel, pos0 + g0, ng);
+            rows, r, budget, max_sel, pos0 + g0, ng, b);
     }
     return cuda_ok(cudaGetLastError(), "Flash-Next QSA select launch");
 }

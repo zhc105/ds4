@@ -17,6 +17,10 @@
  * Set DS4_TEST_QUALITY=1 to run the engine's reference-quality CUDA paths.
  * Set DS4_TEST_SERVER_PREFILL=1 to exercise the progress-split prefill path
  * used by ds4-server.
+ * Set DS4_TEST_RAGGED_POS=1 to advance the odd sessions one token on their
+ * own before batching, so the rows of a batch sit at different positions.
+ * Set DS4_TEST_REQUIRE_NATIVE=1 to fail when a multi-row batch took the
+ * serialized fallback instead of one batched forward (Qwen, CUDA).
  */
 
 #include "ds4.h"
@@ -228,6 +232,24 @@ int main(void) {
         }
     }
 
+    /* Ragged positions: the odd sessions take one step alone first, which
+     * the control replay repeats before its first comparison. */
+    const bool ragged = getenv("DS4_TEST_RAGGED_POS") != NULL;
+    int lead[MAX_SESSION_COUNT];
+    for (int i = 0; i < session_count; i++) {
+        lead[i] = ragged && (i & 1) ? ds4_session_argmax(batched[i]) : -1;
+        if (lead[i] >= 0 &&
+            ds4_session_eval(batched[i], lead[i], err, sizeof(err)) != 0) {
+            fprintf(stderr, "FAIL: lead eval session=%d: %s\n", i, err);
+            return 1;
+        }
+    }
+    const bool require_native = getenv("DS4_TEST_REQUIRE_NATIVE") != NULL;
+#ifdef DS4_TEST_HOOKS
+    uint64_t native_before = ds4_test_qwen_batch_count();
+#endif
+    int fallback_calls = 0;
+
     const int vocab = ds4_engine_vocab_size(engine);
     const size_t frontiers = (size_t)(DECODE_STEPS + 1) * (size_t)session_count;
     float *expected = malloc(frontiers * (size_t)vocab * sizeof(*expected));
@@ -282,6 +304,13 @@ int main(void) {
                         rows, base, step, err);
                 return 1;
             }
+#ifdef DS4_TEST_HOOKS
+            if (rows > 1) {
+                const uint64_t native_after = ds4_test_qwen_batch_count();
+                if (native_after == native_before) fallback_calls++;
+                native_before = native_after;
+            }
+#endif
             batch_ms[rows] += elapsed;
             batch_calls[rows]++;
             evaluated_rows += (uint64_t)rows;
@@ -289,9 +318,16 @@ int main(void) {
         }
     }
     fprintf(stderr,
-            "decode batch timing: rows=%llu total=%.3f ms aggregate=%.1f tok/s\n",
+            "decode batch timing: rows=%llu total=%.3f ms aggregate=%.1f tok/s "
+            "fallback_batches=%d\n",
             (unsigned long long)evaluated_rows, evaluated_ms,
-            evaluated_ms > 0.0 ? (double)evaluated_rows * 1000.0 / evaluated_ms : 0.0);
+            evaluated_ms > 0.0 ? (double)evaluated_rows * 1000.0 / evaluated_ms : 0.0,
+            fallback_calls);
+    if (require_native && fallback_calls != 0) {
+        fprintf(stderr, "FAIL: %d multi-row batches took the serialized fallback\n",
+                fallback_calls);
+        return 1;
+    }
     for (int rows = 2; rows <= session_count; rows++) {
         if (batch_calls[rows] != 0) {
             fprintf(stderr,
@@ -345,6 +381,11 @@ int main(void) {
         }
         if (ds4_session_sync(control, &prompt[i], err, sizeof(err)) != 0) {
             fprintf(stderr, "FAIL: control prefill session=%d: %s\n", i, err);
+            return 1;
+        }
+        if (lead[i] >= 0 &&
+            ds4_session_eval(control, lead[i], err, sizeof(err)) != 0) {
+            fprintf(stderr, "FAIL: control lead eval session=%d: %s\n", i, err);
             return 1;
         }
         for (int step = 0; step <= DECODE_STEPS; step++) {

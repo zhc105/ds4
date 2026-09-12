@@ -41,6 +41,20 @@ typedef struct {
 } ds4_gpu_attention_decode_row;
 #endif
 
+/* Mirrors ds4_gpu_mgpu.h (which ds4_cuda.cu includes instead of this
+ * header); see the comment there. */
+#ifndef DS4_QWEN_BATCH_SLOT_DEFINED
+#define DS4_QWEN_BATCH_SLOT_DEFINED
+#define DS4_QWEN_BATCH_ROWS 8u
+typedef struct {
+    uint64_t p0;
+    uint64_t p1;
+    uint32_t pos;
+    uint32_t ctx;
+    uint64_t reserved;
+} ds4_qwen_batch_slot;
+#endif
+
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
@@ -3195,12 +3209,17 @@ int ds4_gpu_qwen35_matmul(
         uint32_t              n_tok);
 int ds4_gpu_qwen35_bf16(ds4_gpu_tensor *dst, const ds4_gpu_tensor *x, uint64_t n);
 int ds4_gpu_qwen35_warm(ds4_gpu_tensor *f32, ds4_gpu_tensor *bf16, ds4_gpu_tensor *out);
+/* The Qwen kernels that touch per-session state take a ds4_qwen_batch_slot
+ * row table (`slots`, rows from `slot0`) and a `batched` flag: a sequential
+ * pass runs one session's n_tokens tokens over row 0, a batched pass one
+ * token of each of n_tokens sessions over rows 0..n_tokens-1.  pos_end is
+ * one past the highest position of the pass. */
 int ds4_gpu_qwen35_gdn(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *out_bf16,
         ds4_gpu_tensor       *mixed,
-        ds4_gpu_tensor       *conv_state,
-        ds4_gpu_tensor       *ssm_state,
+        const ds4_gpu_tensor *slots,
+        uint32_t              slot0,
         const ds4_gpu_tensor *qkv,
         const ds4_gpu_tensor *z,
         const ds4_gpu_tensor *alpha,
@@ -3215,6 +3234,7 @@ int ds4_gpu_qwen35_gdn(
         uint32_t              n_v,
         uint32_t              n_conv,
         uint32_t              n_tokens,
+        int                   batched,
         int                   sigmoid_gate,
         float                 eps,
         const ds4_gpu_tensor *snap_ssm,
@@ -3226,13 +3246,14 @@ int ds4_gpu_qwen35_attention(
         ds4_gpu_tensor       *part,
         ds4_gpu_tensor       *split,
         ds4_gpu_tensor       *qg,
-        ds4_gpu_tensor       *k_cache,
-        ds4_gpu_tensor       *v_cache,
+        const ds4_gpu_tensor *slots,
+        uint32_t              slot0,
         const ds4_gpu_tensor *k,
         const ds4_gpu_tensor *v,
         const ds4_gpu_tensor *sel,
         const ds4_gpu_tensor *n_sel,
         uint32_t              max_sel,
+        uint32_t              dense_keys,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              q_norm_offset,
@@ -3242,14 +3263,15 @@ int ds4_gpu_qwen35_attention(
         uint32_t              hd,
         uint32_t              n_rot,
         uint32_t              ctx,
-        uint32_t              pos0,
+        uint32_t              pos_end,
         uint32_t              n_tokens,
+        int                   batched,
         float                 freq_base,
         float                 eps);
 int ds4_gpu_qwen4exp_block_keys(
-        ds4_gpu_tensor       *bkey,
+        const ds4_gpu_tensor *slots,
+        uint32_t              slot0,
         const ds4_gpu_tensor *raw,
-        ds4_gpu_tensor       *hist,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              k_norm_offset,
@@ -3257,21 +3279,24 @@ int ds4_gpu_qwen4exp_block_keys(
         uint32_t              r,
         uint32_t              n_rot,
         uint32_t              ctx,
-        uint32_t              pos0,
+        uint32_t              pos_end,
         uint32_t              n_tokens,
+        int                   batched,
         float                 freq_base,
         float                 eps,
         const ds4_gpu_tensor *snap_hist);
 int ds4_gpu_qwen4exp_indexer_query(
         ds4_gpu_tensor       *q,
+        const ds4_gpu_tensor *slots,
+        uint32_t              slot0,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              q_norm_offset,
         uint32_t              n_head,
         uint32_t              d,
         uint32_t              n_rot,
-        uint32_t              pos0,
         uint32_t              n_tokens,
+        int                   batched,
         float                 freq_base,
         float                 eps);
 int ds4_gpu_qwen4exp_qsa_select(
@@ -3280,15 +3305,17 @@ int ds4_gpu_qwen4exp_qsa_select(
         ds4_gpu_tensor       *keys,
         uint32_t              keys_rows,
         const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *bkey,
+        const ds4_gpu_tensor *slots,
+        uint32_t              slot0,
         uint32_t              n_head,
         uint32_t              d,
         uint32_t              r,
         uint32_t              budget,
         uint32_t              max_sel,
         uint32_t              ctx,
-        uint32_t              pos0,
-        uint32_t              n_tokens);
+        uint32_t              pos_end,
+        uint32_t              n_tokens,
+        int                   batched);
 int ds4_gpu_qwen4exp_stream_norm(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *out_bf16,
@@ -3435,7 +3462,8 @@ int ds4_gpu_qwen4exp_ple_conv(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *gated,
         const ds4_gpu_tensor *pnorm,
-        ds4_gpu_tensor       *hist,
+        const ds4_gpu_tensor *slots,
+        uint32_t              slot0,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              taps_offset,
@@ -3443,6 +3471,7 @@ int ds4_gpu_qwen4exp_ple_conv(
         uint32_t              kern,
         uint32_t              dil,
         uint32_t              rows,
+        int                   batched,
         const ds4_gpu_tensor *snap_hist);
 
 int ds4_gpu_glm53_kda_decode(
