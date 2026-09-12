@@ -9830,7 +9830,25 @@ struct server_slot {
     bool decode_pending;
     bool decode_in_flight;
     bool decode_done;
+    /* A decode request: the token to fold in and, when the drafter is
+     * allowed, what a speculative cycle needs to sample.  The worker runs
+     * the cycle only for a slot decoding alone; the batched rows of a busy
+     * server advance one token each.  It returns the committed tokens. */
     int decode_token;
+    struct {
+        bool enabled;
+        bool ignore_eos;
+        int max_tokens;
+        int eos_token;
+        ds4_think_mode think_mode;
+        float temperature;
+        int top_k;
+        float top_p;
+        float min_p;
+        uint64_t *rng;
+    } decode_spec;
+    int decode_toks[17];
+    int decode_ntok;
     int decode_rc;
     char decode_err[160];
 };
@@ -11874,8 +11892,8 @@ static bool complete_tool_call_inside_thinking(const char *text, size_t len,
     return find_any_tool_end(start) != NULL;
 }
 
-static int server_eval_token(server *s, server_slot *slot, int token,
-                             char *err, size_t errlen);
+static int server_eval_step(server *s, server_slot *slot, int token,
+                            char *err, size_t errlen);
 
 static char *rendered_chat_system_region(const char *prompt_text) {
     if (!prompt_text) return xstrdup("");
@@ -12740,20 +12758,49 @@ static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
     return true;
 }
 
-static int server_eval_token(server *s, server_slot *slot, int token,
-                             char *err, size_t errlen) {
-    if (!s || !slot) return 1;
+/* Fold `token` into the slot's session with the drafter (slot->decode_spec),
+ * committing it and the accepted drafts into decode_toks; the count, or
+ * -1.  The caller holds inference_mu. */
+static int server_slot_speculate(server_slot *slot, int token, char *err, size_t errlen) {
+    const int cap = (int)(sizeof(slot->decode_toks) / sizeof(slot->decode_toks[0]));
+    if (slot->decode_spec.ignore_eos) {
+        return ds4_session_eval_speculative_argmax_ignoring_eos(
+            slot->session, token, slot->decode_spec.max_tokens, slot->decode_spec.eos_token,
+            slot->decode_spec.think_mode, slot->decode_toks, cap, err, errlen);
+    }
+    return ds4_session_eval_speculative(
+        slot->session, token, slot->decode_spec.max_tokens, slot->decode_spec.eos_token,
+        slot->decode_spec.temperature, slot->decode_spec.top_k, slot->decode_spec.top_p,
+        slot->decode_spec.min_p, slot->decode_spec.rng, slot->decode_toks, cap, err, errlen);
+}
+
+/* One decode step of a generation: `token` and, with the drafter allowed
+ * (slot->decode_spec.enabled), the drafts it verifies.  Returns the number
+ * of tokens committed into slot->decode_toks, or a nonzero status negated
+ * (DS4_SESSION_SYNC_INTERRUPTED stays recognisable).  In batched mode the
+ * step goes through the decode worker, which batches it with the other
+ * slots' tokens or, when this slot decodes alone, runs its drafter. */
+static int server_eval_step(server *s, server_slot *slot, int token,
+                            char *err, size_t errlen) {
+    if (!s || !slot) return -1;
     if (!s->batched_mode) {
         if (g_stop_requested || slot_job_cancelled(slot)) {
             if (err && errlen) snprintf(err, errlen, "%s",
                                         g_stop_requested ? "shutdown requested" :
                                                            "client disconnected");
-            return DS4_SESSION_SYNC_INTERRUPTED;
+            return -DS4_SESSION_SYNC_INTERRUPTED;
         }
         pthread_mutex_lock(&s->inference_mu);
-        int rc = ds4_session_eval(slot->session, token, err, errlen);
+        int n;
+        if (slot->decode_spec.enabled) {
+            n = server_slot_speculate(slot, token, err, errlen);
+        } else {
+            const int rc = ds4_session_eval(slot->session, token, err, errlen);
+            slot->decode_toks[0] = token;
+            n = rc == 0 ? 1 : -rc;
+        }
         pthread_mutex_unlock(&s->inference_mu);
-        return rc;
+        return n;
     }
 
     pthread_mutex_lock(&s->model_mu);
@@ -12762,14 +12809,15 @@ static int server_eval_token(server *s, server_slot *slot, int token,
         if (err && errlen) snprintf(err, errlen, "%s",
                                     g_stop_requested ? "shutdown requested" :
                                                        "client disconnected");
-        return DS4_SESSION_SYNC_INTERRUPTED;
+        return -DS4_SESSION_SYNC_INTERRUPTED;
     }
     if (slot->decode_pending || slot->decode_in_flight) {
         pthread_mutex_unlock(&s->model_mu);
         if (err && errlen) snprintf(err, errlen, "session already has a decode in flight");
-        return 1;
+        return -1;
     }
     slot->decode_token = token;
+    slot->decode_ntok = 0;
     slot->decode_rc = 1;
     slot->decode_err[0] = '\0';
     slot->decode_done = false;
@@ -12800,7 +12848,7 @@ static int server_eval_token(server *s, server_slot *slot, int token,
     }
     slot->decode_done = false;
     pthread_mutex_unlock(&s->model_mu);
-    return rc;
+    return rc == 0 ? slot->decode_ntok : -rc;
 }
 
 static long server_decode_coalesce_us(void) {
@@ -12868,14 +12916,29 @@ static void *decode_worker_main(void *arg) {
             count++;
         }
         if (count == 0) continue;
+        /* A slot that generates alone gets its drafter: nobody's token is
+         * held up by the cycle, and the batched rows advance by one token
+         * each once a second generation joins. */
+        const bool alone = count == 1 && s->active_generations <= 1 &&
+                           members[0]->decode_spec.enabled;
         s->model_busy = true;
         pthread_mutex_unlock(&s->model_mu);
 
         char batch_err[160] = {0};
         const double batch_t0 = log_batches ? now_sec() : 0.0;
         pthread_mutex_lock(&s->inference_mu);
-        int rc = ds4_sessions_eval_batch(items, count,
-                                         batch_err, sizeof(batch_err));
+        int rc;
+        if (alone) {
+            const int n = server_slot_speculate(members[0], items[0].token, batch_err, sizeof(batch_err));
+            members[0]->decode_ntok = n;
+            rc = n < 0 ? 1 : 0;
+        } else {
+            rc = ds4_sessions_eval_batch(items, count, batch_err, sizeof(batch_err));
+            for (int i = 0; i < count; i++) {
+                members[i]->decode_toks[0] = items[i].token;
+                members[i]->decode_ntok = 1;
+            }
+        }
         pthread_mutex_unlock(&s->inference_mu);
         if (log_batches) {
             server_log(DS4_LOG_DEFAULT,
@@ -13450,37 +13513,23 @@ decode_again:
             break;
         }
 
-        int toks[17];
-        int ntok = 0;
-        if (!s->batched_mode &&
-            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
-        {
-            if (j->req.ignore_eos) {
-                ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
-                    slot->session, token, max_tokens - completion,
-                    eos_token, j->req.think_mode,
-                    toks, (int)(sizeof(toks) / sizeof(toks[0])),
-                    err, sizeof(err));
-            } else {
-                ntok = ds4_session_eval_speculative(
-                    slot->session, token, max_tokens - completion,
-                    eos_token, temperature, top_k, top_p, min_p, &rng,
-                    toks, (int)(sizeof(toks) / sizeof(toks[0])),
-                    err, sizeof(err));
-            }
-            if (ntok < 0) {
-                finish = "error";
-                break;
-            }
-        } else {
-            if (server_eval_token(s, slot, token, err, sizeof(err)) != 0) {
-                finish = "error";
-                break;
-            }
-            toks[0] = token;
-            ntok = 1;
+        slot->decode_spec.enabled = ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+                                    getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+        slot->decode_spec.ignore_eos = j->req.ignore_eos;
+        slot->decode_spec.max_tokens = max_tokens - completion;
+        slot->decode_spec.eos_token = eos_token;
+        slot->decode_spec.think_mode = j->req.think_mode;
+        slot->decode_spec.temperature = temperature;
+        slot->decode_spec.top_k = top_k;
+        slot->decode_spec.top_p = top_p;
+        slot->decode_spec.min_p = min_p;
+        slot->decode_spec.rng = &rng;
+        const int ntok = server_eval_step(s, slot, token, err, sizeof(err));
+        if (ntok < 0) {
+            finish = "error";
+            break;
         }
+        const int *toks = slot->decode_toks;
 
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
