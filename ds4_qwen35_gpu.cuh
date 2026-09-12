@@ -26,6 +26,21 @@ __device__ __forceinline__ float qwen35_cuda_e2m1(uint32_t nib) {
     return __uint_as_float(bits);
 }
 
+/* Both nibbles of a byte (low nibble in .x): Blackwell converts a packed
+ * pair in one instruction, exact in f16 and so in f32; the bit-building
+ * decode above is the fallback for other targets.  The decode of the
+ * routed experts' rows is otherwise the one ALU-bound step of the decode
+ * matvecs (the 640-input down projection ran at 182 GB/s against 218). */
+__device__ __forceinline__ float2 qwen35_cuda_e2m1x2(uint32_t byte) {
+#if defined(__CUDA_ARCH_FEAT_SM121_ALL) || defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM100_ALL)
+    uint32_t h2;
+    asm("{ .reg .b8 b; cvt.u8.u32 b, %1; cvt.rn.f16x2.e2m1x2 %0, b; }" : "=r"(h2) : "r"(byte));
+    return __half22float2(*reinterpret_cast<const __half2 *>(&h2));
+#else
+    return make_float2(qwen35_cuda_e2m1(byte & 15u), qwen35_cuda_e2m1(byte >> 4u));
+#endif
+}
+
 /* The same E2M1 nibble as bf16 bits: the value is exact in bf16, so the
  * f32 pattern above shifted right by 16. */
 __device__ __forceinline__ uint32_t qwen35_e2m1_bf16_bits(uint32_t nib) {
@@ -95,12 +110,12 @@ __device__ __forceinline__ float qwen35_nvfp4_warp_dot(
         float acc = 0.0f;
 #pragma unroll
         for (uint32_t j = 0; j < 4u; j++) {
-            const uint32_t byte_lo = (lo >> (8u * j)) & 0xffu;
-            const uint32_t byte_hi = (hi >> (8u * j)) & 0xffu;
-            acc = fmaf(qwen35_cuda_e2m1(byte_lo & 15u), xv[j], acc);
-            acc = fmaf(qwen35_cuda_e2m1(byte_lo >> 4u), xv[j + 8u], acc);
-            acc = fmaf(qwen35_cuda_e2m1(byte_hi & 15u), xv[j + 4u], acc);
-            acc = fmaf(qwen35_cuda_e2m1(byte_hi >> 4u), xv[j + 12u], acc);
+            const float2 wl = qwen35_cuda_e2m1x2((lo >> (8u * j)) & 0xffu);
+            const float2 wh = qwen35_cuda_e2m1x2((hi >> (8u * j)) & 0xffu);
+            acc = fmaf(wl.x, xv[j], acc);
+            acc = fmaf(wl.y, xv[j + 8u], acc);
+            acc = fmaf(wh.x, xv[j + 4u], acc);
+            acc = fmaf(wh.y, xv[j + 12u], acc);
         }
         sum = fmaf(qwen35_cuda_ue4m3(blk[sub]), acc, sum);
     }
