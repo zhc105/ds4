@@ -9851,7 +9851,12 @@ struct server_slot {
     int decode_ntok;
     int decode_rc;
     char decode_err[160];
-    double last_used;   /* when a job was last dispatched to or finished on the slot */
+    /* How much the slot's conversation is worth keeping resident: one
+     * point per request that continued it, halving every six hours
+     * (slot_hit_score), so an agent's main conversation outranks the
+     * one-off side conversations it spawns. */
+    double hit_score;
+    double hit_time;
 };
 
 static bool id_list_contains(const stop_list *ids, const char *id);
@@ -11054,15 +11059,40 @@ static void kv_cache_store_current(server *s, server_slot *slot,
  * is dispatched onto it; a generating slot is never taken. */
 static void dispatch_jobs_locked(server *s);
 
+/* The slot's hit score as of now: each request that continued the
+ * conversation added a point, and the points halve every six hours. */
+#define SLOT_HIT_HALF_LIFE_SEC (6.0 * 3600.0)
+
+static double slot_hit_score(const server_slot *slot, double now) {
+    if (slot->hit_score <= 0.0) return 0.0;
+    return slot->hit_score * pow(0.5, (now - slot->hit_time) / SLOT_HIT_HALF_LIFE_SEC);
+}
+
+/* A request landed on the slot: a continuation of its conversation scores
+ * a point on top of the decayed score, a new conversation starts at one. */
+static void slot_note_request(server_slot *slot, bool continued) {
+    const double now = now_sec();
+    slot->hit_score = (continued ? slot_hit_score(slot, now) : 0.0) + 1.0;
+    slot->hit_time = now;
+}
+
 static bool server_kv_reclaim(void *ud) {
     server *s = ud;
     pthread_mutex_lock(&s->mu);
     server_slot *victim = NULL;
+    double victim_score = 0.0;
+    const double now = now_sec();
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         if (slot->busy || slot->assigned || slot->running) continue;
         if (ds4_session_pos(slot->session) == 0) continue;
-        if (!victim || slot->last_used < victim->last_used) victim = slot;
+        /* the least worth keeping, and among equals the cheapest to bring back */
+        const double score = slot_hit_score(slot, now);
+        if (!victim || score < victim_score ||
+            (score == victim_score && ds4_session_pos(slot->session) < ds4_session_pos(victim->session))) {
+            victim = slot;
+            victim_score = score;
+        }
     }
     if (victim) victim->busy = true;
     pthread_mutex_unlock(&s->mu);
@@ -11077,8 +11107,8 @@ static bool server_kv_reclaim(void *ud) {
     ds4_session_drop_kv(victim->session);
     free(victim->kv_path);
     victim->kv_path = NULL;
-    server_log(DS4_LOG_DEFAULT, "ds4-server: kv pool full: evicted slot %d (%d tokens) to disk",
-               victim->id, tokens);
+    server_log(DS4_LOG_DEFAULT, "ds4-server: kv pool full: evicted slot %d (%d tokens, hit score %.2f) to disk",
+               victim->id, tokens, victim_score);
     pthread_mutex_lock(&s->mu);
     victim->busy = false;
     dispatch_jobs_locked(s);
@@ -13275,6 +13305,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                     "responses replay missing reasoning state; continuing from visible history source=%s cached=%d",
                     cache_source, cached);
     }
+    slot_note_request(slot, cached > 0);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt start",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -14367,7 +14398,6 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
-        chosen_slot->last_used = now_sec();
         pthread_cond_broadcast(&s->cv);
     }
 }
@@ -14437,7 +14467,6 @@ static void *slot_worker_main(void *arg) {
 
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
-        slot->last_used = now_sec();
         dispatch_jobs_locked(s);
         pthread_mutex_unlock(&s->mu);
     }
