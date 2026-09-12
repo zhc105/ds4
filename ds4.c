@@ -65922,10 +65922,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #ifdef DS4_QWEN_GPU
 /* The bypass projections quantised to q8 as they load
  * (ds4_gpu_qwen35_q8_pack).  Flash-Next's recipe takes the three GDN
- * projections and the lm_head by default, the largest of the decode read
- * (q8_0 there was measured within the vLLM agreement noise); the 2B, the CPU
- * reference's guard, stays as its file has it.  DS4_QWEN_Q8 overrides with
- * a list of gdn, head, attn, shexp, hc, or all or none. */
+ * projections, the lm_head, the attention q/k/v/o and the shared expert
+ * by default: the same modules the published fp8/int4 recipes of this
+ * checkpoint reduce, at q8's finer step; the hyper-connection mixers stay
+ * bf16, as everywhere.  The 2B, the CPU reference's guard, stays as its
+ * file has it.  DS4_QWEN_Q8 overrides with a list of gdn, head, attn,
+ * shexp, hc, or all or none. */
 static bool qwen_q8_group_selected(const char *sel, const char *group) {
     if (!strcmp(sel, "all")) return true;
     const size_t n = strlen(group);
@@ -65952,7 +65954,7 @@ static void qwen_pack_tensor(const ds4_model *m, const ds4_tensor *t, const char
 
 static void qwen_pack_bypass_weights(ds4_engine *e) {
     const char *sel = getenv("DS4_QWEN_Q8");
-    if (!sel || !sel[0]) sel = DS4_MODEL_VARIANT == DS4_VARIANT_QWEN4EXP ? "gdn,head" : "none";
+    if (!sel || !sel[0]) sel = DS4_MODEL_VARIANT == DS4_VARIANT_QWEN4EXP ? "gdn,head,attn,shexp" : "none";
     if (!strcmp(sel, "none")) return;
     const ds4_model *m = &e->model;
     const bool gdn = qwen_q8_group_selected(sel, "gdn");
