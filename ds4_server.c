@@ -15031,6 +15031,8 @@ static server_config parse_options(int argc, char **argv) {
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kv-pool-mb")) {
+            c.engine.kv_pool_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
             c.kv_disk_space_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-min-tokens")) {

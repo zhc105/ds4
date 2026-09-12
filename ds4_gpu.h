@@ -46,12 +46,13 @@ typedef struct {
 #ifndef DS4_QWEN_BATCH_SLOT_DEFINED
 #define DS4_QWEN_BATCH_SLOT_DEFINED
 #define DS4_QWEN_BATCH_ROWS 8u
+#define DS4_QWEN_PAGE_POSITIONS 2048u
 typedef struct {
     uint64_t p0;
     uint64_t p1;
     uint32_t pos;
-    uint32_t ctx;
-    uint64_t reserved;
+    uint32_t _pad;
+    uint64_t pages;
 } ds4_qwen_batch_slot;
 #endif
 

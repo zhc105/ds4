@@ -16392,6 +16392,90 @@ static ds4_context_memory qwen_context_memory_estimate(uint32_t ctx) {
 
 #ifdef DS4_QWEN_GPU
 /* =========================================================================
+ * Qwen paged K/V store.
+ * =========================================================================
+ *
+ * A page holds, for every attention layer (and the drafter's block when it
+ * is loaded), the bf16 K and V rows of QWEN_BLOCK_POSITIONS positions and,
+ * for the QSA layers, the block keys those positions complete: the unit of
+ * the disk checkpoint (qwen_block_io) and of the page table the kernels
+ * index (ds4_gpu_mgpu.h).  The engine owns one pool: a session takes pages
+ * as its history grows and returns them when it starts over, so sessions
+ * of a long context cost what they use rather than the full context each,
+ * and an optional limit caps the whole.
+ */
+
+#define QWEN_BLOCK_POSITIONS 2048u
+
+typedef struct qwen_kv_pool {
+    uint64_t k_off[DS4_MAX_LAYER];      /* bf16 element offsets within a page; UINT64_MAX: the layer has none */
+    uint64_t v_off[DS4_MAX_LAYER];
+    uint64_t bkey_off[DS4_MAX_LAYER];
+    uint64_t elems;                     /* bf16 elements per page */
+    ds4_gpu_tensor **idle;              /* pages no session holds */
+    uint32_t n_idle;
+    uint32_t idle_cap;
+    uint32_t n_pages;                   /* allocated in all */
+    uint32_t limit;                     /* pages, 0 for none */
+} qwen_kv_pool;
+
+static bool qwen_layer_has_kv(bool mtp, uint32_t il) {
+    return (il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER && !ds4_qwen_layer_is_gdn(il)) || (mtp && il == DS4_N_LAYER);
+}
+
+static void qwen_kv_pool_init(qwen_kv_pool *p, bool mtp, uint64_t limit_bytes) {
+    memset(p, 0, sizeof(*p));
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    uint64_t at = 0;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        p->k_off[il] = p->v_off[il] = p->bkey_off[il] = UINT64_MAX;
+        if (!qwen_layer_has_kv(mtp, il)) continue;
+        p->k_off[il] = at;
+        at += QWEN_BLOCK_POSITIONS * kv_dim;
+        p->v_off[il] = at;
+        at += QWEN_BLOCK_POSITIONS * kv_dim;
+        if (ds4_qwen_layer_is_qsa(il)) {
+            p->bkey_off[il] = at;
+            at += (QWEN_BLOCK_POSITIONS / g_ds4_compress_ratios[il]) * DS4_N_INDEXER_HEAD_DIM;
+        }
+    }
+    p->elems = at;
+    if (limit_bytes) {
+        const uint64_t pages = limit_bytes / (at * 2u);
+        p->limit = pages ? (uint32_t)pages : 1u;
+    }
+    fprintf(stderr, "ds4: Qwen KV pages of %.1f MiB (%u positions), pool limit %u pages (0: none)\n",
+            (double)at * 2.0 / 1048576.0, QWEN_BLOCK_POSITIONS, p->limit);
+}
+
+static ds4_gpu_tensor *qwen_kv_pool_take(qwen_kv_pool *p) {
+    if (p->n_idle) return p->idle[--p->n_idle];
+    if (p->limit && p->n_pages >= p->limit) {
+        fprintf(stderr, "ds4: KV page pool exhausted (%u pages of %.0f MiB)\n",
+                p->n_pages, (double)p->elems * 2.0 / 1048576.0);
+        return NULL;
+    }
+    ds4_gpu_tensor *page = ds4_gpu_tensor_alloc(p->elems * 2u);
+    if (page) p->n_pages++;
+    return page;
+}
+
+static void qwen_kv_pool_give(qwen_kv_pool *p, ds4_gpu_tensor *page) {
+    if (p->n_idle == p->idle_cap) {
+        p->idle_cap = p->idle_cap ? 2u * p->idle_cap : 16u;
+        p->idle = xrealloc(p->idle, (size_t)p->idle_cap * sizeof(p->idle[0]));
+    }
+    p->idle[p->n_idle++] = page;
+}
+
+/* Sessions return their pages before this (ds4_session_free). */
+static void qwen_kv_pool_free(qwen_kv_pool *p) {
+    for (uint32_t i = 0; i < p->n_idle; i++) ds4_gpu_tensor_free(p->idle[i]);
+    free(p->idle);
+    memset(p, 0, sizeof(*p));
+}
+
+/* =========================================================================
  * Qwen3.5 CUDA Graph.
  * =========================================================================
  *
@@ -16438,8 +16522,14 @@ typedef struct {
     ds4_gpu_tensor *snap_ple;
     ds4_gpu_tensor *conv_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *ssm_state[DS4_MAX_LAYER];
-    ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];
-    ds4_gpu_tensor *v_cache[DS4_MAX_LAYER];
+    /* The K/V rows and block keys of every attention layer, in pages of
+     * QWEN_BLOCK_POSITIONS positions from the engine's pool (qwen_kv_pool),
+     * taken as the history grows and returned when it starts over; the
+     * device table of their addresses is what the kernels index. */
+    qwen_kv_pool *pool;
+    ds4_gpu_tensor **pages;      /* [ctx / QWEN_BLOCK_POSITIONS], the first n_pages held */
+    uint32_t n_pages;
+    ds4_gpu_tensor *page_table;  /* uint64 [ctx / QWEN_BLOCK_POSITIONS] */
     ds4_gpu_tensor *tokens;      /* int32 [max_rows] */
     ds4_gpu_tensor *x;           /* residual [max_rows][n_embd] */
     ds4_gpu_tensor *h;           /* normalised input */
@@ -16483,10 +16573,10 @@ typedef struct {
     ds4_gpu_tensor *eplan;       /* MoE prefill: uint32 [4][n_expert+1] counts, starts, tile starts, cursors */
     ds4_gpu_tensor *hq;          /* MoE prefill: h as NVFP4 rows [max_rows][n_embd/64 blocks of 36 bytes] */
     ds4_gpu_tensor *egq;         /* MoE prefill: the expert activations as NVFP4 rows [max_rows*n_used][n_ff_exp/64] */
-    /* QSA (see qwen_attention_cells): per layer the block key cache and the
-     * raw keys of the block being filled; per chunk the raw keys, the
-     * indexer queries, the selected cells and the select scratch. */
-    ds4_gpu_tensor *bkey[DS4_MAX_LAYER];    /* bf16 [ctx / ratio][idx_dim] */
+    /* QSA (see qwen_attention_cells): per layer the raw keys of the block
+     * being filled (the block keys themselves are in the pages); per chunk
+     * the raw keys, the indexer queries, the selected cells and the select
+     * scratch. */
     ds4_gpu_tensor *khist[DS4_MAX_LAYER];   /* [ratio - 1][idx_dim], oldest first */
     ds4_gpu_tensor *ikraw;       /* [max_rows][idx_dim] */
     ds4_gpu_tensor *iq;          /* [max_rows][n_idx_head][idx_dim] */
@@ -16528,8 +16618,9 @@ static uint64_t qwen_slot_ptr(const ds4_gpu_tensor *t) {
 /* Describe `src` at position pos in row `row` of the table of `g` (the
  * scratch owner of the pass; src shares it or is g itself). */
 static void qwen_graph_slots_row(ds4_qwen_gpu_graph *g, uint32_t row, const ds4_qwen_gpu_graph *src, uint32_t pos) {
+    const qwen_kv_pool *pool = src->pool;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
-        const ds4_qwen_batch_slot base = { .pos = pos, .ctx = src->ctx };
+        const ds4_qwen_batch_slot base = { .pos = pos, .pages = qwen_slot_ptr(src->page_table) };
         ds4_qwen_batch_slot *gdn = &g->slots_host[qwen_slot(QWEN_SLOT_GDN, il) + row];
         ds4_qwen_batch_slot *attn = &g->slots_host[qwen_slot(QWEN_SLOT_ATTN, il) + row];
         ds4_qwen_batch_slot *qsa = &g->slots_host[qwen_slot(QWEN_SLOT_QSA, il) + row];
@@ -16537,12 +16628,32 @@ static void qwen_graph_slots_row(ds4_qwen_gpu_graph *g, uint32_t row, const ds4_
         *gdn = *attn = *qsa = *ple = base;
         gdn->p0 = qwen_slot_ptr(src->conv_state[il]);
         gdn->p1 = qwen_slot_ptr(src->ssm_state[il]);
-        attn->p0 = qwen_slot_ptr(src->k_cache[il]);
-        attn->p1 = qwen_slot_ptr(src->v_cache[il]);
+        attn->p0 = pool->k_off[il];
+        attn->p1 = pool->v_off[il];
         qsa->p0 = qwen_slot_ptr(src->khist[il]);
-        qsa->p1 = qwen_slot_ptr(src->bkey[il]);
+        qsa->p1 = pool->bkey_off[il];
         ple->p0 = il == DS4_PLE_LAYER ? qwen_slot_ptr(src->ple_hist) : 0u;
     }
+}
+
+/* Pages for every position below pos_end, taken from the pool as needed
+ * and entered in the page table the kernels read. */
+static bool qwen_graph_pages_ensure(ds4_qwen_gpu_graph *g, uint32_t pos_end) {
+    while ((uint64_t)g->n_pages * QWEN_BLOCK_POSITIONS < pos_end) {
+        ds4_gpu_tensor *page = qwen_kv_pool_take(g->pool);
+        if (!page) return false;
+        const uint64_t addr = (uint64_t)(uintptr_t)page->ptr;
+        if (!ds4_gpu_tensor_write(g->page_table, (uint64_t)g->n_pages * sizeof(addr), &addr, sizeof(addr))) {
+            qwen_kv_pool_give(g->pool, page);
+            return false;
+        }
+        g->pages[g->n_pages++] = page;
+    }
+    return true;
+}
+
+static void qwen_graph_pages_release(ds4_qwen_gpu_graph *g) {
+    while (g->n_pages) qwen_kv_pool_give(g->pool, g->pages[--g->n_pages]);
 }
 
 static bool qwen_graph_slots_upload(ds4_qwen_gpu_graph *g) {
@@ -16581,11 +16692,11 @@ static void qwen_graph_free(ds4_qwen_gpu_graph *g) {
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         if (g->conv_state[il]) ds4_gpu_tensor_free(g->conv_state[il]);
         if (g->ssm_state[il]) ds4_gpu_tensor_free(g->ssm_state[il]);
-        if (g->k_cache[il]) ds4_gpu_tensor_free(g->k_cache[il]);
-        if (g->v_cache[il]) ds4_gpu_tensor_free(g->v_cache[il]);
-        if (g->bkey[il]) ds4_gpu_tensor_free(g->bkey[il]);
         if (g->khist[il]) ds4_gpu_tensor_free(g->khist[il]);
     }
+    if (g->pool) qwen_graph_pages_release(g);
+    free(g->pages);
+    if (g->page_table) ds4_gpu_tensor_free(g->page_table);
     if (g->ple_hist) ds4_gpu_tensor_free(g->ple_hist);
     if (g->mtp_pend) ds4_gpu_tensor_free(g->mtp_pend);
     if (g->steering_dirs) ds4_gpu_tensor_free(g->steering_dirs);
@@ -16640,11 +16751,13 @@ static void qwen_graph_transfer_scratch(ds4_qwen_gpu_graph *ws, ds4_qwen_gpu_gra
     g->owns_scratch = false;
 }
 
-/* Zero the recurrent state; K/V rows past n_tokens are never read. */
+/* Zero the recurrent state and return the pages: K/V rows past n_tokens
+ * are never read, so a history that starts over needs none. */
 static bool qwen_graph_reset(ds4_qwen_gpu_graph *g) {
     const uint64_t conv_elems = (uint64_t)(DS4_N_KDA_CONV - 1u) * qwen_conv_dim();
     const uint64_t state_elems = (uint64_t)DS4_N_KDA_V_HEAD * DS4_N_KDA_HEAD_DIM * DS4_N_KDA_HEAD_DIM;
     bool ok = true;
+    qwen_graph_pages_release(g);
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         if (g->conv_state[il]) ok = ok && ds4_gpu_tensor_fill_f32(g->conv_state[il], 0.0f, conv_elems) != 0;
         if (g->ssm_state[il]) ok = ok && ds4_gpu_tensor_fill_f32(g->ssm_state[il], 0.0f, state_elems) != 0;
@@ -16703,12 +16816,13 @@ static bool qwen_graph_load_directional_steering(
 /* With `shared` (the engine's workspace) the scratch is aliased from it
  * when it fits and allocated otherwise; the state is always the graph's. */
 static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_rows, uint32_t spec_rows,
-                             ds4_qwen_gpu_graph *shared) {
+                             qwen_kv_pool *pool, ds4_qwen_gpu_graph *shared) {
     memset(g, 0, sizeof(*g));
     g->ctx = ctx;
     g->max_rows = max_rows;
     g->mtp = spec_rows > 0u;
     g->spec_rows = spec_rows;
+    g->pool = pool;
     const bool mtp = g->mtp;
     const uint64_t hd = DS4_N_KDA_HEAD_DIM;
     const uint64_t conv_dim = qwen_conv_dim();
@@ -16720,33 +16834,23 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
     const uint64_t ff_dim = qwen_max_u64(DS4_N_FF_DENSE, DS4_N_FF_SHEXP);
     bool ok = true;
     uint32_t max_ratio = 0;
-    for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
-        if (ds4_qwen_layer_is_gdn(il)) {
+    /* the K/V rows and block keys are paged (qwen_kv_pool); the histories are the graph's */
+    const uint32_t n_pages = (ctx + QWEN_BLOCK_POSITIONS - 1u) / QWEN_BLOCK_POSITIONS;
+    g->pages = xcalloc(n_pages, sizeof(g->pages[0]));
+    g->page_table = ds4_gpu_tensor_alloc((uint64_t)n_pages * sizeof(uint64_t));
+    if (!g->page_table) ok = false;
+    for (uint32_t il = 0; il <= DS4_N_LAYER; il++) {
+        if (il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER && ds4_qwen_layer_is_gdn(il)) {
             g->conv_state[il] = qwen_graph_tensor((DS4_N_KDA_CONV - 1u) * conv_dim, &ok);
             g->ssm_state[il] = qwen_graph_tensor(v_dim * hd, &ok);
-        } else {
-            /* the K/V caches are bf16, the checkpoint's own attention precision (24 KiB a token for Flash-Next) */
-            g->k_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim / 2u, &ok);
-            g->v_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim / 2u, &ok);
-            if (ds4_qwen_layer_is_qsa(il)) {
-                const uint32_t r = g_ds4_compress_ratios[il];
-                g->bkey[il] = qwen_graph_tensor((uint64_t)(ctx / r) * DS4_N_INDEXER_HEAD_DIM / 2u, &ok);   /* bf16 */
-                g->khist[il] = qwen_graph_tensor((uint64_t)(r - 1u) * DS4_N_INDEXER_HEAD_DIM, &ok);
-                if (r > max_ratio) max_ratio = r;
-            }
+        } else if (qwen_layer_has_kv(mtp, il) && ds4_qwen_layer_is_qsa(il)) {
+            const uint32_t r = g_ds4_compress_ratios[il];
+            g->khist[il] = qwen_graph_tensor((uint64_t)(r - 1u) * DS4_N_INDEXER_HEAD_DIM, &ok);
+            if (r > max_ratio) max_ratio = r;
         }
     }
-    if (mtp) {
-        /* the drafter's block: an attention layer with the indexer, plus the streams it reads */
-        const uint32_t il = DS4_N_LAYER;
-        const uint32_t r = g_ds4_compress_ratios[il];
-        g->k_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim / 2u, &ok);
-        g->v_cache[il] = qwen_graph_tensor((uint64_t)ctx * kv_dim / 2u, &ok);
-        g->bkey[il] = qwen_graph_tensor((uint64_t)(ctx / r) * DS4_N_INDEXER_HEAD_DIM / 2u, &ok);
-        g->khist[il] = qwen_graph_tensor((uint64_t)(r - 1u) * DS4_N_INDEXER_HEAD_DIM, &ok);
-        g->mtp_pend = qwen_graph_tensor((uint64_t)DS4_N_HC * DS4_N_EMBD / 2u, &ok);
-        if (r > max_ratio) max_ratio = r;
-    }
+    /* the drafter's block reads the streams the main model leaves it */
+    if (mtp) g->mtp_pend = qwen_graph_tensor((uint64_t)DS4_N_HC * DS4_N_EMBD / 2u, &ok);
     if (DS4_PLE_LAYER != UINT32_MAX) g->ple_hist = qwen_graph_tensor(qwen_ple_hist_rows() * x_dim, &ok);
     if (max_ratio) g->max_sel = DS4_N_INDEXER_TOP_K + max_ratio - 1u;
     if (ok && shared && qwen_graph_share_scratch(g, shared)) {
@@ -17381,8 +17485,8 @@ static bool qwen_graph_mtp_forward(
         uint32_t                   pos0,
         float                     *logits) {
     const uint64_t x_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    bool ok = n > 0u && n <= g->max_rows &&
-              qwen_graph_slots(g, pos0) &&
+    bool ok = n > 0u && n <= g->max_rows && pos0 + n <= g->ctx &&
+              qwen_graph_pages_ensure(g, pos0 + n) && qwen_graph_slots(g, pos0) &&
               ds4_gpu_tensor_write(g->tokens, 0, tokens, (uint64_t)n * sizeof(int32_t)) != 0 &&
               qwen_graph_embed_rows(g, m, w, g->h, n) &&
               (g->image_count == 0 || qwen_graph_overlay_images(g, g->h, 1u, pos0 + 1u, n)) &&
@@ -17500,7 +17604,7 @@ static bool qwen_graph_forward(
     while (ok && done < n) {
         const uint32_t rows = n - done < g->max_rows ? n - done : g->max_rows;
         const uint32_t pos0 = g->n_tokens;
-        ok = qwen_graph_slots(g, pos0) &&
+        ok = qwen_graph_pages_ensure(g, pos0 + rows) && qwen_graph_slots(g, pos0) &&
              ds4_gpu_tensor_write(g->tokens, 0, tokens + done, (uint64_t)rows * sizeof(int32_t)) != 0;
         if (ok && g->emb) ok = qwen_graph_ple_rows(g, NULL, m, tokens + done, rows);
         if (ok) ok = qwen_graph_embed(g, m, w, rows);
@@ -17552,8 +17656,11 @@ static bool qwen_graph_forward_batch(
     if (n < 2u || n > DS4_QWEN_BATCH_ROWS || g->snapshot || g->image_count) return false;
     uint32_t pos_end = 0;
     for (uint32_t i = 0; i < n; i++) {
-        const ds4_qwen_gpu_graph *r = graphs[i];
-        if (r->slots != g->slots || r->ctx != g->ctx || r->n_tokens >= r->ctx) return false;
+        ds4_qwen_gpu_graph *r = graphs[i];
+        if (r->slots != g->slots || r->ctx != g->ctx || r->n_tokens >= r->ctx ||
+            !qwen_graph_pages_ensure(r, r->n_tokens + 1u)) {
+            return false;
+        }
         qwen_graph_slots_row(g, i, r, r->n_tokens);
         if (r->n_tokens + 1u > pos_end) pos_end = r->n_tokens + 1u;
     }
@@ -41493,6 +41600,7 @@ struct ds4_engine {
     bool vision_ready;
     bool vision_map_ready;
     bool share_session_prefill_workspace;
+    uint64_t kv_pool_mb;
 #ifndef DS4_NO_GPU
     bool shared_prefill_workspace_ready;
     ds4_gpu_graph shared_prefill_workspace;
@@ -41501,6 +41609,7 @@ struct ds4_engine {
     /* The Qwen scratch every session aliases (qwen_graph_share_scratch),
      * taken over from the first session; only its scratch fields are set. */
     ds4_qwen_gpu_graph qwen_workspace;
+    qwen_kv_pool qwen_pool;   /* the sessions' K/V pages, laid out at the first session */
 #endif
 
     /* Wave-2 multi-GPU placement scaffolding: optional multi-GPU placement
@@ -59113,7 +59222,6 @@ static uint64_t qwen_session_payload_bytes(ds4_session *s);
 static int qwen_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 static int qwen_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
                                      char *err, size_t errlen);
-#define QWEN_BLOCK_POSITIONS 2048u
 static uint64_t qwen_block_bytes(const ds4_qwen_gpu_graph *g, uint32_t from, uint32_t to);
 static int qwen_block_io(ds4_session *s, FILE *fp, uint32_t from, uint32_t to, uint32_t stored_to,
                          bool read, char *err, size_t errlen);
@@ -65892,6 +66000,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->placement_session_count_hint = opt->placement_session_count_hint;
     e->share_session_prefill_workspace = opt->share_session_prefill_workspace;
+    e->kv_pool_mb = opt->kv_pool_mb;
     ds4_acquire_instance_lock();
 
     if (opt->simulate_used_memory_bytes != 0 &&
@@ -67667,6 +67776,7 @@ void ds4_engine_close(ds4_engine *e) {
     }
 #ifdef DS4_QWEN_GPU
     qwen_graph_free(&e->qwen_workspace);
+    qwen_kv_pool_free(&e->qwen_pool);
 #endif
     ds4_gpu_cleanup();
 #endif
@@ -67863,9 +67973,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          * session's is handed to the engine, the others alias it (their
          * own when it does not fit, at the cost of the batch). */
         ds4_qwen_gpu_graph *ws = e->share_session_prefill_workspace ? &e->qwen_workspace : NULL;
+        if (!e->qwen_pool.elems) qwen_kv_pool_init(&e->qwen_pool, e->mtp_ready, e->kv_pool_mb << 20);
         if (!qwen_graph_alloc(&s->qwen_graph, (uint32_t)ctx_size, rows,
                               e->mtp_ready ? (uint32_t)e->mtp_draft_tokens + 1u : 0u,
-                              ws && ws->slots ? ws : NULL)) {
+                              &e->qwen_pool, ws && ws->slots ? ws : NULL)) {
             fprintf(stderr, "ds4: failed to allocate the Qwen3.5 graph\n");
             free(s);
             return 1;
@@ -69731,9 +69842,9 @@ static int qwen_session_state_restore(ds4_session *s, const ds4_tokens *prompt) 
 static uint64_t qwen_block_bytes(const ds4_qwen_gpu_graph *g, uint32_t from, uint32_t to) {
     uint64_t bytes = 0;
     for (uint32_t il = 0; il <= DS4_N_LAYER; il++) {
-        if (!g->k_cache[il]) continue;
+        if (!qwen_layer_has_kv(g->mtp, il)) continue;
         bytes += 2ull * (to - from) * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
-        if (g->bkey[il]) {
+        if (ds4_qwen_layer_is_qsa(il)) {
             const uint32_t r = g_ds4_compress_ratios[il];
             bytes += (uint64_t)(to / r - from / r) * DS4_N_INDEXER_HEAD_DIM * 2u;
         }
@@ -69741,39 +69852,60 @@ static uint64_t qwen_block_bytes(const ds4_qwen_gpu_graph *g, uint32_t from, uin
     return bytes;
 }
 
+/* The rows [i0, i1) of one layer's K, V or block keys (`off` their offset
+ * within a page, `per_page` how many a page holds) to or from the file,
+ * page by page; a read then skips the rest of a run the file holds as
+ * [i0, stored_i1). */
+static int qwen_page_rows_io(ds4_qwen_gpu_graph *g, FILE *fp, uint64_t off, uint32_t per_page, uint64_t row_bytes,
+                             uint32_t i0, uint32_t i1, uint32_t stored_i1, bool read, uint8_t *buf,
+                             char *err, size_t errlen) {
+    int rc = 0;
+    for (uint32_t i = i0; rc == 0 && i < i1;) {
+        const uint32_t page = i / per_page;
+        const uint32_t n = (i1 < (page + 1u) * per_page ? i1 : (page + 1u) * per_page) - i;
+        const uint64_t at = off * 2u + (uint64_t)(i - page * per_page) * row_bytes;
+        if (read) {
+            uint64_t remaining = n * row_bytes;
+            rc = payload_read_tensor_span(fp, g->pages[page], at, n * row_bytes, buf, DS4_SESSION_IO_CHUNK,
+                                          &remaining, err, errlen);
+        } else {
+            rc = payload_write_tensor_span(fp, g->pages[page], at, n * row_bytes, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        }
+        i += n;
+    }
+    if (rc == 0 && read && stored_i1 > i1 && fseeko(fp, (off_t)((stored_i1 - i1) * row_bytes), SEEK_CUR) != 0) {
+        payload_set_err(err, errlen, "failed to skip the rest of a KV checkpoint block");
+        rc = 1;
+    }
+    return rc;
+}
+
 /* One block's rows, layer by layer: K, V, then the block keys.  A read
  * takes the rows of [from, to) out of a block the file holds as
- * [from, stored_to). */
+ * [from, stored_to), into pages taken for them first. */
 static int qwen_block_io(ds4_session *s, FILE *fp, uint32_t from, uint32_t to, uint32_t stored_to,
                          bool read, char *err, size_t errlen) {
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
+    const qwen_kv_pool *pool = g->pool;
     const uint64_t row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
     const uint64_t key = (uint64_t)DS4_N_INDEXER_HEAD_DIM * 2u;
+    if (read && !qwen_graph_pages_ensure(g, to)) {
+        payload_set_err(err, errlen, "no KV pages for the checkpoint block");
+        return 1;
+    }
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
     for (uint32_t il = 0; rc == 0 && il <= DS4_N_LAYER; il++) {
-        if (!g->k_cache[il]) continue;
-        const uint32_t r = g->bkey[il] ? g_ds4_compress_ratios[il] : 0u;
-        ds4_gpu_tensor *tensors[3] = { g->k_cache[il], g->v_cache[il], g->bkey[il] };
-        const uint64_t offsets[3] = { from * row, from * row, r ? (from / r) * key : 0u };
-        const uint64_t bytes[3] = { (to - from) * row, (to - from) * row, r ? (to / r - from / r) * key : 0u };
-        const uint64_t stored[3] = { (stored_to - from) * row, (stored_to - from) * row,
-                                     r ? (stored_to / r - from / r) * key : 0u };
-        for (int i = 0; rc == 0 && i < 3; i++) {
-            if (stored[i] == 0u) continue;
-            if (!read) {
-                rc = payload_write_tensor_span(fp, tensors[i], offsets[i], bytes[i], buf, DS4_SESSION_IO_CHUNK, err, errlen);
-                continue;
-            }
-            uint64_t remaining = bytes[i];
-            if (bytes[i]) {
-                rc = payload_read_tensor_span(fp, tensors[i], offsets[i], bytes[i], buf, DS4_SESSION_IO_CHUNK,
-                                              &remaining, err, errlen);
-            }
-            if (rc == 0 && stored[i] > bytes[i] && fseeko(fp, (off_t)(stored[i] - bytes[i]), SEEK_CUR) != 0) {
-                payload_set_err(err, errlen, "failed to skip the rest of a KV checkpoint block");
-                rc = 1;
-            }
+        if (!qwen_layer_has_kv(g->mtp, il) || stored_to == from) continue;
+        rc = qwen_page_rows_io(g, fp, pool->k_off[il], QWEN_BLOCK_POSITIONS, row, from, to, stored_to, read, buf, err, errlen);
+        if (rc == 0) {
+            rc = qwen_page_rows_io(g, fp, pool->v_off[il], QWEN_BLOCK_POSITIONS, row, from, to, stored_to, read, buf, err, errlen);
+        }
+        if (rc == 0 && ds4_qwen_layer_is_qsa(il)) {
+            const uint32_t r = g_ds4_compress_ratios[il];
+            if (stored_to / r == from / r) continue;
+            rc = qwen_page_rows_io(g, fp, pool->bkey_off[il], QWEN_BLOCK_POSITIONS / r, key,
+                                   from / r, to / r, stored_to / r, read, buf, err, errlen);
         }
     }
     free(buf);

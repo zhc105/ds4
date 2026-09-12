@@ -168,6 +168,8 @@ typedef struct {
     int placement_session_count_hint;
     /* Server batch mode serializes execution and can share prefill scratch. */
     bool share_session_prefill_workspace;
+    /* Cap on the Qwen K/V page pool shared by every session (0: none). */
+    uint64_t kv_pool_mb;
     bool first_token_test;
     bool metal_graph_test;
     bool load_slice;

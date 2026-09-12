@@ -70,20 +70,28 @@ typedef struct {
  * kernels that touch per-session state read it from a device-side table of
  * these instead of their launch arguments, so a captured decode island
  * serves every session that shares the activation scratch: the table's
- * address is baked, its rows are rewritten before each pass.  p0 is always
- * the sliding history a row's kernel kind maintains (GDN conv taps, QSA raw
- * keys, PLE conv window) or the K cache; p1 the GDN recurrent state, the
- * block keys, or the V cache.  A sequential pass (one session, n tokens)
- * reads row 0; a batched pass (n sessions, one token each) reads row t. */
+ * address is baked, its rows are rewritten before each pass.  A sequential
+ * pass (one session, n tokens) reads row 0; a batched pass (n sessions, one
+ * token each) reads row t.
+ *
+ * The K/V rows and block keys live in pages of DS4_QWEN_PAGE_POSITIONS
+ * positions, each page holding every attention layer's rows for its
+ * positions; `pages` is the row's device table of page addresses in
+ * position order.  For the GDN and PLE kinds p0 is the sliding history
+ * (conv taps, conv window) and p1 the recurrent state; for the attention
+ * kind p0 and p1 are the layer's K and V offsets within a page (bf16
+ * elements); for the QSA kind p0 is the raw-key history and p1 the layer's
+ * block-key offset within a page. */
 #ifndef DS4_QWEN_BATCH_SLOT_DEFINED
 #define DS4_QWEN_BATCH_SLOT_DEFINED
 #define DS4_QWEN_BATCH_ROWS 8u
+#define DS4_QWEN_PAGE_POSITIONS 2048u
 typedef struct {
     uint64_t p0;
     uint64_t p1;
     uint32_t pos;       /* the row's first position */
-    uint32_t ctx;       /* the row's cache capacity in positions */
-    uint64_t reserved;  /* a paged layout's block table */
+    uint32_t _pad;
+    uint64_t pages;     /* uint64 [ctx / DS4_QWEN_PAGE_POSITIONS] page addresses */
 } ds4_qwen_batch_slot;
 #endif
 

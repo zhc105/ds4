@@ -177,6 +177,9 @@ int main(void) {
         return 1;
     }
 
+    /* DS4_TEST_KV_POOL_MB caps the Qwen K/V page pool: the batched sessions
+     * must fit it together and the control sessions reuse their pages. */
+    const char *pool_mb = getenv("DS4_TEST_KV_POOL_MB");
     ds4_engine_options opt = {
         .model_path = model,
         .backend = DS4_BACKEND_CUDA,
@@ -184,6 +187,7 @@ int main(void) {
         .quality = quality,
         .cuda_tensor_parallel = !single_gpu,
         .share_session_prefill_workspace = true,
+        .kv_pool_mb = pool_mb && pool_mb[0] ? (uint64_t)atoll(pool_mb) : 0u,
         .placement_ctx_hint = (uint32_t)test_ctx,
     };
     ds4_engine *engine = NULL;

@@ -1148,10 +1148,20 @@ __device__ __forceinline__ void qwen35_split_f32(float x, __nv_bfloat16 *hi, __n
  * caches are bf16 (the CPU reference rounds its rows the same way).  With
  * qh/ql (prefill) the finished queries are also written split into bf16 for
  * the tensor-core attention. */
-/* The K/V cache row of position pos in a slot's caches: the one place the
- * cache layout is spelled out (a paged layout changes only this). */
-__device__ __forceinline__ uint64_t qwen35_kv_row(const ds4_qwen_batch_slot &row, uint32_t pos, uint64_t kv_stride) {
-    return (uint64_t)pos * kv_stride;
+/* The paged caches (ds4_gpu_mgpu.h): the page of a position, then the
+ * layer's K or V row at `off` (the slot's p0 or p1) within it, or its
+ * block key.  The two places the layout is spelled out. */
+__device__ __forceinline__ __nv_bfloat16 *qwen35_page(const ds4_qwen_batch_slot &row, uint32_t page) {
+    return (__nv_bfloat16 *)((const uint64_t *)row.pages)[page];
+}
+
+__device__ __forceinline__ __nv_bfloat16 *qwen35_kv_ptr(const ds4_qwen_batch_slot &row, uint64_t off, uint32_t pos, uint64_t kv_stride) {
+    return qwen35_page(row, pos / DS4_QWEN_PAGE_POSITIONS) + off + (uint64_t)(pos % DS4_QWEN_PAGE_POSITIONS) * kv_stride;
+}
+
+__device__ __forceinline__ __nv_bfloat16 *qwen35_bkey_ptr(const ds4_qwen_batch_slot &row, uint32_t block, uint32_t r, uint32_t d) {
+    const uint32_t per_page = DS4_QWEN_PAGE_POSITIONS / r;
+    return qwen35_page(row, block / per_page) + row.p1 + (uint64_t)(block % per_page) * d;
 }
 
 __global__ static void qwen35_attn_prepare_kernel(
@@ -1176,11 +1186,10 @@ __global__ static void qwen35_attn_prepare_kernel(
         const uint32_t h = slot - n_head;
         head = (float *)k + ((uint64_t)t * n_kv + h) * hd;
         norm_w = k_norm;
-        dst = (__nv_bfloat16 *)row.p0 + qwen35_kv_row(row, pos, (uint64_t)n_kv * hd) + (uint64_t)h * hd;
+        dst = qwen35_kv_ptr(row, row.p0, pos, (uint64_t)n_kv * hd) + (uint64_t)h * hd;
     } else {
         const uint32_t h = slot - n_head - n_kv;
-        __nv_bfloat16 *v_cache = (__nv_bfloat16 *)row.p1;
-        v_cache[qwen35_kv_row(row, pos, (uint64_t)n_kv * hd) + (uint64_t)h * hd + tid] =
+        qwen35_kv_ptr(row, row.p1, pos, (uint64_t)n_kv * hd)[(uint64_t)h * hd + tid] =
             __float2bfloat16(v[((uint64_t)t * n_kv + h) * hd + tid]);
         return;
     }
@@ -1263,8 +1272,6 @@ __global__ static void qwen35_attention_kernel(
     const int32_t *cells = qwen35_attn_row_cells(sel, max_sel, dense_keys, t, pos, batched);
     const uint32_t n_splits = qwen35_attn_row_splits(max_splits, cells, max_sel, pos, pos_end, batched);
     if (split >= n_splits) return;
-    const __nv_bfloat16 *k_cache = (const __nv_bfloat16 *)row.p0;
-    const __nv_bfloat16 *v_cache = (const __nv_bfloat16 *)row.p1;
     const float *q = qg + ((uint64_t)t * n_head + h) * 2u * hd;
     const float *gate = q + hd;
     const uint32_t kvh = h / (n_head / n_kv);
@@ -1280,7 +1287,7 @@ __global__ static void qwen35_attention_kernel(
     for (uint32_t i = 0; i < per; i++) qv[i] = q[lane * per + i];
     for (uint32_t key = warp; key < n_local; key += n_warps) {
         const uint32_t cell = cells ? (uint32_t)cells[key0 + key] : key0 + key;
-        const __nv_bfloat162 *kr = (const __nv_bfloat162 *)(k_cache + qwen35_kv_row(row, cell, kv_stride) + kvh * hd + lane * per);
+        const __nv_bfloat162 *kr = (const __nv_bfloat162 *)(qwen35_kv_ptr(row, row.p0, cell, kv_stride) + kvh * hd + lane * per);
         float dot = 0.0f;
         for (uint32_t i = 0; i < per / 2u; i++) {
             const float2 kk = __bfloat1622float2(kr[i]);
@@ -1308,10 +1315,10 @@ __global__ static void qwen35_attention_kernel(
     const float sum = qwen35_cuda_block_sum(local_sum, scratch);
     __syncthreads();
     float acc = 0.0f;
-    const __nv_bfloat16 *vc = v_cache + kvh * hd + tid;
+    const uint64_t vcol = row.p1 + kvh * hd + tid;   /* this thread's V column within a page row */
     for (uint32_t key = 0; key < n_local; key++) {
         const uint32_t cell = cells ? (uint32_t)cells[key0 + key] : key0 + key;
-        acc = fmaf(scores[key], __bfloat162float(vc[qwen35_kv_row(row, cell, kv_stride)]), acc);
+        acc = fmaf(scores[key], __bfloat162float(qwen35_kv_ptr(row, vcol, cell, kv_stride)[0]), acc);
     }
     if (n_splits == 1u) {
         att[((uint64_t)t * n_head + h) * hd + tid] = acc / sum * qwen35_cuda_sigmoid(gate[tid]);
@@ -1415,8 +1422,6 @@ __global__ static void __launch_bounds__(256, 2) qwen35_attention_tc_kernel(
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
     const ds4_qwen_batch_slot row = slots[0];   /* a prefill chunk: one session, sequential */
-    const __nv_bfloat16 *k_cache = (const __nv_bfloat16 *)row.p0;
-    const __nv_bfloat16 *v_cache = (const __nv_bfloat16 *)row.p1;
     const uint32_t n_cells = sel ? n_sel[t] : row.pos + t + 1u;
     const int32_t *cells = sel ? sel + (uint64_t)t * max_sel : NULL;
     const uint64_t kv_stride = (uint64_t)n_kv * hd;
@@ -1453,8 +1458,9 @@ __global__ static void __launch_bounds__(256, 2) qwen35_attention_tc_kernel(
             const uint32_t e = (tid & 15u) * 16u;
             const uint32_t c = c0 + key;
             const bool valid = c < n_cells;
-            const uint64_t off = valid ? qwen35_kv_row(row, cells ? (uint32_t)cells[c] : c, kv_stride) + kvh * hd + e : 0u;
-            const __nv_bfloat16 *src[2] = { k_cache + off, v_cache + off };
+            const uint32_t cell = valid ? (cells ? (uint32_t)cells[c] : c) : 0u;
+            const __nv_bfloat16 *src[2] = { qwen35_kv_ptr(row, row.p0, cell, kv_stride) + kvh * hd + e,
+                                            qwen35_kv_ptr(row, row.p1, cell, kv_stride) + kvh * hd + e };
             __nv_bfloat16 *dst[2] = { &ks[key][e], &vs[key][e] };
             const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
             for (uint32_t a = 0; a < 2u; a++) {
@@ -2483,7 +2489,6 @@ __global__ static void qwen4exp_block_key_kernel(
     const uint32_t pos = batched ? row.pos : row.pos + t;
     if (pos % r != r - 1u) return;
     const float *hist = (const float *)row.p0;
-    __nv_bfloat16 *bkey = (__nv_bfloat16 *)row.p1;
     const uint32_t tl = batched ? 0u : t;
     float acc = 0.0f;
     for (uint32_t j = 0; j < r; j++) {
@@ -2496,7 +2501,7 @@ __global__ static void qwen4exp_block_key_kernel(
     __syncthreads();
     qwen4exp_rope_shared(kb, n_rot, pos + 1u - r, freq_base);
     __syncthreads();
-    bkey[(uint64_t)(pos / r) * d + tid] = __float2bfloat16(kb[tid]);
+    qwen35_bkey_ptr(row, pos / r, r, d)[tid] = __float2bfloat16(kb[tid]);
 }
 
 extern "C" int ds4_gpu_qwen4exp_block_keys(
@@ -2607,14 +2612,13 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_indexer_score_kernel(
     const uint32_t b0 = blockIdx.x * QWEN4EXP_SCORE_COLS;
     /* a batched row scores its one token against its own block keys, in
      * its own tile (the grid's z); the tile columns past its blocks are idle */
-    const uint32_t row = blockIdx.z;
-    const ds4_qwen_batch_slot slot = slots[row];
-    const __nv_bfloat16 *bkey = (const __nv_bfloat16 *)slot.p1;
+    const uint32_t pass_row = blockIdx.z;
+    const ds4_qwen_batch_slot slot = slots[pass_row];
     if (batched) {
         n_blocks = (slot.pos + 1u) / r;
         n_tokens = 1u;
-        q += (uint64_t)row * n_head * d;
-        keys += (uint64_t)row * keys_stride;
+        q += (uint64_t)pass_row * n_head * d;
+        keys += (uint64_t)pass_row * keys_stride;
     }
     if (b0 >= n_blocks) return;
     const uint32_t wr = (warp >> 2u) * 16u;
@@ -2629,7 +2633,7 @@ __global__ static void __launch_bounds__(256, 2) qwen4exp_indexer_score_kernel(
             const uint32_t half = (tid & 1u) * (d / 2u);
             const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
             const bool valid = b0 + row < n_blocks;
-            const uint4 *src = (const uint4 *)(bkey + (uint64_t)(b0 + row) * d + half);
+            const uint4 *src = (const uint4 *)(qwen35_bkey_ptr(slot, valid ? b0 + row : 0u, r, d) + half);
             uint4 *dst = (uint4 *)&bs[row][half];
             for (uint32_t i = 0; i < d / 16u; i++) dst[i] = valid ? src[i] : zero;
         }

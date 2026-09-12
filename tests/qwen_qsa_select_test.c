@@ -7,6 +7,7 @@
 #include "ds4_gpu_mgpu.h"
 #include "ds4_gpu.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,18 +66,20 @@ static uint32_t ref_select(int32_t *sel, const float *q, const float *bkey, floa
     return n_sel;
 }
 
+enum { PAGES = CTX / DS4_QWEN_PAGE_POSITIONS, KEYS_PER_PAGE = DS4_QWEN_PAGE_POSITIONS / R };
+
 static int run_case(uint32_t pos0, uint32_t n_tokens, int batched, unsigned seed,
                     ds4_gpu_tensor *sel_t, ds4_gpu_tensor *n_sel_t, ds4_gpu_tensor *keys_t,
-                    ds4_gpu_tensor *q_t, ds4_gpu_tensor *bkey_t, ds4_gpu_tensor *slots_t) {
+                    ds4_gpu_tensor *q_t, ds4_gpu_tensor **pages, ds4_gpu_tensor *pages_t, ds4_gpu_tensor *slots_t) {
     const uint64_t n_q = (uint64_t)n_tokens * N_HEAD * D;
-    /* the row table: every row over the one block key cache, at its own position */
+    /* the row table: every row over the one paged block key cache, at its own position */
     ds4_qwen_batch_slot slots[DS4_QWEN_BATCH_ROWS] = {0};
     const uint32_t n_rows = batched ? n_tokens : 1u;
     uint32_t pos_end = 0;
     for (uint32_t t = 0; t < n_rows; t++) {
-        slots[t].p1 = (uint64_t)(uintptr_t)bkey_t->ptr;
+        slots[t].p1 = 0;
         slots[t].pos = token_pos(pos0, t, batched);
-        slots[t].ctx = CTX;
+        slots[t].pages = (uint64_t)(uintptr_t)pages_t->ptr;
     }
     for (uint32_t t = 0; t < n_tokens; t++) {
         if (token_pos(pos0, t, batched) + 1u > pos_end) pos_end = token_pos(pos0, t, batched) + 1u;
@@ -100,8 +103,13 @@ static int run_case(uint32_t pos0, uint32_t n_tokens, int batched, unsigned seed
         bkey_bf16[i] = (uint16_t)(bits >> 16);
     }
     int rc = 1;
-    if (ds4_gpu_tensor_write(q_t, 0, q, n_q * sizeof(float)) &&
-        ds4_gpu_tensor_write(bkey_t, 0, bkey_bf16, n_b * sizeof(uint16_t)) &&
+    bool paged = true;
+    for (uint32_t p = 0; p < PAGES; p++) {   /* the block keys page by page */
+        paged = paged && ds4_gpu_tensor_write(pages[p], 0, bkey_bf16 + (uint64_t)p * KEYS_PER_PAGE * D,
+                                              (uint64_t)KEYS_PER_PAGE * D * sizeof(uint16_t));
+    }
+    if (paged &&
+        ds4_gpu_tensor_write(q_t, 0, q, n_q * sizeof(float)) &&
         ds4_gpu_tensor_write(slots_t, 0, slots, sizeof(slots)) &&
         ds4_gpu_qwen4exp_qsa_select(sel_t, n_sel_t, keys_t, ROWS, q_t, slots_t, 0,
                                     N_HEAD, D, R, BUDGET, MAX_SEL, CTX, pos_end, n_tokens, batched) &&
@@ -160,17 +168,26 @@ int main(void) {
     ds4_gpu_tensor *n_sel = ds4_gpu_tensor_alloc(ROWS * 4u * sizeof(uint32_t));
     ds4_gpu_tensor *keys = ds4_gpu_tensor_alloc((uint64_t)ROWS * (CTX / R) * sizeof(uint64_t));
     ds4_gpu_tensor *q = ds4_gpu_tensor_alloc((uint64_t)ROWS * 4u * N_HEAD * D * sizeof(float));
-    ds4_gpu_tensor *bkey = ds4_gpu_tensor_alloc((uint64_t)(CTX / R) * D * sizeof(float));
     ds4_gpu_tensor *slots = ds4_gpu_tensor_alloc(DS4_QWEN_BATCH_ROWS * sizeof(ds4_qwen_batch_slot));
-    if (!sel || !n_sel || !keys || !q || !bkey || !slots) return 1;
+    /* the block key cache as pages of KEYS_PER_PAGE keys, and their address table */
+    ds4_gpu_tensor *pages[PAGES];
+    uint64_t addrs[PAGES];
+    ds4_gpu_tensor *pages_t = ds4_gpu_tensor_alloc(sizeof(addrs));
+    if (!sel || !n_sel || !keys || !q || !slots || !pages_t) return 1;
+    for (uint32_t p = 0; p < PAGES; p++) {
+        pages[p] = ds4_gpu_tensor_alloc((uint64_t)KEYS_PER_PAGE * D * sizeof(uint16_t));
+        if (!pages[p]) return 1;
+        addrs[p] = (uint64_t)(uintptr_t)pages[p]->ptr;
+    }
+    if (!ds4_gpu_tensor_write(pages_t, 0, addrs, sizeof(addrs))) return 1;
     int rc = 0;
-    rc |= run_case(0, 64, 0, 1u, sel, n_sel, keys, q, bkey, slots);          /* everything within the budget */
-    rc |= run_case(2000, 128, 0, 2u, sel, n_sel, keys, q, bkey, slots);      /* the chunk crosses the budget */
-    rc |= run_case(2051, 1, 0, 3u, sel, n_sel, keys, q, bkey, slots);        /* first selecting token, decode */
-    rc |= run_case(4093, 8, 0, 4u, sel, n_sel, keys, q, bkey, slots);        /* block boundaries inside the chunk */
-    rc |= run_case(CTX - 300, 300, 0, 5u, sel, n_sel, keys, q, bkey, slots); /* more tokens than scratch rows, end of context */
-    rc |= run_case(1500, 8, 1, 6u, sel, n_sel, keys, q, bkey, slots);        /* batched rows within and past the budget */
-    rc |= run_case(CTX - 7 * BATCH_STRIDE - 1, 8, 1, 7u, sel, n_sel, keys, q, bkey, slots);   /* batched, last row at the end */
+    rc |= run_case(0, 64, 0, 1u, sel, n_sel, keys, q, pages, pages_t, slots);          /* everything within the budget */
+    rc |= run_case(2000, 128, 0, 2u, sel, n_sel, keys, q, pages, pages_t, slots);      /* the chunk crosses the budget */
+    rc |= run_case(2051, 1, 0, 3u, sel, n_sel, keys, q, pages, pages_t, slots);        /* first selecting token, decode */
+    rc |= run_case(4093, 8, 0, 4u, sel, n_sel, keys, q, pages, pages_t, slots);        /* block boundaries inside the chunk */
+    rc |= run_case(CTX - 300, 300, 0, 5u, sel, n_sel, keys, q, pages, pages_t, slots); /* more tokens than scratch rows, end of context */
+    rc |= run_case(1500, 8, 1, 6u, sel, n_sel, keys, q, pages, pages_t, slots);        /* batched rows within and past the budget */
+    rc |= run_case(CTX - 7 * BATCH_STRIDE - 1, 8, 1, 7u, sel, n_sel, keys, q, pages, pages_t, slots);   /* batched, last row at the end */
     printf("qsa-select: %s\n", rc ? "FAIL" : "PASS");
     return rc;
 }
