@@ -2173,10 +2173,133 @@ extern "C" int ds4_gpu_qwen4exp_hc_gate(
     return cublas_ok(st, "hc gate GEMM");
 }
 
-/* mixed = mean over streams of xn * sigmoid(gate); the gate is bf16 after
- * the prefill GEMM above and f32 after a decode matvec. */
+/* Decode's hc gate and mix in one launch: gate = SiLU(lo / n_hc) W_up^T, then
+ * mixed = mean over streams of xn * sigmoid(gate).  A warp owns one
+ * embedding index j and walks its HC weight rows (the columns c*n + j) in the
+ * order of the bf16 matvec, so every gate value is bit for bit the one the
+ * separate projection produced; the mix then needs no second launch and no
+ * [rows][n_hc * n_embd] gate in memory at all.  The 8 loads of a warp's
+ * rows are issued before any arithmetic, which is the parallelism the short
+ * 640-byte rows would otherwise lack. */
+#define QWEN4EXP_MAX_HC_LOW 512u
+
+template <int N, int HC>
+__global__ static void qwen4exp_hc_gate_mix_kernel(
+        float *mixed, const uint16_t *w_up, const float *lo, const __nv_bfloat16 *xn,
+        uint32_t n_low, uint32_t n, float scale) {
+    __shared__ __align__(16) float los[N][QWEN4EXP_MAX_HC_LOW];
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    for (uint32_t i = threadIdx.x; i < (uint32_t)N * n_low; i += blockDim.x) {
+        los[i / n_low][i % n_low] = qwen35_cuda_silu(lo[i] / (float)HC);
+    }
+    __syncthreads();
+    const uint32_t j = blockIdx.x * 8u + warp;
+    if (j >= n) return;
+    const uint32_t steps = n_low / 8u;
+    uint4 wq[HC][2];
+#pragma unroll
+    for (int c = 0; c < HC; c++) {
+        const uint4 *wrow = (const uint4 *)(w_up + (uint64_t)((uint32_t)c * n + j) * n_low);
+        wq[c][0] = lane < steps ? wrow[lane] : make_uint4(0u, 0u, 0u, 0u);
+        wq[c][1] = lane + 32u < steps ? wrow[lane + 32u] : make_uint4(0u, 0u, 0u, 0u);
+    }
+    float acc[N];
+#pragma unroll
+    for (int r = 0; r < N; r++) acc[r] = 0.0f;
+#pragma unroll
+    for (int c = 0; c < HC; c++) {
+        float sum[N];
+#pragma unroll
+        for (int r = 0; r < N; r++) sum[r] = 0.0f;
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const uint32_t i = lane + 32u * h;
+            if (i >= steps) break;
+            const uint4 v = wq[c][h];
+            const float w0 = __uint_as_float(v.x << 16), w1 = __uint_as_float(v.x & 0xffff0000u);
+            const float w2 = __uint_as_float(v.y << 16), w3 = __uint_as_float(v.y & 0xffff0000u);
+            const float w4 = __uint_as_float(v.z << 16), w5 = __uint_as_float(v.z & 0xffff0000u);
+            const float w6 = __uint_as_float(v.w << 16), w7 = __uint_as_float(v.w & 0xffff0000u);
+#pragma unroll
+            for (int r = 0; r < N; r++) {
+                const float4 *xs = (const float4 *)(los[r] + i * 8u);
+                const float4 xa = xs[0], xb = xs[1];
+                sum[r] = fmaf(w0, xa.x, sum[r]);
+                sum[r] = fmaf(w1, xa.y, sum[r]);
+                sum[r] = fmaf(w2, xa.z, sum[r]);
+                sum[r] = fmaf(w3, xa.w, sum[r]);
+                sum[r] = fmaf(w4, xb.x, sum[r]);
+                sum[r] = fmaf(w5, xb.y, sum[r]);
+                sum[r] = fmaf(w6, xb.z, sum[r]);
+                sum[r] = fmaf(w7, xb.w, sum[r]);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < N; r++) {
+            const float gate = warp_sum_f32(sum[r]) * scale;
+            const float x = __bfloat162float(xn[((uint64_t)r * HC + (uint32_t)c) * n + j]);
+            acc[r] = fmaf(x, qwen35_cuda_sigmoid(gate), acc[r]);
+        }
+    }
+    if (lane == 0u) {
+#pragma unroll
+        for (int r = 0; r < N; r++) mixed[(uint64_t)r * n + j] = acc[r] / (float)HC;
+    }
+}
+
+template <int N>
+static void qwen4exp_hc_gate_mix_rows(
+        float *mixed, const uint16_t *w_up, const float *lo, const __nv_bfloat16 *xn,
+        uint32_t n_low, uint32_t n, float scale, cudaStream_t stream) {
+    qwen4exp_hc_gate_mix_kernel<N, 4><<<(n + 7u) / 8u, 256, 0, stream>>>(mixed, w_up, lo, xn, n_low, n, scale);
+}
+
+extern "C" int ds4_gpu_qwen4exp_hc_gate_mix(
+        ds4_gpu_tensor       *mixed,         /* f32 [rows][n_embd] */
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset, /* BF16 [n_hc * n_embd][n_low] */
+        uint32_t              wtype,
+        float                 scale,
+        const ds4_gpu_tensor *lo,            /* f32 [rows][n_low], before the SiLU */
+        const ds4_gpu_tensor *xn,            /* bf16 [rows][n_hc][n_embd] */
+        uint32_t              n_low,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              rows) {
+    const uint64_t weight_bytes = qwen35_weight_bytes(wtype, n_low, (uint64_t)n_hc * n_embd);
+    if (!mixed || !lo || !xn || !model_map || wtype != QWEN35_W_BF16 || n_hc != 4u || rows == 0u || rows > 8u ||
+        n_low == 0u || n_low % 8u != 0u || n_low > QWEN4EXP_MAX_HC_LOW || n_embd == 0u || weight_bytes == 0u ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        !qwen4exp_elems_fit(lo, (uint64_t)rows * n_low) || !qwen4exp_bf16_fit(xn, (uint64_t)rows * n_hc * n_embd) ||
+        !qwen4exp_elems_fit(mixed, (uint64_t)rows * n_embd)) {
+        return 0;
+    }
+    const uint16_t *w = (const uint16_t *)cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes,
+                                                                    ds4_tensor_device_idx(mixed), "hc up");
+    if (!w) return 0;
+    float *o = (float *)mixed->ptr;
+    const float *l = (const float *)lo->ptr;
+    const __nv_bfloat16 *x = (const __nv_bfloat16 *)xn->ptr;
+    cudaStream_t stream = cuda_decode_stream();
+    switch (rows) {
+    case 1: qwen4exp_hc_gate_mix_rows<1>(o, w, l, x, n_low, n_embd, scale, stream); break;
+    case 2: qwen4exp_hc_gate_mix_rows<2>(o, w, l, x, n_low, n_embd, scale, stream); break;
+    case 3: qwen4exp_hc_gate_mix_rows<3>(o, w, l, x, n_low, n_embd, scale, stream); break;
+    case 4: qwen4exp_hc_gate_mix_rows<4>(o, w, l, x, n_low, n_embd, scale, stream); break;
+    case 5: qwen4exp_hc_gate_mix_rows<5>(o, w, l, x, n_low, n_embd, scale, stream); break;
+    case 6: qwen4exp_hc_gate_mix_rows<6>(o, w, l, x, n_low, n_embd, scale, stream); break;
+    case 7: qwen4exp_hc_gate_mix_rows<7>(o, w, l, x, n_low, n_embd, scale, stream); break;
+    default: qwen4exp_hc_gate_mix_rows<8>(o, w, l, x, n_low, n_embd, scale, stream); break;
+    }
+    return cuda_ok(cudaGetLastError(), "Flash-Next hc gate mix launch");
+}
+
+/* mixed = mean over streams of xn * sigmoid(gate) after the prefill gate
+ * GEMM above (decode fuses the gate and the mix, qwen4exp_hc_gate_mix). */
 __global__ static void qwen4exp_hc_mix_kernel(
-        float *mixed, const __nv_bfloat16 *xn, const void *gate, uint32_t gate_bf16, uint32_t n, uint32_t n_hc, uint32_t rows) {
+        float *mixed, const __nv_bfloat16 *xn, const __nv_bfloat16 *gate, uint32_t n, uint32_t n_hc, uint32_t rows) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (uint64_t)rows * n) return;
     const uint64_t t = i / n;
@@ -2184,8 +2307,7 @@ __global__ static void qwen4exp_hc_mix_kernel(
     float acc = 0.0f;
     for (uint32_t c = 0; c < n_hc; c++) {
         const uint64_t idx = (t * n_hc + c) * n + j;
-        const float g = gate_bf16 ? __bfloat162float(((const __nv_bfloat16 *)gate)[idx]) : ((const float *)gate)[idx];
-        acc = fmaf(__bfloat162float(xn[idx]), qwen35_cuda_sigmoid(g), acc);
+        acc = fmaf(__bfloat162float(xn[idx]), qwen35_cuda_sigmoid(__bfloat162float(gate[idx])), acc);
     }
     mixed[i] = acc / (float)n_hc;
 }
@@ -2193,18 +2315,17 @@ __global__ static void qwen4exp_hc_mix_kernel(
 extern "C" int ds4_gpu_qwen4exp_hc_mix(
         ds4_gpu_tensor       *mixed,
         const ds4_gpu_tensor *xn,            /* bf16 */
-        const ds4_gpu_tensor *gate,
-        int                   gate_bf16,
+        const ds4_gpu_tensor *gate,          /* bf16 */
         uint32_t              n_embd,
         uint32_t              n_hc,
         uint32_t              rows) {
     const uint64_t n = (uint64_t)rows * n_embd;
     if (n == 0u || n_hc == 0u || !qwen4exp_elems_fit(mixed, n) || !qwen4exp_bf16_fit(xn, n * n_hc) ||
-        !gate || gate->bytes < n * n_hc * (gate_bf16 ? sizeof(__nv_bfloat16) : sizeof(float))) {
+        !qwen4exp_bf16_fit(gate, n * n_hc)) {
         return 0;
     }
     qwen4exp_hc_mix_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
-        (float *)mixed->ptr, (const __nv_bfloat16 *)xn->ptr, gate->ptr, gate_bf16 != 0, n_embd, n_hc, rows);
+        (float *)mixed->ptr, (const __nv_bfloat16 *)xn->ptr, (const __nv_bfloat16 *)gate->ptr, n_embd, n_hc, rows);
     return cuda_ok(cudaGetLastError(), "Flash-Next hc mix launch");
 }
 
