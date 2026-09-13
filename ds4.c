@@ -17185,6 +17185,39 @@ static void qwen_ple_gather_worker(void *vctx, uint64_t row0, uint64_t row1) {
     }
 }
 
+/* DS4_PLE_TRACE=FILE appends this pass's n-gram row ids (n * n_head uint32,
+ * token-major then head) for the offline cache simulation in
+ * gguf-tools/ple_cache_sim.py.  The stream is the one the engine really
+ * fetches, so a speculative pass contributes all k+1 rows including the
+ * drafts it goes on to reject: those rows are gathered too.  Diagnostic and
+ * off unless the variable is set; the flush costs one syscall per pass. */
+static void qwen_ple_trace(const uint64_t *rows, uint32_t n, uint32_t n_head) {
+    static FILE *fp = NULL;
+    static bool  opened = false;
+    if (!opened) {
+        opened = true;
+        const char *path = getenv("DS4_PLE_TRACE");
+        if (path && path[0] && (fp = fopen(path, "wb")) != NULL) {
+            const uint32_t version = 1u;
+            fwrite("DS4PLTRC", 1, 8, fp);
+            fwrite(&version, sizeof version, 1, fp);
+            fwrite(&n_head, sizeof n_head, 1, fp);
+        }
+    }
+    if (!fp) return;
+    const uint32_t total = n * n_head;
+    uint32_t buf[256], k = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        buf[k++] = (uint32_t)rows[i];   /* global row id: n_rows < 2^32 */
+        if (k == sizeof buf / sizeof buf[0]) {
+            fwrite(buf, sizeof buf[0], k, fp);
+            k = 0;
+        }
+    }
+    if (k) fwrite(buf, sizeof buf[0], k, fp);
+    fflush(fp);   /* the trace is the point: do not lose it to a signal */
+}
+
 /* `owners`, when given, names the graph whose n-gram window token i
  * advances (a batched pass: one session per row); else every token is
  * g's own, in order. */
@@ -17198,6 +17231,7 @@ static bool qwen_graph_ple_rows(ds4_qwen_gpu_graph *g, ds4_qwen_gpu_graph **owne
         for (uint32_t s = t->n_mult - 1u; s > 1; s--) o->ple_prev[s - 1] = o->ple_prev[s - 2];
         o->ple_prev[0] = tokens[i];
     }
+    if (n) qwen_ple_trace(rows, n, t->n_head);
     qwen_ple_gather_ctx ctx = { .t = t, .rows = rows, .emb = g->emb_host };
     for (uint32_t b = 0; b < 256u; b++) ctx.lut[b] = ds4_e4m3_to_f32((uint8_t)b) * t->scale;
     ds4_parallel_for(n, qwen_ple_gather_worker, &ctx);
