@@ -148,7 +148,9 @@ static void test_prefetch(void) {
     uint32_t hint[4000], rows[64];
     uint8_t out[64 * RB];
     for (int i = 0; i < 4000; i++) hint[i] = (uint32_t)(50000 + i * 11);
-    ds4_ngram_cache_prefetch(c, hint, 4000);
+    /* two hints queue up: the second must not replace the first */
+    ds4_ngram_cache_prefetch(c, hint, 1000);
+    ds4_ngram_cache_prefetch(c, hint + 1000, 3000);
     int all_ok = 1;
     for (int pass = 0; pass < 50; pass++) {
         for (int i = 0; i < 64; i++) rows[i] = (uint32_t)(rnd() % ROWS);

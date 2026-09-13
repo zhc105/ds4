@@ -41,8 +41,10 @@ void ds4_ngram_cache_close(ds4_ngram_cache *c);
  * distinct rows than the cache has slots. */
 bool ds4_ngram_cache_gather(ds4_ngram_cache *c, const uint32_t *rows, uint64_t n, uint8_t *out);
 
-/* Rows that will be gathered soon: read in the background, replacing any
- * earlier hint not yet served.  Returns at once. */
+/* Rows that will be gathered soon, in the order they will be needed: read
+ * in the background after any earlier hint still pending.  The queue is
+ * bounded (a full 262K-token prompt fits); a tail that does not fit is
+ * dropped, being the least urgent.  Returns at once. */
 void ds4_ngram_cache_prefetch(ds4_ngram_cache *c, const uint32_t *rows, uint64_t n);
 
 void ds4_ngram_cache_stats_get(ds4_ngram_cache *c, ds4_ngram_cache_stats *out);

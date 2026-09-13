@@ -611,10 +611,11 @@ void ds4_session_drop_kv(ds4_session *s);
  * longest saved state that begins it, else 0.  A caller feeding the
  * prompt in pieces must start its first piece past this. */
 int ds4_session_resume_pos(ds4_session *s, const ds4_tokens *prompt);
-/* A caller feeding a prompt in pieces marks all but the last piece
- * partial: the engine then archives no turn-boundary state at their ends
- * (each piece is not a turn), so the archive keeps real turns. */
-void ds4_session_set_sync_partial(ds4_session *s, bool partial);
+/* A caller feeding a prompt in pieces names the whole prompt while syncing
+ * all but the last piece (NULL otherwise): the engine then archives no
+ * turn-boundary state at a piece's end (a piece is not a turn), so the
+ * archive keeps real turns, and it can read ahead for the pieces to come. */
+void ds4_session_set_sync_partial(ds4_session *s, const ds4_tokens *whole);
 
 /* Low-level graph slice entry points used by distributed inference.  The
  * transport/session routing logic lives in ds4_distributed.c. */

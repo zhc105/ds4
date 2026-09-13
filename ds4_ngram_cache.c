@@ -44,6 +44,7 @@ enum {
     NGC_WAYS = 8,            /* entries per index bucket */
     NGC_QD = 64,             /* reads submitted together */
     NGC_HINT_BATCH = 256,    /* prefetch rows between checks for a gather */
+    NGC_HINT_CAP = 1 << 22,  /* pending prefetch rows, 16 MiB: 262K tokens of 16 heads */
     NGC_LOG_SECONDS = 600,
 };
 enum { NGC_COLD = 0, NGC_HOT = 1, NGC_PINNED = 2 };   /* ref[] states */
@@ -107,8 +108,8 @@ struct ds4_ngram_cache {
     const uint32_t *req_rows;
     uint64_t req_n;
     uint8_t *req_out;
-    uint32_t *hint;
-    uint64_t hint_n, hint_pos, hint_cap;
+    uint32_t *hint;          /* [NGC_HINT_CAP] once first used; served in order */
+    uint64_t hint_n, hint_pos;
     ds4_ngram_cache_stats pub;   /* published copy of st, plus the caller-side counters */
     time_t last_log;             /* CLOCK_MONOTONIC seconds */
     uint64_t logged_lookups;
@@ -716,18 +717,17 @@ bool ds4_ngram_cache_gather(ds4_ngram_cache *c, const uint32_t *rows, uint64_t n
 
 void ds4_ngram_cache_prefetch(ds4_ngram_cache *c, const uint32_t *rows, uint64_t n) {
     pthread_mutex_lock(&c->mu);
-    if (n > c->hint_cap) {
-        uint32_t *h = realloc(c->hint, (size_t)n * sizeof(uint32_t));
-        if (h) {
-            c->hint = h;
-            c->hint_cap = n;
-        }
+    if (!c->hint) c->hint = malloc((size_t)NGC_HINT_CAP * sizeof(uint32_t));
+    if (c->hint) {
+        /* pending hints move to the front, the new ones follow */
+        const uint64_t pending = c->hint_n - c->hint_pos;
+        if (c->hint_pos) memmove(c->hint, c->hint + c->hint_pos, (size_t)pending * sizeof(uint32_t));
+        const uint64_t k = n < NGC_HINT_CAP - pending ? n : NGC_HINT_CAP - pending;
+        memcpy(c->hint + pending, rows, (size_t)k * sizeof(uint32_t));
+        c->hint_pos = 0;
+        c->hint_n = pending + k;
+        pthread_cond_signal(&c->wake);
     }
-    const uint64_t k = n <= c->hint_cap ? n : 0;   /* a hint that cannot be held is dropped */
-    if (k) memcpy(c->hint, rows, (size_t)k * sizeof(uint32_t));
-    c->hint_n = k;
-    c->hint_pos = 0;
-    pthread_cond_signal(&c->wake);
     pthread_mutex_unlock(&c->mu);
 }
 

@@ -17232,19 +17232,20 @@ static bool qwen_graph_ple_rows(ds4_qwen_gpu_graph *g, ds4_qwen_gpu_graph **owne
     return ok;
 }
 
-/* A prompt's rows are all known before its first chunk runs: those past the
- * first chunk go to the row cache as read-ahead, so their misses load while
- * the earlier chunks compute.  The window advances on a copy here; each
- * chunk still advances the graph's own as it runs. */
-static void qwen_graph_ple_prefetch(const ds4_qwen_gpu_graph *g, const ds4_model *m, const int *tokens, uint32_t n) {
-    if (!g->emb || n <= g->max_rows) return;
+/* A prompt's rows are all known before its first pass runs: those past the
+ * `skip` tokens the caller gathers next go to the row cache as read-ahead,
+ * so their misses load while the earlier passes compute.  The window
+ * advances on a copy here; each pass still advances the graph's own. */
+static void qwen_graph_ple_prefetch(const ds4_qwen_gpu_graph *g, const ds4_model *m,
+                                    const int *tokens, uint32_t n, uint32_t skip) {
+    if (!g->emb || n <= skip) return;
     const ds4_ngram_table *t = &m->ngram;
     int32_t prev[DS4_NGRAM_MAX_MULT];
     memcpy(prev, g->ple_prev, sizeof prev);
     uint32_t *rows = xmalloc((uint64_t)n * t->n_head * sizeof(uint32_t));
     for (uint32_t i = 0; i < n; i++) qwen_ple_step(t, prev, tokens[i], rows + (uint64_t)i * t->n_head);
-    const uint64_t skip = (uint64_t)g->max_rows * t->n_head;
-    ds4_ngram_cache_prefetch(t->cache, rows + skip, (uint64_t)n * t->n_head - skip);
+    const uint64_t from = (uint64_t)skip * t->n_head;
+    ds4_ngram_cache_prefetch(t->cache, rows + from, (uint64_t)n * t->n_head - from);
     free(rows);
 }
 
@@ -57345,7 +57346,8 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
-    bool sync_partial;   /* the prompt being synced is a piece, not a turn: archive no state at its end */
+    const ds4_tokens *sync_whole;   /* the prompt being synced is a piece of this, not a turn: archive no state at its end */
+    uint32_t ple_hinted;            /* live-history position up to which n-gram rows were read ahead */
 };
 
 #ifndef DS4_NO_GPU
@@ -68670,8 +68672,8 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
     s->cancel_ud = ud;
 }
 
-void ds4_session_set_sync_partial(ds4_session *s, bool partial) {
-    if (s) s->sync_partial = partial;
+void ds4_session_set_sync_partial(ds4_session *s, const ds4_tokens *whole) {
+    if (s) s->sync_whole = whole;
 }
 
 static bool ds4_session_cancelled(ds4_session *s) {
@@ -70309,11 +70311,13 @@ static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, ch
         return 1;
     }
     int start = 0;
+    bool continues = false;   /* the live history goes on: earlier read-ahead still stands */
     if (s->checkpoint_valid &&
         (uint32_t)s->checkpoint.len == g->n_tokens &&
         prompt->len >= s->checkpoint.len &&
         ds4_tokens_starts_with(prompt, &s->checkpoint)) {
         start = s->checkpoint.len;
+        continues = true;
     } else if ((start = qwen_session_state_restore(s, prompt)) == 0) {
         if (!qwen_graph_reset(g)) {
             snprintf(err, errlen, "Qwen3.5 graph reset failed");
@@ -70323,11 +70327,23 @@ static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, ch
         s->qwen_mtp_pending = false;
         s->qwen_mtp_draft = -1;
     }
+    /* Read the n-gram rows of everything still to come ahead of the passes,
+     * once per prompt: a caller feeding pieces names the whole, and the
+     * hint stands until the live history moves past it.  The first pass
+     * gathers its own rows, so the hint starts after it. */
+    const ds4_tokens *whole = s->sync_whole ? s->sync_whole : prompt;
+    if (!continues || (int)s->ple_hinted < start) s->ple_hinted = (uint32_t)start;
+    if ((int)s->ple_hinted < whole->len) {
+        const uint32_t piece = (uint32_t)(prompt->len - start) < g->max_rows ? (uint32_t)(prompt->len - start) : g->max_rows;
+        const uint32_t hinted = s->ple_hinted - (uint32_t)start;
+        qwen_graph_ple_prefetch(g, &e->model, whole->v + start, (uint32_t)(whole->len - start),
+                                hinted > piece ? hinted : piece);
+        s->ple_hinted = (uint32_t)whole->len;
+    }
     /* DS4_QWEN_DUMP_LOGITS=FILE: the logits after every prompt position
      * appended as f32 rows, the same layout as the CPU reference's dump. */
     const char *dump_path = getenv("DS4_QWEN_DUMP_LOGITS");
     FILE *dump = dump_path && dump_path[0] ? fopen(dump_path, "ab") : NULL;
-    qwen_graph_ple_prefetch(g, &e->model, prompt->v + start, (uint32_t)(prompt->len - start));
     for (int i = start; i < prompt->len;) {
         if (ds4_session_cancelled(s)) {
             if (dump) fclose(dump);
@@ -70361,7 +70377,7 @@ static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, ch
     s->greedy_splitkv_segment.len = 0;
     s->greedy_splitkv_anchor_valid = false;
     /* a piece of a prompt fed in pieces ends mid-turn: the archive keeps turns */
-    if (!s->sync_partial && !qwen_session_state_save(s)) {
+    if (!s->sync_whole && !qwen_session_state_save(s)) {
         snprintf(err, errlen, "Qwen state save failed");
         return 1;
     }
