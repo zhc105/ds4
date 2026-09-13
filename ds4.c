@@ -43,6 +43,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
+#include "ds4_ngram_cache.h"
 #include "ds4_tp.h"
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
@@ -2250,12 +2251,13 @@ typedef struct {
  * DS4_NGRAM_HEADER_BYTES + i * row_bytes, all multiplied by scale.  Each of
  * the n_head hash heads owns a disjoint row range and gathers one full row;
  * the n_head rows concatenated (head slowest) form the n_embd-wide n-gram
- * embedding.  The table is mmapped and only touched row by row, so the
- * working set is a tiny slice of the file. */
+ * embedding.  Rows come through the row cache in ds4_ngram_cache.c, never
+ * a mapping: the working set is a tiny, hash-scattered slice of the file,
+ * which the page cache holds at 25x the memory. */
 enum { DS4_NGRAM_HEADER_BYTES = 4096, DS4_NGRAM_MAX_MULT = 4, DS4_NGRAM_MAX_HEAD = 32 };
 
 typedef struct {
-    const uint8_t *map;
+    ds4_ngram_cache *cache;
     uint64_t size;
     uint64_t rows;
     uint32_t row_bytes;
@@ -2508,7 +2510,7 @@ static void model_close(ds4_model *m) {
     free(m->kv);
     free(m->tensors);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
-    if (m->ngram.map) munmap((void *)m->ngram.map, (size_t)m->ngram.size);
+    ds4_ngram_cache_close(m->ngram.cache);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
     m->fd = -1;
@@ -6706,11 +6708,11 @@ static void qwen_ngram_expect_u64_array(const ds4_model *m, const char *key,
     }
 }
 
-/* Map the PLE n-gram sidecar named by ple.table_file, resolved beside the
+/* Open the PLE n-gram sidecar named by ple.table_file, resolved beside the
  * GGUF, and check its header against the hash constants the GGUF metadata
  * carries so the two files cannot silently drift apart.  Only the header
- * is touched here; rows are faulted in on demand by the forward pass. */
-static void qwen_ngram_open(ds4_model *m, const char *model_path) {
+ * is read here; rows are read into the row cache as passes ask for them. */
+static void qwen_ngram_open(ds4_model *m, const char *model_path, uint64_t cache_mb) {
     ds4_ngram_table *t = &m->ngram;
     ds4_str file = {0};
     if (!model_get_string(m, "qwen4exp.ple.table_file", &file)) {
@@ -6728,16 +6730,16 @@ static void qwen_ngram_open(ds4_model *m, const char *model_path) {
     if (fd == -1) ds4_die_errno("cannot open PLE n-gram table", path);
     struct stat st;
     if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat PLE n-gram table", path);
-    if (st.st_size < DS4_NGRAM_HEADER_BYTES) ds4_die("qwen: PLE n-gram table is truncated");
-    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    uint8_t h[DS4_NGRAM_HEADER_BYTES];
+    if (st.st_size < DS4_NGRAM_HEADER_BYTES ||
+        pread(fd, h, sizeof h, 0) != (ssize_t)sizeof h) {
+        ds4_die("qwen: PLE n-gram table is truncated");
+    }
     close(fd);
-    if (map == MAP_FAILED) ds4_die_errno("cannot map PLE n-gram table", path);
-    t->map = map;
     t->size = (uint64_t)st.st_size;
 
     /* header: magic, u32 version, u32 row_bytes, u64 rows, u32 dtype, f32 scale,
      * u32 n_mult, u32 n_head, then u64 mult[n_mult], offset[n_head], vocab[n_head] */
-    const uint8_t *h = t->map;
     uint32_t version = 0, dtype = 0;
     if (memcmp(h, "DS4NGRAM", 8) != 0) ds4_die("qwen: PLE table is not a ds4 n-gram file");
     memcpy(&version, h + 8, 4);
@@ -6772,6 +6774,10 @@ static void qwen_ngram_open(ds4_model *m, const char *model_path) {
     qwen_ngram_expect_u64_array(m, "qwen4exp.ple.layer_multipliers", t->mult, t->n_mult);
     qwen_ngram_expect_u64_array(m, "qwen4exp.ple.head_offsets", t->head_offset, t->n_head);
     qwen_ngram_expect_u64_array(m, "qwen4exp.ple.head_vocab_sizes", t->head_vocab, t->n_head);
+
+    t->cache = ds4_ngram_cache_open(path, DS4_NGRAM_HEADER_BYTES, t->rows, t->row_bytes,
+                                    (cache_mb ? cache_mb : 4096u) << 20);
+    if (!t->cache) ds4_die("qwen: cannot set up the PLE n-gram row cache");
 }
 
 static void config_validate_model(const ds4_model *m) {
@@ -16137,7 +16143,7 @@ static inline float ds4_e4m3_to_f32(uint8_t bits) {
  * its own window.  Every n-gram order from 2 up hashes its prefix of the
  * window, and heads_per_ngram heads share that hash with their own modulus
  * and row range. */
-static void qwen_ple_rows(const ds4_ngram_table *t, const int32_t *prev, int token, uint64_t *rows) {
+static void qwen_ple_rows(const ds4_ngram_table *t, const int32_t *prev, int token, uint32_t *rows) {
     const uint32_t n_gram = t->n_mult;
     const uint32_t per_gram = t->n_head / (n_gram - 1u);
     uint64_t window[DS4_NGRAM_MAX_MULT];
@@ -16152,9 +16158,16 @@ static void qwen_ple_rows(const ds4_ngram_table *t, const int32_t *prev, int tok
         for (uint32_t j = 1; j < n; j++) mixed ^= window[j] * t->mult[j];
         for (uint32_t g = 0; g < per_gram; g++) {
             const uint32_t h = (n - 2u) * per_gram + g;
-            rows[h] = mixed % t->head_vocab[h] + t->head_offset[h];
+            rows[h] = (uint32_t)(mixed % t->head_vocab[h] + t->head_offset[h]);   /* the cache checks rows < 2^32 */
         }
     }
+}
+
+/* The rows of token, then the window advanced past it. */
+static void qwen_ple_step(const ds4_ngram_table *t, int32_t *prev, int token, uint32_t *rows) {
+    qwen_ple_rows(t, prev, token, rows);
+    for (uint32_t s = t->n_mult - 1u; s > 1; s--) prev[s - 1] = prev[s - 2];
+    prev[0] = token;
 }
 
 /* PLE injection on its layer, before the attention mixer.  The gathered
@@ -16174,15 +16187,11 @@ static void qwen_ple_forward(
     const uint64_t hc_dim = (uint64_t)n_hc * n;
     const float eps = DS4_RMS_EPS;
 
-    uint64_t rows[DS4_NGRAM_MAX_HEAD];
-    qwen_ple_rows(t, st->ple_prev, token, rows);
-    for (uint32_t s = t->n_mult - 1u; s > 1; s--) st->ple_prev[s - 1] = st->ple_prev[s - 2];
-    st->ple_prev[0] = token;
-    for (uint32_t h = 0; h < t->n_head; h++) {
-        const uint8_t *row = t->map + DS4_NGRAM_HEADER_BYTES + rows[h] * t->row_bytes;
-        float *e = st->emb + (uint64_t)h * t->row_bytes;
-        for (uint32_t i = 0; i < t->row_bytes; i++) e[i] = ds4_e4m3_to_f32(row[i]) * t->scale;
-    }
+    uint32_t rows[DS4_NGRAM_MAX_HEAD];
+    uint8_t raw[DS4_MAX_EMBD];   /* n_head * row_bytes == n_embd, checked at open */
+    qwen_ple_step(t, st->ple_prev, token, rows);
+    if (!ds4_ngram_cache_gather(t->cache, rows, t->n_head, raw)) ds4_die("qwen: PLE n-gram row read failed");
+    for (uint64_t i = 0; i < n; i++) st->emb[i] = ds4_e4m3_to_f32(raw[i]) * t->scale;
 
     matvec_any(st->pkey, m, l->ple_key, st->emb);
     matvec_any(st->pval, m, l->ple_value, st->emb);
@@ -17159,30 +17168,18 @@ static bool qwen_graph_ple(
     return ok;
 }
 
-/* Gather the n-gram rows of a chunk on the host: the table stays mmapped
- * and is read row by row, so the GPU never touches it.  The hash window
- * advances token by token exactly as the CPU reference does, which is
- * cheap and sequential; the row reads and E4M3 decoding, the actual cost
- * (70 ms for 2481 tokens single-threaded), go to the thread pool over
- * tokens with a decode table. */
+/* The row cache returns a pass's rows as raw E4M3 codes, n_head rows per
+ * token concatenated: exactly n_embd bytes a token.  Decoding goes to the
+ * thread pool with a lookup table. */
 typedef struct {
-    const ds4_ngram_table *t;
-    const uint64_t        *rows;      /* [n][n_head] */
-    float                 *emb;       /* [n][n_embd] */
-    float                  lut[256];  /* E4M3 code -> value * scale */
-} qwen_ple_gather_ctx;
+    const uint8_t *raw;       /* [n][n_embd] E4M3 codes */
+    float         *emb;       /* [n][n_embd] */
+    float          lut[256];  /* E4M3 code -> value * scale */
+} qwen_ple_decode_ctx;
 
-static void qwen_ple_gather_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    const qwen_ple_gather_ctx *c = vctx;
-    const ds4_ngram_table *t = c->t;
-    for (uint64_t i = row0; i < row1; i++) {
-        float *e = c->emb + i * DS4_N_EMBD;
-        for (uint32_t h = 0; h < t->n_head; h++) {
-            const uint8_t *row = t->map + DS4_NGRAM_HEADER_BYTES + c->rows[i * t->n_head + h] * t->row_bytes;
-            float *dst = e + (uint64_t)h * t->row_bytes;
-            for (uint32_t j = 0; j < t->row_bytes; j++) dst[j] = c->lut[row[j]];
-        }
-    }
+static void qwen_ple_decode_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    const qwen_ple_decode_ctx *c = vctx;
+    for (uint64_t i = row0 * DS4_N_EMBD; i < row1 * DS4_N_EMBD; i++) c->emb[i] = c->lut[c->raw[i]];
 }
 
 /* DS4_PLE_TRACE=FILE appends this pass's n-gram row ids (n * n_head uint32,
@@ -17191,7 +17188,7 @@ static void qwen_ple_gather_worker(void *vctx, uint64_t row0, uint64_t row1) {
  * fetches, so a speculative pass contributes all k+1 rows including the
  * drafts it goes on to reject: those rows are gathered too.  Diagnostic and
  * off unless the variable is set; the flush costs one syscall per pass. */
-static void qwen_ple_trace(const uint64_t *rows, uint32_t n, uint32_t n_head) {
+static void qwen_ple_trace(const uint32_t *rows, uint32_t n, uint32_t n_head) {
     static FILE *fp = NULL;
     static bool  opened = false;
     if (!opened) {
@@ -17205,38 +17202,50 @@ static void qwen_ple_trace(const uint64_t *rows, uint32_t n, uint32_t n_head) {
         }
     }
     if (!fp) return;
-    const uint32_t total = n * n_head;
-    uint32_t buf[256], k = 0;
-    for (uint32_t i = 0; i < total; i++) {
-        buf[k++] = (uint32_t)rows[i];   /* global row id: n_rows < 2^32 */
-        if (k == sizeof buf / sizeof buf[0]) {
-            fwrite(buf, sizeof buf[0], k, fp);
-            k = 0;
-        }
-    }
-    if (k) fwrite(buf, sizeof buf[0], k, fp);
+    fwrite(rows, sizeof(uint32_t), (size_t)n * n_head, fp);
     fflush(fp);   /* the trace is the point: do not lose it to a signal */
 }
 
-/* `owners`, when given, names the graph whose n-gram window token i
- * advances (a batched pass: one session per row); else every token is
- * g's own, in order. */
+/* Gather a pass's n-gram rows into g->emb through the row cache; the GPU
+ * never touches the table.  `owners`, when given, names the graph whose
+ * n-gram window token i advances (a batched pass: one session per row);
+ * else every token is g's own, in order.  The hashing is cheap and
+ * sequential, as in the CPU reference. */
 static bool qwen_graph_ple_rows(ds4_qwen_gpu_graph *g, ds4_qwen_gpu_graph **owners, const ds4_model *m,
                                 const int *tokens, uint32_t n) {
     const ds4_ngram_table *t = &m->ngram;
-    uint64_t *rows = xmalloc((uint64_t)n * t->n_head * sizeof(uint64_t));
+    uint32_t *rows = xmalloc((uint64_t)n * t->n_head * sizeof(uint32_t));
     for (uint32_t i = 0; i < n; i++) {
-        ds4_qwen_gpu_graph *o = owners ? owners[i] : g;
-        qwen_ple_rows(t, o->ple_prev, tokens[i], rows + (uint64_t)i * t->n_head);
-        for (uint32_t s = t->n_mult - 1u; s > 1; s--) o->ple_prev[s - 1] = o->ple_prev[s - 2];
-        o->ple_prev[0] = tokens[i];
+        qwen_ple_step(t, (owners ? owners[i] : g)->ple_prev, tokens[i], rows + (uint64_t)i * t->n_head);
     }
-    if (n) qwen_ple_trace(rows, n, t->n_head);
-    qwen_ple_gather_ctx ctx = { .t = t, .rows = rows, .emb = g->emb_host };
-    for (uint32_t b = 0; b < 256u; b++) ctx.lut[b] = ds4_e4m3_to_f32((uint8_t)b) * t->scale;
-    ds4_parallel_for(n, qwen_ple_gather_worker, &ctx);
+    qwen_ple_trace(rows, n, t->n_head);
+    uint8_t *raw = xmalloc((uint64_t)n * DS4_N_EMBD);
+    bool ok = ds4_ngram_cache_gather(t->cache, rows, (uint64_t)n * t->n_head, raw);
+    if (ok) {
+        qwen_ple_decode_ctx ctx = { .raw = raw, .emb = g->emb_host };
+        for (uint32_t b = 0; b < 256u; b++) ctx.lut[b] = ds4_e4m3_to_f32((uint8_t)b) * t->scale;
+        ds4_parallel_for(n, qwen_ple_decode_worker, &ctx);
+        ok = ds4_gpu_tensor_write(g->emb, 0, g->emb_host, (uint64_t)n * DS4_N_EMBD * sizeof(float)) != 0;
+    }
+    free(raw);
     free(rows);
-    return ds4_gpu_tensor_write(g->emb, 0, g->emb_host, (uint64_t)n * DS4_N_EMBD * sizeof(float)) != 0;
+    return ok;
+}
+
+/* A prompt's rows are all known before its first chunk runs: those past the
+ * first chunk go to the row cache as read-ahead, so their misses load while
+ * the earlier chunks compute.  The window advances on a copy here; each
+ * chunk still advances the graph's own as it runs. */
+static void qwen_graph_ple_prefetch(const ds4_qwen_gpu_graph *g, const ds4_model *m, const int *tokens, uint32_t n) {
+    if (!g->emb || n <= g->max_rows) return;
+    const ds4_ngram_table *t = &m->ngram;
+    int32_t prev[DS4_NGRAM_MAX_MULT];
+    memcpy(prev, g->ple_prev, sizeof prev);
+    uint32_t *rows = xmalloc((uint64_t)n * t->n_head * sizeof(uint32_t));
+    for (uint32_t i = 0; i < n; i++) qwen_ple_step(t, prev, tokens[i], rows + (uint64_t)i * t->n_head);
+    const uint64_t skip = (uint64_t)g->max_rows * t->n_head;
+    ds4_ngram_cache_prefetch(t->cache, rows + skip, (uint64_t)n * t->n_head - skip);
+    free(rows);
 }
 
 /* QSA indexer for a chunk (see qwen_attention_cells): fold the chunk's raw
@@ -41783,6 +41792,13 @@ static void ds4_engine_print_startup_memory(
     total = ds4_add_sat_u64(total, resident_model_bytes);
     total = ds4_add_sat_u64(total, dynamic_expert_cache_bytes);
     total = ds4_add_sat_u64(total, expert_reserved_bytes);
+    uint64_t ple_cache_bytes = 0;
+    if (e->model.ngram.cache) {
+        ds4_ngram_cache_stats ps;
+        ds4_ngram_cache_stats_get(e->model.ngram.cache, &ps);
+        ple_cache_bytes = ps.bytes;
+        total = ds4_add_sat_u64(total, ple_cache_bytes);
+    }
 
     const bool color = ds4_log_is_tty(stderr);
     const char *green = color ? "\x1b[32m" : "";
@@ -41807,6 +41823,9 @@ static void ds4_engine_print_startup_memory(
         fprintf(stderr,
                 " + prefill expert reserve %.2f GiB",
                 ds4_bytes_to_gib(expert_reserved_bytes));
+    }
+    if (ple_cache_bytes != 0) {
+        fprintf(stderr, " + PLE cache %.2f GiB", ds4_bytes_to_gib(ple_cache_bytes));
     }
     fprintf(stderr,
             " = %s%.2f GiB planned%s\n",
@@ -66174,7 +66193,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
     if (ds4_model_is_qwen() && DS4_PLE_LAYER != UINT32_MAX) {
-        qwen_ngram_open(&e->model, opt->model_path);
+        qwen_ngram_open(&e->model, opt->model_path, opt->ple_cache_mb);
     }
     if (opt->vision_path && opt->vision_path[0]) {
         const bool qwen_vision = ds4_model_is_qwen() && ds4_qwen_has_hc();
@@ -67158,7 +67177,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
 void ds4_engine_summary(ds4_engine *e) {
     model_summary(&e->model);
     const ds4_ngram_table *ng = &e->model.ngram;
-    if (ng->map) {
+    if (ng->cache) {
         printf("ple table: layer=%u rows=%" PRIu64 " row_bytes=%u heads=%u ngram=%u scale=%g (%.2f GiB)\n",
                DS4_PLE_LAYER, ng->rows, ng->row_bytes, ng->n_head, ng->n_mult, ng->scale,
                (double)ng->size / 1073741824.0);
@@ -70308,6 +70327,7 @@ static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, ch
      * appended as f32 rows, the same layout as the CPU reference's dump. */
     const char *dump_path = getenv("DS4_QWEN_DUMP_LOGITS");
     FILE *dump = dump_path && dump_path[0] ? fopen(dump_path, "ab") : NULL;
+    qwen_graph_ple_prefetch(g, &e->model, prompt->v + start, (uint32_t)(prompt->len - start));
     for (int i = start; i < prompt->len;) {
         if (ds4_session_cancelled(s)) {
             if (dump) fclose(dump);

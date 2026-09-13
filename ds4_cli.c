@@ -2006,6 +2006,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.gen.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--ple-cache-mb")) {
+            c.engine.ple_cache_mb = (uint64_t)parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--temp")) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
             c.gen.temperature_set = true;

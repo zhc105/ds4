@@ -170,6 +170,8 @@ typedef struct {
     bool share_session_prefill_workspace;
     /* Cap on the Qwen K/V page pool shared by every session (0: none). */
     uint64_t kv_pool_mb;
+    /* Qwen PLE n-gram row cache size (0: the default 4096). */
+    uint64_t ple_cache_mb;
     bool first_token_test;
     bool metal_graph_test;
     bool load_slice;
