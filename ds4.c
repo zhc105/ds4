@@ -70558,10 +70558,14 @@ static int ds4_sessions_eval_batch_qwen(ds4_decode_item *items, int count, char 
  * kept row, and s->logits is that row's distribution for the loop's next
  * sample.  The drafter then re-reads the committed rows with the target's
  * streams (its own drafts' streams are only approximations) and keeps the
- * last row pending.  Returns the number of committed tokens, or -1. */
+ * last row pending.  A draft equal to eos_token ends the acceptance before
+ * itself: the session then stops short of the end-of-turn token exactly as
+ * it does when the loop samples that token (which it never feeds), so a
+ * continuation always finds the live tokens ending at the answer's last
+ * visible token.  Returns the number of committed tokens, or -1. */
 static int qwen_session_spec_cycle(
-        ds4_session *s, int first_token, float temperature, int top_k, float top_p, float min_p, uint64_t *rng,
-        int *accepted, int cap, char *err, size_t errlen) {
+        ds4_session *s, int first_token, int eos_token, float temperature, int top_k, float top_p, float min_p,
+        uint64_t *rng, int *accepted, int cap, char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     const bool sampling = temperature > 0.0f && rng != NULL;
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
@@ -70638,6 +70642,12 @@ static int qwen_session_spec_cycle(
             if (best != d) break;
         }
         a++;
+    }
+    for (int i = 1; i <= a; i++) {   /* the loop samples the end token from row i - 1 and stops */
+        if (toks[i] != eos_token) continue;
+        a = i - 1;
+        replacement = -1;
+        break;
     }
     memcpy(s->logits, s->qwen_mtp_rows + (uint64_t)a * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
     if (replacement >= 0) {
@@ -78366,8 +78376,8 @@ static int ds4_session_eval_speculative_argmax_impl(
     }
 #ifdef DS4_QWEN_GPU
     if (ds4_model_is_qwen() && s->qwen_graph.mtp && accepted) {
-        return qwen_session_spec_cycle(s, first_token, 0.0f, 0, 1.0f, 0.0f, NULL, accepted,
-                                       accepted_cap < max_tokens ? accepted_cap : max_tokens, err, errlen);
+        return qwen_session_spec_cycle(s, first_token, ignore_eos ? -1 : eos_token, 0.0f, 0, 1.0f, 0.0f, NULL,
+                                       accepted, accepted_cap < max_tokens ? accepted_cap : max_tokens, err, errlen);
     }
 #endif
     if (ds4_session_is_glm(s)) {
@@ -79183,7 +79193,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     ds4_engine *e = s->engine;
 #ifdef DS4_QWEN_GPU
     if (ds4_model_is_qwen() && s->qwen_graph.mtp) {
-        return qwen_session_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng, accepted,
+        return qwen_session_spec_cycle(s, first_token, eos_token, temperature, top_k, top_p, min_p, rng, accepted,
                                        accepted_cap < max_tokens ? accepted_cap : max_tokens, err, errlen);
     }
 #endif
@@ -79295,10 +79305,12 @@ void ds4_session_invalidate(ds4_session *s) {
 #endif
 }
 
-int ds4_session_resume_pos(ds4_session *s, const ds4_tokens *prompt) {
-    if (!s || !prompt) return 0;
+int ds4_session_resume_pos(ds4_session *s, const ds4_tokens *prompt,
+                           const ds4_vision_span *images, size_t image_count) {
+    if (!s || !prompt || (image_count != 0 && !images)) return 0;
     const int live = s->checkpoint_valid ? s->checkpoint.len : 0;
-    if (live > 0 && prompt->len >= live && ds4_tokens_starts_with(prompt, &s->checkpoint)) return live;
+    if (live > 0 && prompt->len >= live && ds4_tokens_starts_with(prompt, &s->checkpoint) &&
+        ds4_session_vision_prefix_matches(s, images, image_count)) return live;
 #ifdef DS4_QWEN_GPU
     if (ds4_model_is_qwen() && !ds4_session_is_cpu(s)) {
         /* the copies a sync would restore (qwen_session_state_restore) */
@@ -79306,7 +79318,7 @@ int ds4_session_resume_pos(ds4_session *s, const ds4_tokens *prompt) {
         for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
             const qwen_state_copy *c = &s->qwen_states[i];
             if (c->tokens.len > best &&
-                qwen_state_copy_resumes(s, c, prompt, s->sync_images, s->sync_image_count)) {
+                qwen_state_copy_resumes(s, c, prompt, images, image_count)) {
                 best = c->tokens.len;
             }
         }

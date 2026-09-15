@@ -5,14 +5,30 @@ live or saved state instead of prefilling the story again, and the image
 turns must see the pictures.  Reasoning is replayed as agents do; pass
 --no-think to send reasoning_effort none, which makes the replay text equal
 to the live text (the memory-text path instead of thinking-visible).
+The cached count a response reports is what the engine reused; with the
+server log given, a prefill piece reporting no progress or a warning that
+the engine resumed short of the cache's claim fails the test too.
 
-usage: qwen_vision_cache_test.py http://HOST:8000 STORY.txt [--no-think]
+usage: qwen_vision_cache_test.py http://HOST:8000 STORY.txt [SERVER.log] [--no-think]
 """
-import base64, json, os, struct, sys, time, urllib.request, zlib
+import base64, json, os, re, struct, sys, time, urllib.request, zlib
 
 NO_THINK = "--no-think" in sys.argv
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 URL, STORY = args[0].rstrip("/") + "/v1/chat/completions", args[1]
+LOG = args[2] if len(args) > 2 else None
+
+
+def log_lines(mark):
+    return open(LOG, errors="replace").read().splitlines()[mark:] if LOG else []
+
+
+def log_check(mark, tag):
+    lines = log_lines(mark)
+    zero = [l for l in lines if "prefill chunk 0/" in l]
+    errs = [l for l in lines if re.search(r"engine resumes at|prefill failed|rejected |cancelled during prefill", l)]
+    check(len(zero) <= 1, f"{tag}: {len(zero)} prefill pieces from the start: the history was recomputed")
+    check(not errs, f"{tag}: the server logged " + (errs[0][errs[0].find("ds4-server"):][:140] if errs else ""))
 
 def png(rgb):
     """A 256x256 solid-colour PNG as a data URI."""
@@ -30,7 +46,7 @@ def ask(messages, tag, expect=None):
     body = {"model": "qwen3.8-flash-next", "messages": messages, "max_tokens": 60, "temperature": 0}
     if NO_THINK:
         body["reasoning_effort"] = "none"
-    t = time.time()
+    mark, t = len(log_lines(0)), time.time()
     r = urllib.request.urlopen(urllib.request.Request(URL, json.dumps(body).encode(), {"Content-Type": "application/json"}))
     j = json.loads(r.read())
     u = j["usage"]
@@ -41,6 +57,7 @@ def ask(messages, tag, expect=None):
     if expect and expect.lower() not in text.lower():
         print(f"  FAIL: expected {expect!r} in the answer", flush=True)
         globals()["fails"] += 1
+    log_check(mark, tag)
     reply = {"role": "assistant", "content": text}
     if m.get("reasoning_content"):
         reply["reasoning_content"] = m["reasoning_content"]

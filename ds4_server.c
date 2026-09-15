@@ -633,6 +633,86 @@ static bool server_image_inputs_push_data_uri(
     return false;
 }
 
+/* The vision tower's output for the pictures an agent replays every turn.
+ * The K/V of a picture's tokens live in the state, but every request
+ * carries the picture's embedding, and encoding a screenshot takes
+ * seconds: so the last few embeddings are kept by the marker that names
+ * their bytes, and a request that repeats a picture copies its embedding
+ * instead of encoding it again.  Bounded by bytes, a screenshot being tens
+ * of megabytes of rows. */
+#define VISION_CACHE_BYTES ((size_t)512 << 20)
+
+typedef struct {
+    char marker[SERVER_IMAGE_MARKER_BYTES];
+    ds4_vision_embedding embedding;
+    uint64_t used;                  /* the tick of its last use */
+} vision_cache_entry;
+
+static struct {
+    pthread_mutex_t mu;
+    vision_cache_entry *v;
+    size_t len, cap;
+    size_t bytes, budget;
+    uint64_t tick;
+} g_vision_cache = { PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0, 0, VISION_CACHE_BYTES, 0 };
+
+static size_t vision_embedding_bytes(const ds4_vision_embedding *e) {
+    return (size_t)e->token_count * e->dim * sizeof(float);
+}
+
+static void vision_embedding_copy(ds4_vision_embedding *dst, const ds4_vision_embedding *src) {
+    *dst = *src;
+    dst->data = xmalloc(vision_embedding_bytes(src));
+    memcpy(dst->data, src->data, vision_embedding_bytes(src));
+}
+
+static vision_cache_entry *vision_cache_find(const char *marker) {
+    for (size_t i = 0; i < g_vision_cache.len; i++)
+        if (!strcmp(g_vision_cache.v[i].marker, marker)) return &g_vision_cache.v[i];
+    return NULL;
+}
+
+/* A copy of the embedding of the picture `marker` names, when cached. */
+static bool vision_cache_get(const char *marker, ds4_vision_embedding *out) {
+    pthread_mutex_lock(&g_vision_cache.mu);
+    vision_cache_entry *e = vision_cache_find(marker);
+    if (e) {
+        e->used = ++g_vision_cache.tick;
+        vision_embedding_copy(out, &e->embedding);
+    }
+    pthread_mutex_unlock(&g_vision_cache.mu);
+    return e != NULL;
+}
+
+static void vision_cache_put(const char *marker, const ds4_vision_embedding *embedding) {
+    const size_t bytes = vision_embedding_bytes(embedding);
+    if (bytes > g_vision_cache.budget) return;
+    pthread_mutex_lock(&g_vision_cache.mu);
+    if (vision_cache_find(marker)) {    /* two requests encoded it at once */
+        pthread_mutex_unlock(&g_vision_cache.mu);
+        return;
+    }
+    while (g_vision_cache.len && g_vision_cache.bytes + bytes > g_vision_cache.budget) {
+        size_t oldest = 0;
+        for (size_t i = 1; i < g_vision_cache.len; i++)
+            if (g_vision_cache.v[i].used < g_vision_cache.v[oldest].used) oldest = i;
+        g_vision_cache.bytes -= vision_embedding_bytes(&g_vision_cache.v[oldest].embedding);
+        ds4_vision_embedding_free(&g_vision_cache.v[oldest].embedding);
+        g_vision_cache.v[oldest] = g_vision_cache.v[--g_vision_cache.len];
+    }
+    if (g_vision_cache.len == g_vision_cache.cap) {
+        g_vision_cache.cap = g_vision_cache.cap ? g_vision_cache.cap * 2 : 4;
+        g_vision_cache.v = xrealloc(g_vision_cache.v,
+                                    g_vision_cache.cap * sizeof(*g_vision_cache.v));
+    }
+    vision_cache_entry *e = &g_vision_cache.v[g_vision_cache.len++];
+    snprintf(e->marker, sizeof(e->marker), "%s", marker);
+    vision_embedding_copy(&e->embedding, embedding);
+    e->used = ++g_vision_cache.tick;
+    g_vision_cache.bytes += bytes;
+    pthread_mutex_unlock(&g_vision_cache.mu);
+}
+
 static void append_owned_text(char **dst, const char *text) {
     buf b = {0};
     buf_puts(&b, *dst ? *dst : "");
@@ -3597,16 +3677,15 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
     }
 
     bool ok = true;
-    server_inference_lock(s);
-    for (size_t i = 0; i < count; i++) {
-        if (!ds4_engine_vision_encode_memory(e, inputs[i]->encoded,
+    for (size_t i = 0; ok && i < count; i++) {
+        if (vision_cache_get(inputs[i]->marker, &embeddings[i])) continue;
+        server_inference_lock(s);
+        ok = ds4_engine_vision_encode_memory(e, inputs[i]->encoded,
                                              inputs[i]->encoded_len,
-                                             &embeddings[i], err, errlen)) {
-            ok = false;
-            break;
-        }
+                                             &embeddings[i], err, errlen);
+        server_inference_unlock(s);
+        if (ok) vision_cache_put(inputs[i]->marker, &embeddings[i]);
     }
-    server_inference_unlock(s);
     if (!ok) goto done;
 
     r->images = xmalloc(count * sizeof(r->images[0]));
@@ -4716,9 +4795,12 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                     goto item_fail;
                 }
             } else if (!strcmp(key, "output")) {
+                /* A tool output array may carry input_image blocks: Codex's
+                 * view_image tool returns the picture this way. */
                 json_ws(p);
                 if (**p == '[') {
-                    if (!parse_responses_content_array_replace(p, &output)) {
+                    if (!parse_responses_content_array_multimodal(
+                            p, &output, &content_images)) {
                         free(key);
                         goto item_fail;
                     }
@@ -4854,7 +4936,11 @@ item_fail:
             buf_free(&pending_reasoning);
             return false;
         }
-        if (content_images.len &&
+        /* Images arrive in user messages and in tool outputs (an agent's file
+         * reader returning a picture); the model sees both as user input. */
+        bool is_tool_output = !strcmp(t, "function_call_output") ||
+                              !strcmp(t, "custom_tool_call_output");
+        if (content_images.len && !is_tool_output &&
             (strcmp(t, "message") || (role && strcmp(role, "user")))) {
             free(type);
             free(role);
@@ -4948,11 +5034,13 @@ item_fail:
                 tool_calls_push(&msg.calls, tc);
                 chat_msgs_push(msgs, msg);
             }
-        } else if (!strcmp(t, "function_call_output") || !strcmp(t, "custom_tool_call_output")) {
+        } else if (is_tool_output) {
             chat_msg msg = {0};
             msg.role = xstrdup("tool");
             msg.content = output ? output : xstrdup("");
             output = NULL;
+            msg.images = content_images;
+            memset(&content_images, 0, sizeof(content_images));
             if (call_id || item_id) {
                 chat_msg_add_tool_call_id(&msg, call_id ? call_id : item_id);
             }
@@ -11255,6 +11343,20 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
  * changed.  The request's image spans then describe the effective prompt:
  * the state's pictures where its tokens hold them, the new ones after the
  * shift. */
+/* The pictures a state holds sit where the state has them: a request
+ * continued from that state must describe them there, not where its own
+ * rendering of the history put them (a replay without the hidden reasoning
+ * renders the turns before them shorter).  Every continuation built on a
+ * state's tokens goes through here; the engine rejects a span that does
+ * not cover placeholder tokens. */
+static bool request_images_follow_state(request *req,
+                                        const ds4_vision_identity *ids, size_t n_ids) {
+    if (!ds4_vision_identities_prefix(ids, n_ids, req->images, req->image_count))
+        return false;
+    for (size_t i = 0; i < n_ids; i++) req->images[i].token_start = ids[i].token_start;
+    return true;
+}
+
 static bool build_prompt_after_state(server *s, request *req,
                                      const ds4_vision_identity *ids, size_t n_ids,
                                      const ds4_tokens *tokens, size_t offset,
@@ -11262,7 +11364,7 @@ static bool build_prompt_after_state(server *s, request *req,
     const request_image_place *next =
         n_ids < req->image_count ? &req->image_places[n_ids] : NULL;
     if (next && next->text_start < offset) return false;
-    for (size_t i = 0; i < n_ids; i++) req->images[i].token_start = ids[i].token_start;
+    if (!request_images_follow_state(req, ids, n_ids)) return false;
     if (!next) {
         build_prompt_from_exact_prefix_and_text_suffix(
             s->engine, tokens, req->prompt_text + offset, out);
@@ -11286,6 +11388,24 @@ static void append_tokens_text(buf *b, ds4_engine *engine,
     char *text = render_tokens_text(engine, &span, &len);
     buf_append(b, text, len);
     free(text);
+}
+
+/* `text` as a client that never saw the reasoning replays it: every closed
+ * <think> block emptied, the way append_qwen_turns renders a turn whose
+ * reasoning is absent.  An open block at the end (the assistant prefix
+ * the state stops at) is kept. */
+static void qwen_visible_text(buf *out, const char *text, size_t len) {
+    static const char open[] = "<think>\n", close[] = "\n</think>";
+    const char *p = text, *end = text + len;
+    while (p < end) {
+        const char *think = memmem(p, (size_t)(end - p), open, sizeof(open) - 1);
+        const char *after = think ? think + sizeof(open) - 1 : NULL;
+        const char *shut = after ? memmem(after, (size_t)(end - after), close, sizeof(close) - 1) : NULL;
+        if (!shut) break;
+        buf_append(out, p, (size_t)(after - p));
+        p = shut;
+    }
+    buf_append(out, p, (size_t)(end - p));
 }
 
 /* Continue a state (the live history or a saved one) from its own text.
@@ -11321,9 +11441,20 @@ static int state_text_prefix_prompt(server *s, request *req,
         cursor = end;
     }
     append_tokens_text(&text, s->engine, tokens, cursor, tokens->len);
-    const bool ok = byte_prefix_match(req->prompt_text, strlen(req->prompt_text),
-                                      text.ptr, text.len);
-    const size_t offset = text.len;
+    const size_t prompt_len = strlen(req->prompt_text);
+    bool ok = byte_prefix_match(req->prompt_text, prompt_len, text.ptr, text.len);
+    size_t offset = text.len;
+    if (!ok && req->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        /* A replay carries no reasoning the client never received (Codex),
+         * and the template renders such turns with an empty think block:
+         * the state's text reads the same once its reasoning is dropped,
+         * and the state's tokens, reasoning included, then stand for it. */
+        buf visible = {0};
+        qwen_visible_text(&visible, text.ptr, text.len);
+        ok = byte_prefix_match(req->prompt_text, prompt_len, visible.ptr, visible.len);
+        offset = visible.len;
+        buf_free(&visible);
+    }
     buf_free(&text);
     if (!ok || !build_prompt_after_state(s, req, ids, n_ids, tokens, offset,
                                          effective_prompt)) {
@@ -11371,7 +11502,7 @@ static int saved_state_text_prefix_prompt(server *s, server_slot *slot,
  * protocol binding to the previous live assistant output.  Use it only when the
  * remembered live frontier and call-id set match exactly. */
 static int responses_live_continuation_prompt(server *s, server_slot *slot,
-                                              const request *req,
+                                              request *req,
                                               int live_pos,
                                               ds4_tokens *effective_prompt,
                                               int *matched_ids) {
@@ -11384,6 +11515,11 @@ static int responses_live_continuation_prompt(server *s, server_slot *slot,
 
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
+    /* The tail is tokenized as text: a picture in it would be lost, so a
+     * request adding one continues through its rendered text instead. */
+    size_t n_ids = 0;
+    const ds4_vision_identity *ids = ds4_session_vision_identities(slot->session, &n_ids);
+    if (n_ids != req->image_count || !request_images_follow_state(req, ids, n_ids)) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->responses_live_suffix_text,
@@ -11399,7 +11535,7 @@ static int responses_live_continuation_prompt(server *s, server_slot *slot,
  * local agent loop.  When the IDs and live token frontier match, continue from
  * the sampled DSML state and append only the user tool_result suffix. */
 static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
-                                              const request *req,
+                                              request *req,
                                               int live_pos,
                                               ds4_tokens *effective_prompt,
                                               int *matched_ids) {
@@ -11412,6 +11548,10 @@ static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
 
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
+    /* as for Responses: a picture in the tail continues through the text */
+    size_t n_ids = 0;
+    const ds4_vision_identity *ids = ds4_session_vision_identities(slot->session, &n_ids);
+    if (n_ids != req->image_count || !request_images_follow_state(req, ids, n_ids)) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->anthropic_live_suffix_text,
@@ -11434,7 +11574,7 @@ static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
  * then uses normal token/text/disk matching, which is the correct fallback for
  * cold starts, edits, restarts, or cross-client replays. */
 static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
-                                                const request *req,
+                                                request *req,
                                                 int live_pos,
                                                 ds4_tokens *effective_prompt) {
     if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
@@ -11451,15 +11591,27 @@ static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
                                 slot->responses_live.visible_text,
                                 slot->responses_live.visible_len);
     if (ok) visible_len = slot->responses_live.visible_len;
+    if (!ok && slot->responses_live.valid) {
+        /* why the remembered transcript does not begin this request */
+        const char *vt = slot->responses_live.visible_text ? slot->responses_live.visible_text : "";
+        size_t d = 0;
+        while (d < slot->responses_live.visible_len && d < prompt_len && vt[d] == req->prompt_text[d]) d++;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: responses visible key unmatched: live=%d remembered=%d visible=%zu prompt=%zu diverge=%zu key=%.64s | request=%.64s",
+                   live_pos, slot->responses_live.live_tokens, slot->responses_live.visible_len, prompt_len, d,
+                   vt + (d > 24 ? d - 24 : 0), req->prompt_text + (d > 24 ? d - 24 : 0));
+    }
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
-
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
-        effective_prompt);
+    size_t n_ids = 0;
+    const ds4_vision_identity *ids = ds4_session_vision_identities(slot->session, &n_ids);
+    if (!build_prompt_after_state(s, req, ids, n_ids, live_tokens, visible_len,
+                                  effective_prompt)) {
+        return 0;
+    }
     return live_tokens->len;
 }
 
@@ -12143,9 +12295,14 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
+/* An idle server feeds the engine its own prefill chunk: the expert GEMM
+ * reads every expert's weights once per piece, so a piece half the chunk
+ * costs a fifth more (measured 2048 vs 4096 on a GB10).  While a generation
+ * runs the piece shrinks to the mixed quantum so decode steps interleave. */
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    const int chunk = s->engine ? (int)ds4_engine_prefill_chunk(s->engine) : 0;   /* 0: the engine's default */
+    int quantum = generation_active ? s->mixed_prefill_quantum : chunk > 0 ? chunk : 4096;
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
@@ -12160,129 +12317,70 @@ static int server_prefill_quantum(server *s) {
     return server_prefill_quantum_for(s, generation_active);
 }
 
-/* Synchronize one resident slot without monopolizing the model executor.  A
- * non-matching prompt is first rebuilt to one quantum; a matching checkpoint
- * advances from its current frontier. Absolute positions remain session-local,
- * so compressor alignment is independent of scheduler order. */
+/* The end of the last picture a piece ending at `target` completes, and
+ * how many pictures that is: a piece never ends inside a picture, so the
+ * engine sees every picture whole, with its embedding. */
+static int server_piece_end(const ds4_vision_span *images, size_t image_count,
+                            int target, int prompt_len, size_t *piece_images) {
+    size_t n = 0;
+    for (size_t i = 0; i < image_count; i++) {
+        const uint64_t end = (uint64_t)images[i].token_start +
+                             images[i].embedding.token_count;
+        if ((uint64_t)target > images[i].token_start && (uint64_t)target < end)
+            target = end > (uint64_t)prompt_len ? prompt_len : (int)end;
+        if (end <= (uint64_t)target) n = i + 1;
+    }
+    *piece_images = n;
+    return target;
+}
+
+/* Synchronize one resident slot with a prompt, text or with pictures.  A
+ * batched server hands the prompt over in pieces so the other slots' decode
+ * steps can interleave (server_prefill_enter).  The first piece must reach
+ * past where the engine resumes from (the live frontier, or a saved
+ * turn-boundary state when the prompt edits the history), or the engine
+ * sees a prompt no saved state begins and recomputes everything from the
+ * start, one piece at a time.  Absolute positions remain session-local, so
+ * compressor alignment is independent of scheduler order. */
 static int server_session_sync(server *s, server_slot *slot,
                                const ds4_tokens *prompt,
+                               const ds4_vision_span *images, size_t image_count,
                                char *err, size_t errlen) {
-    if (!s || !slot || !prompt) return 1;
+    if (!s || !slot || !prompt || (image_count != 0 && !images)) return 1;
     if (!s->batched_mode) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
-        int rc = ds4_session_sync(slot->session, prompt, err, errlen);
+        int rc = image_count ?
+            ds4_session_sync_multimodal(slot->session, prompt, images, image_count,
+                                        err, errlen) :
+            ds4_session_sync(slot->session, prompt, err, errlen);
         server_prefill_leave(s);
         return rc;
     }
 
-    /* The first piece must reach past where the engine resumes from (the
-     * live frontier, or a saved turn-boundary state when the prompt edits
-     * the history), or the engine sees a prompt no saved state begins and
-     * recomputes everything from the start, one piece at a time. */
     pthread_mutex_lock(&s->inference_mu);
-    int done = ds4_session_resume_pos(slot->session, prompt);
+    int done = ds4_session_resume_pos(slot->session, prompt, images, image_count);
     pthread_mutex_unlock(&s->inference_mu);
     bool called = false;
 
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
-        int quantum = server_prefill_quantum(s);
-        int target = done + quantum;
+        int target = done + server_prefill_quantum(s);
         if (target > prompt->len || target < done) target = prompt->len;
         if (target <= 0) target = prompt->len;
+        size_t piece_images = 0;
+        target = server_piece_end(images, image_count, target, prompt->len,
+                                  &piece_images);
 
         ds4_tokens prefix = *prompt;
         prefix.len = target;
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         /* a piece short of the prompt is not a turn: the engine archives no state at its end */
         ds4_session_set_sync_partial(slot->session, target < prompt->len ? prompt : NULL);
-        int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
+        int rc = image_count ?
+            ds4_session_sync_multimodal(slot->session, &prefix, images, piece_images,
+                                        err, errlen) :
+            ds4_session_sync(slot->session, &prefix, err, errlen);
         ds4_session_set_sync_partial(slot->session, NULL);
-        if (rc == 0) done = ds4_session_pos(slot->session);
-        server_prefill_leave(s);
-        called = true;
-        if (rc != 0) return rc;
-        if (done >= prompt->len) return 0;
-        if (done < target) {
-            if (err && errlen) snprintf(err, errlen, "prefill made no progress");
-            return 1;
-        }
-    }
-    return (g_stop_requested || slot_job_cancelled(slot)) ?
-           DS4_SESSION_SYNC_INTERRUPTED : 0;
-}
-
-static int server_multimodal_resume_frontier(int live, int common,
-                                             int prompt_len,
-                                             bool image_state_matches) {
-    return common == live && prompt_len >= live && image_state_matches
-           ? live : 0;
-}
-
-static int server_multimodal_resume_pos(ds4_session *session,
-                                        const ds4_tokens *prompt,
-                                        const ds4_vision_span *images,
-                                        size_t image_count) {
-    if (!session || !prompt) return 0;
-    const int live = ds4_session_pos(session);
-    const int common = ds4_session_common_prefix(session, prompt);
-    return server_multimodal_resume_frontier(
-        live, common, prompt->len,
-        ds4_session_vision_prefix_matches(session, images, image_count));
-}
-
-static int server_session_sync_multimodal(server *s, server_slot *slot,
-                                          const ds4_tokens *prompt,
-                                          const ds4_vision_span *images,
-                                          size_t image_count,
-                                          char *err, size_t errlen) {
-    if (!image_count)
-        return server_session_sync(s, slot, prompt, err, errlen);
-    if (!s || !slot || !prompt || !images) return 1;
-    if (!s->batched_mode) {
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
-        int rc = ds4_session_sync_multimodal(slot->session, prompt,
-                                             images, image_count,
-                                             err, errlen);
-        server_prefill_leave(s);
-        return rc;
-    }
-
-    /* Start at the exact live frontier when both tokens and image identities
-     * match. Starting at zero made the first scheduling slice truncate a
-     * perfectly reusable long checkpoint, forcing a complete refill. */
-    pthread_mutex_lock(&s->inference_mu);
-    int done = server_multimodal_resume_pos(slot->session, prompt,
-                                            images, image_count);
-    pthread_mutex_unlock(&s->inference_mu);
-    bool called = false;
-    while (!g_stop_requested && !slot_job_cancelled(slot) &&
-           (!called || done < prompt->len)) {
-        int quantum = server_prefill_quantum(s);
-        int target = done + quantum;
-        if (target > prompt->len || target < done) target = prompt->len;
-        if (target <= 0) target = prompt->len;
-        for (size_t i = 0; i < image_count; i++) {
-            uint64_t end = (uint64_t)images[i].token_start +
-                           images[i].embedding.token_count;
-            if ((uint64_t)target > images[i].token_start &&
-                (uint64_t)target < end) {
-                target = end > (uint64_t)prompt->len ? prompt->len : (int)end;
-            }
-        }
-        size_t prefix_images = 0;
-        while (prefix_images < image_count) {
-            uint64_t end = (uint64_t)images[prefix_images].token_start +
-                           images[prefix_images].embedding.token_count;
-            if (end > (uint64_t)target) break;
-            prefix_images++;
-        }
-        ds4_tokens prefix = *prompt;
-        prefix.len = target;
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
-        int rc = ds4_session_sync_multimodal(slot->session, &prefix,
-                                             images, prefix_images,
-                                             err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
         server_prefill_leave(s);
         called = true;
@@ -12312,7 +12410,7 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
     ds4_tokens target = {0};
     build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
     const int before = ds4_session_pos(slot->session);
-    bool ok = server_session_sync(s, slot, &target, err, errlen) == 0;
+    bool ok = server_session_sync(s, slot, &target, NULL, 0, err, errlen) == 0;
     if (ok && tokens_appended) {
         int delta = ds4_session_pos(slot->session) - before;
         *tokens_appended = delta > 0 ? delta : 0;
@@ -12542,7 +12640,10 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     append_assistant_content_for_syntax(&suffix, syntax, content);
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL, content);
-    append_turn_end_for_syntax(&suffix, syntax);
+    /* No turn end: generation stops at the end-of-turn token without
+     * folding it into the session, so the next request's text from the end
+     * of this key on, which starts with that token, is what the live tokens
+     * still lack (render_qwen_live_tool_tail supplies it the same way). */
     return buf_take(&suffix);
 }
 
@@ -12551,10 +12652,10 @@ static char *build_responses_visible_assistant_suffix(const request *r,
  * reasoning bytes, so the next request would miss the session cache even though
  * the visible conversation prefix is logically the same.
  *
- *   prompt-without-final-<think> + </think> + visible-content + eos
+ *   prompt-without-final-<think> + </think> + visible-content
  *
  * is exactly the visible prefix that render_chat_prompt_text() will produce on
- * the next turn.  Do not rebuild the KV cache to erase hidden reasoning here:
+ * the next turn, up to the end-of-turn token the live tokens stop before.  Do not rebuild the KV cache to erase hidden reasoning here:
  * that caused long post-answer pauses and threw away useful sampled state.
  * Instead, remember the visible bytes as a key for the current sampled frontier.
  * The next request can then continue from live KV while tokenizing only the new
@@ -12583,8 +12684,8 @@ static char *build_toolless_thinking_visible_text(const request *r,
         buf_puts(&visible, "</think>");
     }
     append_assistant_content_for_syntax(&visible, r->model_syntax, content);
-    append_turn_end_for_syntax(&visible, qwen ? SERVER_MODEL_SYNTAX_QWEN :
-                                               SERVER_MODEL_SYNTAX_DEEPSEEK);
+    /* no turn end: the live tokens stop before it (see
+     * build_responses_visible_assistant_suffix) */
     return buf_take(&visible);
 }
 
@@ -12751,7 +12852,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(slot->session, server_progress_cb, &rebuild_progress);
         ds4_session_set_display_progress(slot->session, server_progress_cb, &rebuild_progress);
-        if (server_session_sync(s, slot, sync_prompt,
+        if (server_session_sync(s, slot, sync_prompt, NULL, 0,
                                 sync_err, sizeof(sync_err)) == 0) {
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
@@ -13066,6 +13167,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const bool live_vision_match =
         ds4_session_vision_state_matches(slot->session,
                                          j->req.images, j->req.image_count);
+    /* The continuations built on the live tokens take a request that adds
+     * pictures after the live frontier (a tool returning one): the state's
+     * pictures need only be the request's first ones. */
+    const bool live_vision_prefix =
+        ds4_session_vision_prefix_matches(slot->session,
+                                          j->req.images, j->req.image_count);
     pthread_mutex_unlock(&s->inference_mu);
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
@@ -13085,7 +13192,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = live_vision_match ?
+    int cached = live_vision_prefix ?
         responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
                                               &effective_prompt) : 0;
     const char *cache_source = cached > 0 ? "responses-visible" : "none";
@@ -13098,7 +13205,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             responses_live_match_ids = j->req.responses_live_call_ids.len;
         }
     }
-    if (cached == 0 && live_vision_match) {
+    if (cached == 0 && live_vision_prefix) {
         cached = responses_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &responses_live_match_ids);
@@ -13108,7 +13215,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (cached > 0) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
-    } else if (live_vision_match) {
+    } else if (live_vision_prefix) {
         cached = anthropic_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &anthropic_live_match_ids);
@@ -13245,11 +13352,25 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         j->req.responses_requires_live_reasoning &&
         !responses_reasoning_state_preserved;
     const int prompt_tokens = prompt_for_sync->len;
+    /* The usage a client sees reports what the engine reuses, not what the
+     * matching above claims: the two agree when the effective prompt and
+     * its image spans describe the state the engine holds, and a request
+     * that makes them disagree recomputes its history, which the log says
+     * so a live test can fail on it. */
+    pthread_mutex_lock(&s->inference_mu);
+    const int resumed = ds4_session_resume_pos(slot->session, prompt_for_sync,
+                                               j->req.images, j->req.image_count);
+    pthread_mutex_unlock(&s->inference_mu);
+    if (resumed < cached) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: cache source %s claims %d tokens but the engine resumes at %d",
+                   cache_source, cached, resumed);
+    }
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by ds4_session_sync() is written into
      * the live KV cache and can be reused by the next request. */
-    j->req.cache_read_tokens = cached;
-    j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
+    j->req.cache_read_tokens = resumed;
+    j->req.cache_write_tokens = prompt_tokens > resumed ? prompt_tokens - resumed : 0;
 
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
@@ -13351,7 +13472,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
+        if (server_session_sync(s, slot, &prefix, NULL, 0, err, sizeof(err)) != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
@@ -13381,11 +13502,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    int prompt_sync_rc = multimodal ?
-        server_session_sync_multimodal(s, slot, prompt_for_sync,
-                                       j->req.images, j->req.image_count,
-                                       err, sizeof(err)) :
-        server_session_sync(s, slot, prompt_for_sync, err, sizeof(err));
+    int prompt_sync_rc = server_session_sync(s, slot, prompt_for_sync,
+                                             j->req.images, j->req.image_count,
+                                             err, sizeof(err));
     if (prompt_sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
@@ -13396,9 +13515,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         free(disk_cache_path);
         if (job_cancelled(j)) {
             request_live_state_clear(s, slot);
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: chat ctx=%s%s%s cancelled during prefill",
+                       ctx_span, req_flags[0] ? " " : "", req_flags);
             trace_event(s, trace_id, "cancelled during prefill");
             return;
         }
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: chat ctx=%s%s%s prefill failed: %s",
+                   ctx_span, req_flags[0] ? " " : "", req_flags, err);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
@@ -14350,6 +14475,32 @@ static int job_required_slot_locked(server *s, const job *j) {
     return -1;
 }
 
+/* Whether the slot holds this request's live continuation: it remembers
+ * the tool calls the request answers, or a visible transcript (a Responses
+ * turn, or a tool-less thinking answer) that begins the request's text at
+ * its current frontier.  Called under tool_mu. */
+static bool slot_continues_request(const server_slot *slot, const request *r) {
+    const size_t len = r->prompt_text ? strlen(r->prompt_text) : 0;
+    const int live = ds4_session_pos(slot->session);
+    const live_tool_state *rl = &slot->responses_live;
+    const visible_live_state *tl = &slot->thinking_live;
+    if (r->api == API_RESPONSES && rl->valid && rl->live_tokens == live) {
+        if (r->responses_live_call_ids.len &&
+            live_state_contains_all(rl, &r->responses_live_call_ids)) return true;
+        if (rl->visible_text && rl->visible_len < len &&
+            byte_prefix_match(r->prompt_text, len, rl->visible_text, rl->visible_len)) return true;
+    }
+    if (r->api == API_ANTHROPIC && r->anthropic_live_call_ids.len &&
+        live_state_contains_all(&slot->anthropic_live, &r->anthropic_live_call_ids)) return true;
+    return tl->valid && tl->live_tokens == live && tl->visible_text && tl->visible_len < len &&
+           byte_prefix_match(r->prompt_text, len, tl->visible_text, tl->visible_len);
+}
+
+/* The slot a job should run on: its required one, else one holding its
+ * live continuation, else the longest token prefix.  Tokens alone mislead:
+ * the live tokens hold hidden reasoning the request does not replay, so
+ * two conversations sharing a system prompt look alike by tokens and a
+ * request could land on a slot holding another branch of its history. */
 static int job_slot_score(server *s, server_slot *slot, const job *j,
                           int required_slot) {
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
@@ -14360,8 +14511,8 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
                                            j->req.images, j->req.image_count)) {
         return -1;
     }
-    int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    return common;
+    if (slot_continues_request(slot, &j->req)) return INT_MAX - 1;
+    return ds4_session_common_prefix(slot->session, &j->req.prompt);
 }
 
 static void dispatch_jobs_locked(server *s) {
@@ -14809,7 +14960,12 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    if (ok) {
+        req.raw_body = xstrndup(hr.body, hr.body_len);
+    } else {
+        server_log(DS4_LOG_WARNING, "ds4-server: rejected %s %s (%zu bytes): %s",
+                   hr.method, hr.path, hr.body_len, err);
+    }
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
@@ -15675,17 +15831,10 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(custom.mixed_prefill_quantum == 2048);
 
     server s = {.mixed_prefill_quantum = custom.mixed_prefill_quantum};
-    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 2048);
+    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 4096);   /* the engine's chunk; its default without one */
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
-}
-
-static void test_multimodal_prefill_resume_frontier(void) {
-    TEST_ASSERT(server_multimodal_resume_frontier(160, 160, 170, true) == 160);
-    TEST_ASSERT(server_multimodal_resume_frontier(160, 159, 170, true) == 0);
-    TEST_ASSERT(server_multimodal_resume_frontier(160, 160, 159, true) == 0);
-    TEST_ASSERT(server_multimodal_resume_frontier(160, 160, 170, false) == 0);
 }
 
 static void test_batched_live_continuation_slot_binding(void) {
@@ -20685,7 +20834,6 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     buf_append(&canonical, prompt_text, pt_len - 7);  /* strip <think> */
     buf_puts(&canonical, "</think>");
     buf_puts(&canonical, content);
-    buf_puts(&canonical, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
 
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -20698,8 +20846,8 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     request_free(&r);
 
     /* Now build what the NEXT request would render: history includes this
-     * assistant message, plus a new user message.  Extract just the prefix
-     * up to and including the eos of the assistant turn. */
+     * assistant message, plus a new user message.  It begins with the key;
+     * the turn end that follows is tokenized as part of the suffix. */
     chat_msgs history_msgs = {0};
     chat_msg h_user1 = {0};
     h_user1.role = xstrdup("user");
@@ -20742,7 +20890,8 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
 static void test_thinking_canonical_empty_content(void) {
     /* Edge case: model thinks but produces empty content (e.g. tool-less
      * thinking where answer is entirely in reasoning).  Canonical should
-     * still be valid: prompt_text[:-7] + "</think><|eos|>" */
+     * still be valid: prompt_text[:-7] + "</think>", the turn end left to
+     * the next request's text. */
     chat_msgs msgs = {0};
     chat_msg user = {0};
     user.role = xstrdup("user");
@@ -20757,7 +20906,6 @@ static void test_thinking_canonical_empty_content(void) {
     buf_append(&canonical, prompt_text, pt_len - 7);
     buf_puts(&canonical, "</think>");
     /* empty content */
-    buf_puts(&canonical, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
 
     /* Future prompt with empty content assistant message */
     chat_msgs history = {0};
@@ -20823,7 +20971,6 @@ static void test_thinking_canonical_multi_turn(void) {
     buf_append(&canonical, prompt_text, pt_len - 7);
     buf_puts(&canonical, "</think>");
     buf_puts(&canonical, content2);
-    buf_puts(&canonical, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
 
     /* Future: 3rd user message arrives */
     chat_msgs future_msgs = {0};
@@ -21028,10 +21175,79 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
+/* Codex's view_image tool returns the picture as an input_image block inside
+ * function_call_output.output; the tool message keeps the image and marks its
+ * place in the text, like tool results on the other two APIs. */
+static void test_responses_tool_output_image_content(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"view_image\","
+        "\"arguments\":\"{\\\"path\\\":\\\"x.png\\\"}\"},"
+        "{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":["
+        "{\"type\":\"input_text\",\"text\":\"attached \"},"
+        "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    buf loaded = {0};
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_responses_input(&p, &msgs, &loaded, &orders));
+    TEST_ASSERT(msgs.len == 2 && !strcmp(msgs.v[1].role, "tool"));
+    TEST_ASSERT(msgs.v[1].images.len == 1);
+    TEST_ASSERT(strstr(msgs.v[1].content, "attached ") == msgs.v[1].content);
+    TEST_ASSERT(strstr(msgs.v[1].content, msgs.v[1].images.v[0].marker) != NULL);
+    buf_free(&loaded);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+}
+
+/* Repeated pictures come from the embedding cache: a copy of their rows,
+ * the least recently used evicted when the byte budget is exceeded. */
+static void test_vision_cache_keeps_recent_embeddings(void) {
+    float rows[4][4] = {{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}};
+    ds4_vision_embedding e = { .data = NULL, .token_count = 1, .dim = 4 };
+    const size_t budget = g_vision_cache.budget;
+    g_vision_cache.budget = 2 * sizeof(rows[0]);
+    e.data = rows[0]; vision_cache_put("a", &e);
+    e.data = rows[1]; vision_cache_put("b", &e);
+    ds4_vision_embedding got = {0};
+    TEST_ASSERT(vision_cache_get("a", &got) && got.data != rows[0] && got.data[3] == 4);
+    got.data[3] = 0;                                    /* the caller owns its copy */
+    ds4_vision_embedding_free(&got);
+    e.data = rows[2]; vision_cache_put("c", &e);        /* over budget: b goes, a was used */
+    TEST_ASSERT(!vision_cache_get("b", &got));
+    TEST_ASSERT(vision_cache_get("a", &got) && got.data[3] == 4);
+    ds4_vision_embedding_free(&got);
+    TEST_ASSERT(vision_cache_get("c", &got) && got.data[0] == 9);
+    ds4_vision_embedding_free(&got);
+    e.data = rows[3]; vision_cache_put("c", &e);        /* already cached: kept as is */
+    TEST_ASSERT(vision_cache_get("c", &got) && got.data[0] == 9);
+    ds4_vision_embedding_free(&got);
+    g_vision_cache.budget = budget;
+}
+
+/* A state's text with its reasoning dropped reads like a replay that never
+ * had it; the open block of the assistant prefix at the end stays. */
+static void test_qwen_visible_text_empties_think_blocks(void) {
+    static const char live[] =
+        "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\nlet me see\n</think>\n\n"
+        "hello<|im_end|>\n<|im_start|>user\nmore<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    static const char replay[] =
+        "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        "hello<|im_end|>\n<|im_start|>user\nmore<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    buf visible = {0};
+    qwen_visible_text(&visible, live, sizeof(live) - 1);
+    TEST_ASSERT(visible.len == sizeof(replay) - 1 && !memcmp(visible.ptr, replay, visible.len));
+    buf_free(&visible);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_qwen_visible_text_empties_think_blocks();
+    test_vision_cache_keeps_recent_embeddings();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
-    test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
     test_request_steering_scales();
@@ -21124,6 +21340,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_inline_image_content();
     test_tool_result_image_content();
     test_responses_inline_image_content();
+    test_responses_tool_output_image_content();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
     test_stop_list_parses_all_sequences();

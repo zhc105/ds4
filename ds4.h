@@ -608,9 +608,12 @@ void ds4_engine_set_kv_reclaim(ds4_engine *e, ds4_kv_reclaim_fn fn, void *ud);
 void ds4_session_drop_kv(ds4_session *s);
 /* The position ds4_session_sync would resume `prompt` from without
  * recomputing: the live frontier when the prompt extends it, else the
- * longest saved state that begins it, else 0.  A caller feeding the
- * prompt in pieces must start its first piece past this. */
-int ds4_session_resume_pos(ds4_session *s, const ds4_tokens *prompt);
+ * longest saved state that begins it, else 0.  A state resumes only a
+ * prompt whose pictures are its own (the images the prompt carries, in
+ * order).  A caller feeding the prompt in pieces must start its first
+ * piece past this. */
+int ds4_session_resume_pos(ds4_session *s, const ds4_tokens *prompt,
+                           const ds4_vision_span *images, size_t image_count);
 /* A caller feeding a prompt in pieces names the whole prompt while syncing
  * all but the last piece (NULL otherwise): the engine then archives no
  * turn-boundary state at a piece's end (a piece is not a turn), so the
