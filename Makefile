@@ -509,6 +509,9 @@ tests/qwen_fp4_bench.o: tests/qwen_fp4_bench.c cuda/mmq/ds4_qwen_fp4.h
 tests/qwen_fp4_bench: tests/qwen_fp4_bench.o cuda/mmq/ds4_qwen_fp4.o cuda/mmq/ds4_ggml_stubs.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/qwen_cublas_bench: tests/qwen_cublas_bench.cu
+	$(NVCC) $(NVCCFLAGS) -o $@ $< $(CUDA_LDLIBS)
+
 tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 

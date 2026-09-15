@@ -2,8 +2,9 @@
  * the shapes a prefill chunk gives it: 512 experts, 10 per token, a chunk
  * of ROWS tokens, the gate/up projection (K 2560, M 640, per-token rows)
  * and the down projection (K 640, M 2560, per-slot rows).  Random routing,
- * random operands; the kernel's cost does not depend on the values.  Built
- * by `make tests/qwen_fp4_bench`. */
+ * random operands; the kernel's cost does not depend on the values.  A
+ * device-to-device memcpy goes first as the card's achievable streaming
+ * rate.  Built by `make tests/qwen_fp4_bench`. */
 #include "cuda/mmq/ds4_qwen_fp4.h"
 
 #include <cuda_runtime.h>
@@ -89,6 +90,25 @@ static int run(const char *name, int K, int M, int x_per_slot) {
     return 0;
 }
 
+static void memcpy_ref(void) {
+    const size_t n = 472u << 20;
+    void *a = dev_copy(NULL, n), *b = dev_copy(NULL, n);
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0); cudaEventCreate(&t1);
+    cudaMemcpy(b, a, n, cudaMemcpyDeviceToDevice);
+    cudaEventRecord(t0, 0);
+    for (int i = 0; i < 10; i++) cudaMemcpy(b, a, n, cudaMemcpyDeviceToDevice);
+    cudaEventRecord(t1, 0); cudaEventSynchronize(t1);
+    float ms = 0; cudaEventElapsedTime(&ms, t0, t1); ms /= 10;
+    printf("fp4-bench: d2d memcpy %.0f MB: %.3f ms  %.0f GB/s read+write\n", n / 1e6, ms, 2.0 * n / ms / 1e6);
+    struct cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    printf("fp4-bench: %s: %d SMs, L2 %d MB, smem/SM %zu KB, smem/block opt-in %zu KB\n", prop.name,
+           prop.multiProcessorCount, prop.l2CacheSize >> 20, prop.sharedMemPerMultiprocessor >> 10, prop.sharedMemPerBlockOptin >> 10);
+    cudaFree(a); cudaFree(b);
+}
+
 int main(void) {
+    memcpy_ref();
     return run("gate", 2560, 640, 0) || run("down", 640, 2560, 1);
 }

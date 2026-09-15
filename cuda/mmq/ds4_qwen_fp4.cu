@@ -14,7 +14,7 @@ namespace {
 constexpr int TILE_ROWS = DS4_QWEN_FP4_TILE_ROWS;   /* slots per tile, matches the expert plan */
 constexpr int NTHREADS = 256;                        /* 8 warps: 2 row groups of 32 x 4 column quarters */
 constexpr int MAX_EXPERT = 512;
-constexpr int NSTAGE = 3;                            /* K steps in flight, cp.async; a 4th costs the 2nd block per SM */
+constexpr int NSTAGE = 3;                            /* K steps in flight, cp.async; 4 to 6 measured no faster */
 
 /* The plan arrays, in the order ds4_gpu_qwen4exp_expert_plan writes them. */
 enum { PLAN_COUNT = 0, PLAN_START = 1, PLAN_TILE = 2 };
@@ -54,28 +54,16 @@ __global__ void quantize_kernel(const T *x, const T *up, block_nvfp4 *xq, int ro
     }
 }
 
-/* A row's 32 code bytes are staged as 8 words with the two 16-byte halves
- * swapped on rows 4-7 of every eight, so the eight row addresses of one
- * ldmatrix 8x8 matrix hit distinct bank groups without padding. */
-__device__ __forceinline__ uint32_t swz(uint32_t row, uint32_t word) {
-    return row * 8u + (((word >> 2u) ^ ((row >> 2u) & 1u)) << 2u) + (word & 3u);
-}
-
-__device__ __forceinline__ void ldsm_x4(uint32_t *r, const uint32_t *p) {
-    const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
-}
-
-__device__ __forceinline__ void ldsm_x2(uint32_t *r, const uint32_t *p) {
-    const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(a));
-}
-
-/* One 4-byte word global -> shared, asynchronous; `bytes` 0 zero-fills. */
-__device__ __forceinline__ void cp_async4(void *dst, const void *src, uint32_t bytes) {
+/* CB bytes (8 or 16) global -> shared, asynchronous; `bytes` 0 zero-fills. */
+template <uint32_t CB>
+__device__ __forceinline__ void cp_async(void *dst, const void *src, uint32_t bytes) {
     const uint32_t d = (uint32_t)__cvta_generic_to_shared(dst);
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" :: "r"(d), "l"(src), "r"(bytes));
+    if (CB == 16u) asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(d), "l"(src), "r"(bytes));
+    else asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" :: "r"(d), "l"(src), "r"(bytes));
+}
+
+__device__ __forceinline__ void prefetch_l2(const void *p) {
+    asm volatile("prefetch.global.L2 [%0];\n" :: "l"(p));
 }
 
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
@@ -98,39 +86,50 @@ __device__ __forceinline__ void mma_nvfp4(float c[4], const uint32_t a[4], const
 #endif
 }
 
-/* One K step of both operands in shared memory: codes for ldmatrix and the
- * packed scales beside them, KS super-blocks per row. */
-template <int KS, int COLS>
-struct moe_stage {
-    uint32_t a_qs[KS][TILE_ROWS * 8];
-    uint32_t b_qs[KS][COLS * 8];
-    uint32_t a_sc[KS][TILE_ROWS];
-    uint32_t b_sc[KS][COLS];
+/* One K step of an operand row in shared memory is its KS super-blocks as
+ * they lie in memory (4 scale bytes then 32 code bytes each), so the copy
+ * is CB-byte pieces of one contiguous segment.  The smem row stride keeps
+ * the eight rows one fragment load touches on distinct banks: 36 words
+ * for KS 4 (4 apart mod 32), 20 for KS 2 (its 18 padded). */
+template <int KS>
+struct moe_seg {
+    static_assert(KS == 2 || KS == 4, "row stride chosen for KS 2 and 4");
+    static constexpr uint32_t BYTES = KS * 36u;
+    static constexpr uint32_t CB = BYTES % 16u == 0u ? 16u : 8u;
+    static constexpr uint32_t STRIDE = KS == 2 ? 80u : BYTES;
 };
+
+template <int KS, int COLS>
+__host__ __device__ constexpr int stage_bytes() { return (TILE_ROWS + COLS) * (int)moe_seg<KS>::STRIDE; }
 
 /* Block (row tile, column tile), 32 x 8 threads: the row tile maps through
  * the plan to one expert and up to TILE_ROWS of its slots, the column tile
  * covers COLS outputs.  The FP4 MMA is nowhere near the limit here (a
- * chunk of a few thousand tokens gives every expert some tens of slots):
- * the kernel is bound by the latency of its operand loads, so NSTAGE K
- * steps are in flight at once, copied global -> shared by cp.async without
- * a register round trip.  A super-block is 4 scale bytes then 32 code
- * bytes, which rules out 16-byte copies into the ldmatrix layout, so every
- * word goes on its own; the tile's copies of one step still cover whole
- * segments, so they coalesce.  Warp w owns rows 32*(w/4).. as two m16
- * fragments and columns (COLS/4)*(w%4).. . */
+ * chunk of a few thousand tokens gives every expert some tens of slots);
+ * the kernel is bound by its operand loads.  Two things keep those near
+ * the DRAM rate.  The tile's weight rows are prefetched into L2 whole at
+ * the start: the K steps read each row in KS*36-byte pieces, and LPDDR
+ * serves 20 such passes over 128 strided rows at half the rate it serves
+ * the rows once in order (24 MB of L2 holds the tiles in flight).  Then
+ * NSTAGE steps are in flight at once, copied global -> shared by cp.async
+ * in 8- or 16-byte pieces of the rows' raw bytes, and the MMA fragments
+ * are gathered from that layout with 32-bit shared loads: the two
+ * operands share a 16-value scale block, so any fixed order of the values
+ * inside it is exact.  Warp w owns rows 32*(w/4).. as two m16 fragments
+ * and columns (COLS/4)*(w%4).. . */
 template <int KS, int COLS>
 __global__ void __launch_bounds__(NTHREADS, 2) moe_gemm_kernel(
         void *out, uint32_t out_bf16, const block_nvfp4 *W, const float *scales, const block_nvfp4 *xq, uint32_t x_per_slot,
         const int32_t *order, const uint32_t *plan, uint32_t n_expert, uint32_t n_used, uint32_t K, uint32_t M) {
-    constexpr uint32_t WPR = KS * 9u;                         /* 4-byte words per row segment */
-    constexpr uint32_t ITEMS = (TILE_ROWS + COLS) * WPR;      /* words copied per step */
+    typedef moe_seg<KS> seg;
+    constexpr uint32_t CPR = seg::BYTES / seg::CB;              /* copies per row segment */
+    constexpr uint32_t ITEMS = (TILE_ROWS + COLS) * CPR;        /* copies per step */
     constexpr int PER_THREAD = (int)((ITEMS + NTHREADS - 1) / NTHREADS);
-    constexpr int NT = COLS / 32;                             /* n-tiles per warp */
+    constexpr uint32_t SW = seg::STRIDE / 4u;                   /* smem row stride in words */
+    constexpr int NT = COLS / 32;                               /* n-tiles per warp */
     constexpr uint32_t NONE = 0xffffffffu;
-    typedef moe_stage<KS, COLS> stage_t;
     extern __shared__ __align__(16) uint32_t smem_raw[];
-    stage_t *stages = (stage_t *)smem_raw;
+    constexpr uint32_t STAGE_WORDS = (uint32_t)stage_bytes<KS, COLS>() / 4u;
     __shared__ int32_t slot_of[TILE_ROWS];
     __shared__ int32_t xrow_of[TILE_ROWS];
     __shared__ uint32_t tiles[MAX_EXPERT + 1];
@@ -164,53 +163,58 @@ __global__ void __launch_bounds__(NTHREADS, 2) moe_gemm_kernel(
     const uint32_t col0 = blockIdx.x * COLS;
     const uint32_t n_super = K / QK_NVFP4;
     const uint32_t n_steps = n_super / KS;
-    const uint32_t row_u4 = n_super * 9u;                     /* 4-byte words per operand row */
-    const uint32_t *xq4 = (const uint32_t *)xq;
-    const uint32_t *w4 = (const uint32_t *)(W + (size_t)e * M * n_super);
+    const uint32_t row_bytes = n_super * 36u;
+    const char *xb = (const char *)xq;
+    const char *wb = (const char *)(W + (size_t)e * M * n_super);
 
-    /* this thread's share of a step's words, as word offsets into the
+    /* the tile's weight rows into L2, whole */
+    {
+        const uint32_t lpr = (row_bytes + 127u) / 128u;
+        for (uint32_t i = tid; i < COLS * lpr; i += NTHREADS) {
+            const uint32_t r = col0 + i / lpr, l = (i % lpr) * 128u;
+            if (r < M && l < row_bytes) prefetch_l2(wb + (size_t)r * row_bytes + l);
+        }
+    }
+
+    /* this thread's share of a step's copies, as byte offsets into the
      * activation rows (A items) or the expert (B items); NONE copies zero */
     uint32_t src_off[PER_THREAD];
 #pragma unroll
     for (int p = 0; p < PER_THREAD; p++) {
         const uint32_t i = tid + NTHREADS * p;
-        const uint32_t r = i / WPR, w = i % WPR;
+        const uint32_t r = i / CPR, c = i % CPR;
         src_off[p] = NONE;
         if (i < ITEMS) {
             if (r < TILE_ROWS) {
                 const int32_t xr = xrow_of[r];
-                if (xr >= 0) src_off[p] = (uint32_t)xr * row_u4 + w;
+                if (xr >= 0) src_off[p] = (uint32_t)xr * row_bytes + c * seg::CB;
             } else if (col0 + r - TILE_ROWS < M) {
-                src_off[p] = (col0 + r - TILE_ROWS) * row_u4 + w;
+                src_off[p] = (col0 + r - TILE_ROWS) * row_bytes + c * seg::CB;
             }
         }
     }
-    auto issue = [&](uint32_t step) {   /* the step's words into stage step % NSTAGE */
-        stage_t &s = stages[step % NSTAGE];
+    auto issue = [&](uint32_t step) {   /* the step's segments into stage step % NSTAGE */
+        char *stage = (char *)(smem_raw + (step % NSTAGE) * STAGE_WORDS);
 #pragma unroll
         for (int p = 0; p < PER_THREAD; p++) {
             const uint32_t i = tid + NTHREADS * p;
             if (i >= ITEMS) continue;
-            const uint32_t r = i / WPR, w = i % WPR;
-            const uint32_t sb = w / 9u, k = w % 9u;
-            const bool is_a = r < TILE_ROWS;
-            const uint32_t rr = is_a ? r : r - TILE_ROWS;
-            uint32_t *dst = is_a ? (k == 0u ? &s.a_sc[sb][rr] : &s.a_qs[sb][swz(rr, k - 1u)])
-                                 : (k == 0u ? &s.b_sc[sb][rr] : &s.b_qs[sb][swz(rr, k - 1u)]);
+            const uint32_t r = i / CPR, c = i % CPR;
             const uint32_t off = src_off[p];
-            const uint32_t *src = (is_a ? xq4 : w4) + (off == NONE ? 0u : off + step * WPR);
-            cp_async4(dst, src, off == NONE ? 0u : 4u);
+            const char *src = (r < TILE_ROWS ? xb : wb) + (off == NONE ? 0u : off + step * seg::BYTES);
+            cp_async<seg::CB>(stage + r * seg::STRIDE + c * seg::CB, src, off == NONE ? 0u : seg::CB);
         }
         cp_async_commit();
     };
 
+    /* fragment words: register i of an m16 A fragment is code word
+     * (i/2)*4 + lane%4 of row lane/4 + (i%2)*8, of an n8 B fragment word
+     * i*4 + lane%4 of row lane/4; the scale word of a super-block is its
+     * first, the codes follow */
     const uint32_t wr = (warp >> 2u) * 32u;
     const uint32_t wc = (warp & 3u) * (COLS / 4u);
+    const uint32_t frow = lane / 4u, fword = 1u + (lane & 3u);
     const uint32_t tidx_a = lane / 4u + (lane % 2u) * 8u;   /* rows whose scales this lane supplies */
-    const uint32_t tidx_b = lane / 4u;
-    const uint32_t ar = (lane & 7u) + ((lane >> 3u) & 1u) * 8u;   /* ldmatrix row within a fragment */
-    const uint32_t ah = (lane >> 4u) * 4u;
-    const uint32_t bh = ((lane >> 3u) & 1u) * 4u;
     float C[2][NT][4];
 #pragma unroll
     for (int rf = 0; rf < 2; rf++) {
@@ -227,22 +231,24 @@ __global__ void __launch_bounds__(NTHREADS, 2) moe_gemm_kernel(
         cp_async_wait<NSTAGE - 2>();   /* this thread's copies of the step landed */
         __syncthreads();               /* everyone's did, and step - 1's stage is free */
         if (step + NSTAGE - 1 < n_steps) issue(step + NSTAGE - 1); else cp_async_commit();
-        const stage_t &s = stages[step % NSTAGE];
+        const uint32_t *sa_rows = smem_raw + (step % NSTAGE) * STAGE_WORDS;
+        const uint32_t *sb_rows = sa_rows + TILE_ROWS * SW;
 #pragma unroll
         for (int sb = 0; sb < KS; sb++) {
             uint32_t A[2][4];
             uint32_t sa[2];
 #pragma unroll
             for (int rf = 0; rf < 2; rf++) {
-                ldsm_x4(A[rf], &s.a_qs[sb][swz(wr + rf * 16u + ar, ah)]);
-                sa[rf] = s.a_sc[sb][wr + rf * 16u + tidx_a];
+                const uint32_t *row = sa_rows + (wr + rf * 16u + frow) * SW + sb * 9u;
+#pragma unroll
+                for (int i = 0; i < 4; i++) A[rf][i] = row[(i & 1) * 8u * SW + (i >> 1) * 4u + fword];
+                sa[rf] = sa_rows[(wr + rf * 16u + tidx_a) * SW + sb * 9u];
             }
 #pragma unroll
             for (int f = 0; f < NT; f++) {
-                uint32_t B[2];
-                const uint32_t n = wc + f * 8u + (lane & 7u);
-                ldsm_x2(B, &s.b_qs[sb][swz(n, bh)]);
-                const uint32_t sbw = s.b_sc[sb][wc + f * 8u + tidx_b];
+                const uint32_t *row = sb_rows + (wc + f * 8u + frow) * SW + sb * 9u;
+                const uint32_t B[2] = { row[fword], row[4u + fword] };
+                const uint32_t sbw = row[0];
 #pragma unroll
                 for (int rf = 0; rf < 2; rf++) mma_nvfp4(C[rf][f], A[rf], B, sa[rf], sbw);
             }
@@ -302,7 +308,7 @@ int launch_moe_gemm(
         const int32_t *order, const uint32_t *plan, int n_expert, int n_used, int K, int M, int rows,
         cudaStream_t stream) {
     constexpr int STAGED_OUT = TILE_ROWS * (COLS + 8) * 2;   /* the bf16 output tile of the epilogue */
-    constexpr int STAGES = NSTAGE * (int)sizeof(moe_stage<KS, COLS>);
+    constexpr int STAGES = NSTAGE * stage_bytes<KS, COLS>();
     constexpr int SMEM = STAGES > STAGED_OUT ? STAGES : STAGED_OUT;
     static bool attr_ok = false;   /* the stages may exceed the 48 KiB default: opt in once per instantiation */
     if (!attr_ok) {
@@ -346,8 +352,12 @@ extern "C" int ds4_qwen_fp4_moe_gemm(
     }
     const block_nvfp4 *w = (const block_nvfp4 *)W;
     const block_nvfp4 *x = (const block_nvfp4 *)xq;
-    const int rc = launch_moe_gemm<2, 128>(out, out_bf16, w, scales, x, x_per_slot, order, plan,
-                                           n_expert, n_used, K, M, rows, stream);
+    /* 4 super-blocks a step when the rows allow 16-byte copies (K % 256),
+     * else 2 with 8-byte ones: the gate/up rows of 2560 take the first,
+     * the down rows of 640 the second */
+    const int rc = (K / QK_NVFP4) % 4 == 0
+        ? launch_moe_gemm<4, 128>(out, out_bf16, w, scales, x, x_per_slot, order, plan, n_expert, n_used, K, M, rows, stream)
+        : launch_moe_gemm<2, 128>(out, out_bf16, w, scales, x, x_per_slot, order, plan, n_expert, n_used, K, M, rows, stream);
     if (rc != 0) return rc;
     return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }
