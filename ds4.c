@@ -16578,7 +16578,7 @@ typedef struct {
     ds4_gpu_tensor *att;         /* GDN or attention output before the out proj */
     ds4_gpu_tensor *att_bf16;    /* the same in bf16 for Flash-Next prefill */
     ds4_gpu_tensor *att_part;    /* decode attention split partials */
-    ds4_gpu_tensor *att_split;   /* prefill attention: bf16 hi/lo copies of the chunk's queries */
+    ds4_gpu_tensor *att_split;   /* prefill attention: a bf16 copy of the chunk's prepared queries */
     ds4_gpu_tensor *logits;      /* [n_vocab] */
     /* Flash-Next.  x is then [max_rows][n_hc][n_embd]; the mixer leaves the
      * normalised streams and inject weights for the combine, like the CPU
@@ -16936,7 +16936,7 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
     /* up to 8 decode rows x heads x 64 key splits x (values, max, sum) */
     g->att_part = qwen_graph_tensor(8ull * DS4_N_HEAD * 64ull * (DS4_N_HEAD_DIM + 2u), &ok);
     /* prefill: bf16 hi/lo copies of the chunk's queries */
-    g->att_split = qwen_graph_tensor(rows * attn_dim, &ok);
+    g->att_split = qwen_graph_tensor(rows * attn_dim / 2u, &ok);
     /* the rows of a speculative verify batch or of a batched decode pass */
     g->logits = qwen_graph_tensor((uint64_t)qwen_max_u64(spec_rows, DS4_QWEN_BATCH_ROWS) * DS4_N_VOCAB, &ok);
     if (ds4_qwen_has_hc()) {
@@ -17500,10 +17500,11 @@ static bool qwen_graph_layer(
         /* the serial dense rule per row, for a batched pass under QSA (qwen35_attn_row_cells) */
         const uint32_t r = sparse ? g_ds4_compress_ratios[il] : 1u;
         const uint32_t dense_keys = sparse ? (DS4_N_INDEXER_TOP_K / r + 1u) * r - 1u : 0u;
-        /* Flash-Next attends in the checkpoint's bf16; the 2B keeps the f32-exact operands (its CPU guard) */
-        if (ok) ok = ds4_gpu_qwen35_attention(g->att, att_bf16, !ds4_qwen_has_hc(), g->att_part, g->att_split, g->proj,
+        /* a prefill chunk attends in the checkpoint's bf16 on the tensor cores; decode-sized passes in f32 */
+        if (ok) ok = ds4_gpu_qwen35_attention(g->att, att_bf16, g->att_part, g->att_split, g->proj,
                                               g->slots, qwen_slot(QWEN_SLOT_ATTN, il),
                                               g->k, g->v, sparse ? g->sel : NULL, g->n_sel, g->max_sel, dense_keys,
+                                              sparse ? r : 0u, sparse ? DS4_N_INDEXER_TOP_K / r : 0u,
                                               m->map, m->size,
                                               l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                               DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,

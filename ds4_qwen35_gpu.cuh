@@ -1638,19 +1638,11 @@ extern "C" int ds4_gpu_qwen35_gdn(
 
 /* ---- Gated GQA attention ------------------------------------------------- */
 
-/* f32 into a bf16 high part and a bf16 remainder (both round-to-nearest):
- * the split operands of the tensor-core paths, hi + lo within 2^-16 of x. */
-__device__ __forceinline__ void qwen35_split_f32(float x, __nv_bfloat16 *hi, __nv_bfloat16 *lo) {
-    const __nv_bfloat16 h = __float2bfloat16(x);
-    *hi = h;
-    *lo = __float2bfloat16(x - __bfloat162float(h));
-}
-
 /* Per (token, head slot): RMS-normalise and RoPE the query heads in place
  * (the q buffer holds [query | gate] per head), do the same for the key heads
  * and store them in the cache, copy the value heads into the cache.  The
  * caches are bf16 (the CPU reference rounds its rows the same way).  With
- * qh/ql (prefill) the finished queries are also written split into bf16 for
+ * qh (prefill) the finished queries are also written in bf16 for
  * the tensor-core attention. */
 /* The paged caches (ds4_gpu_mgpu.h): the page of a position, then the
  * layer's K or V row at `off` (the slot's p0 or p1) within it, or its
@@ -1670,7 +1662,7 @@ __device__ __forceinline__ __nv_bfloat16 *qwen35_bkey_ptr(const ds4_qwen_batch_s
 
 __global__ static void qwen35_attn_prepare_kernel(
         float *qg, const ds4_qwen_batch_slot *slots, const float *k, const float *v,
-        const float *q_norm, const float *k_norm, __nv_bfloat16 *qh, __nv_bfloat16 *ql,
+        const float *q_norm, const float *k_norm, __nv_bfloat16 *qh,
         uint32_t n_head, uint32_t n_kv, uint32_t hd, uint32_t n_rot,
         uint32_t n_tokens, uint32_t batched, float freq_base, float eps) {
     __shared__ float scratch[32];
@@ -1716,7 +1708,7 @@ __global__ static void qwen35_attn_prepare_kernel(
     if (dst) dst[tid] = __float2bfloat16(head[tid]);
     if (qh && slot < n_head) {
         const uint64_t i = ((uint64_t)t * n_head + slot) * hd + tid;
-        qwen35_split_f32(head[tid], qh + i, ql + i);
+        qh[i] = __float2bfloat16(head[tid]);
     }
 }
 
@@ -1865,17 +1857,11 @@ __global__ static void qwen35_attention_merge_kernel(
 }
 
 /* ---- Tensor-core prefill attention ---------------------------------------
- * Block per (token, KV head), eight warps.  The rows are the group's query
- * heads (up to 16) and the keys come in 16-cell tiles gathered from the bf16
- * caches, so the causal prefix and a QSA cell list cost the same.  Warp w
- * scores keys 8*(w%2).. over dims 64*(w/2)..
- * with its query fragments held in registers; one thread per (row, key)
- * sums the four partials and runs the online softmax; warp w then owns
- * output dims 32*w.. .  The mma.sync fragment layouts are the m16n8k16
- * ones from the PTX ISA (rows lane/4 and lane/4+8, column pairs lane%4). */
-#define QWEN35_TC_KEYS 16u
-#define QWEN35_TC_LD 264u    /* bf16 per staged K/V row: 256 + 8 so ldmatrix rows hit distinct banks */
-#define QWEN35_TC_LDP 24u    /* bf16 per staged P row */
+ * bf16 m16n8k16 MMAs with f32 accumulation, the checkpoint's own attention
+ * precision, on operands staged in shared memory with ldmatrix.  The
+ * fragment layouts are the PTX ISA's (rows lane/4 and lane/4+8, column
+ * pairs lane%4). */
+#define QWEN35_TC_LD 264u    /* bf16 per staged Q/K/V row: 256 + 8 so ldmatrix rows hit distinct banks */
 
 __device__ __forceinline__ void qwen35_mma_bf16(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -1900,173 +1886,395 @@ __device__ __forceinline__ void qwen35_ldsm_x4(uint32_t *r, const void *p) {
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
 }
 
-/* SPLIT: the queries and probabilities are bf16 hi/lo pairs and every
- * product takes two MMAs, within f32 rounding of the reference, which
- * rounds its K/V rows to bf16 as the cache does (the 2B's guard path).
- * Otherwise they are plain bf16 with f32 accumulation, the checkpoint's own
- * attention precision.  The kernel is bound by the L2 bandwidth of the
- * per-token K/V gather. */
-template <bool SPLIT>
-__global__ static void __launch_bounds__(256, 2) qwen35_attention_tc_kernel(
-        float *att, __nv_bfloat16 *att_bf16, const float *qg, const __nv_bfloat16 *qh, const __nv_bfloat16 *ql,
-        const ds4_qwen_batch_slot *slots,
-        const int32_t *sel, const uint32_t *n_sel, uint32_t max_sel,
-        uint32_t n_head, uint32_t n_kv, uint32_t n_tokens) {
+
+/* ---- Tiled prefill attention -------------------------------------------
+ * A block owns a tile of QWEN35_AT_ROWS query rows (consecutive tokens,
+ * every query head of one KV head, so rows = tokens * group) and walks
+ * its keys in tiles of QWEN35_AT_KEYS, the flash-attention structure: K
+ * and V rows land in shared memory once per query tile through cp.async,
+ * where the per-token kernel above gathered them once per token (its
+ * whole cost, 1 KB of L2 traffic per key per token).  Warp w owns rows
+ * 16w..16w+15: S = Q K^T over the full head dim as m16n8k16 MMAs, the
+ * online softmax on the S fragments in registers, and P V with the
+ * probabilities repacked from the S fragment straight into the A operand
+ * of the next MMA (the C layout of one MMA is the A layout of the next),
+ * so P never touches memory.  The next K tile loads while the warps run
+ * the softmax and P V, the next V tile while they score.
+ *
+ * Every key carries a token mask, bit i for token i of the tile: the
+ * causal prefix (no list) masks by position; under QSA the tile's keys
+ * are the union of its tokens' selected blocks (qwen35_qsa_tile_union
+ * below, whose entries carry the mask), then the tokens' tail cells, the
+ * positions after their last completed block.  A tile's union is 2 to 3
+ * times one token's list, so K and V cross the L2 3 to 4 times less
+ * than per token, at twice the (cheap) MMA work. */
+#define QWEN35_AT_TOKENS 8u          /* tokens per tile, one warp each */
+#define QWEN35_AT_THREADS (QWEN35_AT_TOKENS * 32u)
+#define QWEN35_AT_KEYS 32u
+#define QWEN35_AT_UNION_MAX 8192u   /* entries a tile's union may hold: tokens * budget */
+
+__device__ __forceinline__ void qwen35_cp_async16(void *dst, const void *src, uint32_t bytes) {
+    const uint32_t d = (uint32_t)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(d), "l"(src), "r"(bytes));
+}
+__device__ __forceinline__ void qwen35_cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N>
+__device__ __forceinline__ void qwen35_cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+
+__device__ __forceinline__ uint32_t qwen35_pack_bf16x2(float a, float b) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
+    return *(const uint32_t *)&v;
+}
+
+/* The union of a query tile's selected blocks (uint2 {block, token mask}
+ * in block order) from the tokens' cell lists: one block per tile sorts
+ * the tokens' block ids in shared memory (bitonic, the lists are short)
+ * and merges equal ids.  A token within the budget lists every block
+ * before its own (the select kernel's short-row case). */
+__global__ static void qwen35_qsa_tile_union_kernel(
+        uint2 *lists, uint32_t *list_n, uint32_t cap, uint32_t len_max, const int32_t *sel, uint32_t max_sel,
+        uint32_t qt, uint32_t r, uint32_t budget, uint32_t pos0, uint32_t n_tokens) {
+    extern __shared__ __align__(16) uint32_t un_smem[];
+    uint32_t *key = un_smem;             /* [len_max] block ids, len_max the power of two above cap */
+    uint32_t *msk = un_smem + len_max;   /* [len_max] token masks */
+    __shared__ uint32_t scan[256];
+    const uint32_t tile = blockIdx.x;
+    const uint32_t t0 = tile * qt;
+    const uint32_t tid = threadIdx.x;
+    if (t0 >= n_tokens) return;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < qt && t0 + i < n_tokens; i++) {
+        const uint32_t t = t0 + i;
+        const uint32_t n_blocks = (pos0 + t + 1u) / r;
+        const uint32_t nb = n_blocks < budget ? n_blocks : budget;
+        for (uint32_t k = tid; k < nb; k += blockDim.x) {
+            key[n + k] = n_blocks <= budget ? k : (uint32_t)sel[(uint64_t)t * max_sel + k * r] / r;
+            msk[n + k] = 1u << i;
+        }
+        n += nb;
+    }
+    uint32_t len = 1;
+    while (len < n) len <<= 1;
+    for (uint32_t k = n + tid; k < len; k += blockDim.x) { key[k] = 0xffffffffu; msk[k] = 0u; }
+    __syncthreads();
+    for (uint32_t size = 2; size <= len; size <<= 1) {
+        for (uint32_t stride = size >> 1; stride > 0; stride >>= 1) {
+            for (uint32_t i = tid; i < len / 2u; i += blockDim.x) {
+                const uint32_t a = (i / stride) * stride * 2u + (i % stride), b = a + stride;
+                const bool up = ((a & size) == 0u);
+                if ((key[a] > key[b]) == up) {
+                    const uint32_t tk = key[a], tm = msk[a];
+                    key[a] = key[b]; msk[a] = msk[b];
+                    key[b] = tk; msk[b] = tm;
+                }
+            }
+            __syncthreads();
+        }
+    }
+    /* runs of one block id merge into one entry; a block-wide scan places them */
+    uint32_t base = 0;
+    for (uint32_t i0 = 0; i0 < n; i0 += blockDim.x) {
+        const uint32_t i = i0 + tid;
+        const bool start = i < n && (i == 0u || key[i - 1u] != key[i]);
+        scan[tid] = start ? 1u : 0u;
+        __syncthreads();
+        for (uint32_t off = 1; off < blockDim.x; off <<= 1) {
+            const uint32_t v = tid >= off ? scan[tid - off] : 0u;
+            __syncthreads();
+            scan[tid] += v;
+            __syncthreads();
+        }
+        if (start) {
+            uint32_t m = 0;
+            for (uint32_t j = i; j < n && key[j] == key[i]; j++) m |= msk[j];
+            lists[(uint64_t)tile * cap + base + scan[tid] - 1u] = make_uint2(key[i], m);
+        }
+        base += scan[blockDim.x - 1u];
+        __syncthreads();
+    }
+    if (tid == 0u) list_n[tile] = base;
+}
+
+__global__ static void __launch_bounds__(QWEN35_AT_THREADS, 1) qwen35_attention_tile_kernel(
+        float *att, __nv_bfloat16 *att_bf16, const float *qg, const __nv_bfloat16 *qh,
+        const ds4_qwen_batch_slot *slots, const uint2 *lists, const uint32_t *list_n, uint32_t cap,
+        uint32_t r, uint32_t n_head, uint32_t n_kv, uint32_t n_tokens) {
     constexpr uint32_t hd = 256u;
-    constexpr uint32_t NP = SPLIT ? 2u : 1u;                                        /* query and probability parts */
-    __shared__ __align__(16) __nv_bfloat16 ks[QWEN35_TC_KEYS][QWEN35_TC_LD];      /* [key][dim] */
-    __shared__ __align__(16) __nv_bfloat16 vs[QWEN35_TC_KEYS][QWEN35_TC_LD];
-    __shared__ __align__(16) __nv_bfloat16 ps[NP][16][QWEN35_TC_LDP];             /* [hi, lo] probabilities [row][key] */
-    __shared__ float sp[4][16][QWEN35_TC_KEYS];                                    /* score partials per dim quarter */
-    __shared__ float alpha_s[16], lsum_s[16];
-    const uint32_t t = blockIdx.x;
-    const uint32_t kvh = blockIdx.y;
+    constexpr uint32_t LD = QWEN35_TC_LD;
+    constexpr uint32_t KT = QWEN35_AT_KEYS;
+    constexpr uint32_t QT = QWEN35_AT_TOKENS;
+    extern __shared__ __align__(16) __nv_bfloat16 at_smem[];
     const uint32_t group = n_head / n_kv;
+    __nv_bfloat16 *qs = at_smem;                              /* [QT * group][LD] */
+    __nv_bfloat16 *zero = qs + QT * group * LD;               /* one zero row for the padding rows and keys */
+    __nv_bfloat16 *ks = zero + LD;                            /* [KT][LD] */
+    __nv_bfloat16 *vs = ks + KT * LD;
+    __shared__ uint8_t kidx[QT][KT];                          /* each warp's keys of the tile, compacted */
+    __shared__ uint32_t kcell[2][KT], kmask[2][KT];           /* the tile's keys' cells and token masks, this and next */
+    const uint32_t kvh = blockIdx.y;
+    const uint32_t tile = blockIdx.x;
+    const uint32_t t0 = tile * QT;
+    if (t0 >= n_tokens) return;
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
-    const uint32_t warp = tid >> 5u;
+    const uint32_t warp = tid >> 5u;                          /* the warp's token within the tile */
     const ds4_qwen_batch_slot row = slots[0];   /* a prefill chunk: one session, sequential */
-    const uint32_t n_cells = sel ? n_sel[t] : row.pos + t + 1u;
-    const int32_t *cells = sel ? sel + (uint64_t)t * max_sel : NULL;
     const uint64_t kv_stride = (uint64_t)n_kv * hd;
-    const float scale = rsqrtf((float)hd);
     const uint32_t head0 = kvh * group;
+    const uint32_t t_last = t0 + QT - 1u < n_tokens ? t0 + QT - 1u : n_tokens - 1u;
+    const uint32_t pos0 = row.pos + t0;                        /* the tile's first position */
+    const uint32_t n_keys = row.pos + t_last + 1u;             /* the tile's longest causal prefix */
+    /* the key tiles: the causal prefix, or the union entries (r cells each) then the tail */
+    const uint32_t n_list = lists ? list_n[tile] : 0u;
+    const uint2 *entries = lists ? lists + (uint64_t)tile * cap : NULL;
+    const uint32_t tail_lo = lists ? ((pos0 + 1u) / r) * r : 0u;   /* the first token's tail start */
+    const uint32_t list_iters = lists ? (n_list * r + KT - 1u) / KT : 0u;
+    const uint32_t n_iter = lists ? list_iters + (n_keys > tail_lo ? 1u : 0u) : (n_keys + KT - 1u) / KT;
+    /* key k of iteration it: its cell, and the mask of the tile's tokens that see it */
+    auto key_of = [&](uint32_t it, uint32_t k, uint32_t *cell, uint32_t *tmask) {
+        if (!lists) {
+            const uint32_t c = it * KT + k;
+            *cell = c;
+            *tmask = c >= n_keys ? 0u : (c <= pos0 ? 0xffffffffu : 0xffffffffu << (c - pos0));
+        } else if (it < list_iters) {
+            const uint32_t e = (it * KT + k) / r;
+            const uint2 en = e < n_list ? entries[e] : make_uint2(0u, 0u);
+            *cell = en.x * r + (it * KT + k) % r;
+            *tmask = e < n_list ? en.y : 0u;
+        } else {
+            const uint32_t c = tail_lo + k;
+            *cell = c;
+            uint32_t m = 0u;
+            for (uint32_t i = 0; i < QT; i++) {
+                const uint32_t p = pos0 + i;
+                if (c >= ((p + 1u) / r) * r && c <= p) m |= 1u << i;
+            }
+            *tmask = c < n_keys ? m : 0u;
+        }
+    };
 
-    /* score work of this warp: keys sk.., dims sd..; the query fragments
-     * (rows lane/4 and +8, column pairs lane%4, four 16-dim steps) */
-    const uint32_t sk = (warp & 1u) * 8u;
-    const uint32_t sd = (warp >> 1u) * 64u;
-    uint32_t qa[2][4][4];
-    for (uint32_t step = 0; step < 4u; step++) {
-        for (uint32_t reg = 0; reg < 4u; reg++) {
-            const uint32_t r = (lane >> 2u) + (reg & 1u) * 8u;
-            const uint32_t d = sd + step * 16u + (reg >> 1u) * 8u + (lane & 3u) * 2u;
-            const uint64_t i = ((uint64_t)t * n_head + head0 + r) * hd + d;
-            qa[0][step][reg] = r < group ? *(const uint32_t *)(qh + i) : 0u;
-            qa[1][step][reg] = SPLIT && r < group ? *(const uint32_t *)(ql + i) : 0u;
-        }
+    /* the queries: row i of the tile is token t0 + i / group, head i % group; and the zero row */
+    for (uint32_t i = tid; i < (QT * group + 1u) * (hd / 8u); i += QWEN35_AT_THREADS) {
+        const uint32_t rr = i / (hd / 8u), c = (i % (hd / 8u)) * 8u;
+        const uint32_t t = t0 + rr / group;
+        const bool valid = rr < QT * group && t < n_tokens;
+        const __nv_bfloat16 *src = qh + ((uint64_t)(valid ? t : 0u) * n_head + head0 + rr % group) * hd + c;
+        qwen35_cp_async16(qs + rr * LD + c, src, valid ? 16u : 0u);
     }
-    float o[4][4];
-    for (uint32_t j = 0; j < 4u; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.0f;
-    /* softmax state of row tid/16, identical in its 16 threads */
-    const uint32_t srow = tid >> 4u;
-    const uint32_t skey = tid & 15u;
-    float m_row = -INFINITY;
-    float l_row = 0.0f;
-
-    for (uint32_t c0 = 0; c0 < n_cells; c0 += QWEN35_TC_KEYS) {
-        /* gather the tile: 16 threads per key, 32 bytes of each row each;
-         * masked keys are zero so their zero probability meets no garbage */
-        {
-            const uint32_t key = tid >> 4u;
-            const uint32_t e = (tid & 15u) * 16u;
-            const uint32_t c = c0 + key;
-            const bool valid = c < n_cells;
-            const uint32_t cell = valid ? (cells ? (uint32_t)cells[c] : c) : 0u;
-            const __nv_bfloat16 *src[2] = { qwen35_kv_ptr(row, row.p0, cell, kv_stride) + kvh * hd + e,
-                                            qwen35_kv_ptr(row, row.p1, cell, kv_stride) + kvh * hd + e };
-            __nv_bfloat16 *dst[2] = { &ks[key][e], &vs[key][e] };
-            const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
-            for (uint32_t a = 0; a < 2u; a++) {
-                const uint4 x0 = valid ? ((const uint4 *)src[a])[0] : zero;
-                const uint4 x1 = valid ? ((const uint4 *)src[a])[1] : zero;
-                ((uint4 *)dst[a])[0] = x0;
-                ((uint4 *)dst[a])[1] = x1;
-            }
+    /* a K or V tile: 32 keys x 32 pieces of 16 bytes; unseen keys zero */
+    auto load_tile = [&](__nv_bfloat16 *dst, uint64_t off, uint32_t it) {
+        for (uint32_t i = tid; i < KT * (hd / 8u); i += QWEN35_AT_THREADS) {
+            const uint32_t k = i / (hd / 8u), c = (i % (hd / 8u)) * 8u;
+            const bool valid = kmask[it & 1u][k] != 0u;
+            const __nv_bfloat16 *src = qwen35_kv_ptr(row, off, valid ? kcell[it & 1u][k] : 0u, kv_stride) + kvh * hd + c;
+            qwen35_cp_async16(dst + k * LD + c, src, valid ? 16u : 0u);
         }
-        __syncthreads();
-        /* scores: this warp's 16 rows x 8 keys over its 64 dims */
-        {
-            float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-            const uint32_t key = sk + (lane & 7u);
-            for (uint32_t step = 0; step < 4u; step++) {
-                const uint32_t d = sd + step * 16u + ((lane >> 3u) & 1u) * 8u;
-                uint32_t bh[2];
-                qwen35_ldsm_x2(bh, &ks[key][d]);
-                qwen35_mma_bf16(s, qa[0][step], bh[0], bh[1]);
-                if (SPLIT) qwen35_mma_bf16(s, qa[1][step], bh[0], bh[1]);
-            }
-            const uint32_t r = lane >> 2u;
-            const uint32_t kc = sk + (lane & 3u) * 2u;
-            sp[warp >> 1u][r][kc] = s[0];
-            sp[warp >> 1u][r][kc + 1u] = s[1];
-            sp[warp >> 1u][r + 8u][kc] = s[2];
-            sp[warp >> 1u][r + 8u][kc + 1u] = s[3];
-        }
-        __syncthreads();
-        /* online softmax, one thread per (row, key); the row's 16 threads
-         * form a half-warp, so the max and sum are shuffle reductions */
-        {
-            const bool valid = srow < group && c0 + skey < n_cells;
-            float v = -INFINITY;
-            if (valid) v = (sp[0][srow][skey] + sp[1][srow][skey] + sp[2][srow][skey] + sp[3][srow][skey]) * scale;
-            float mx = v;
-            for (uint32_t off = 8u; off > 0u; off >>= 1u) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
-            const float m_new = fmaxf(m_row, mx);
-            const float a = m_new == -INFINITY ? 1.0f : expf(m_row - m_new);
-            const float p = valid ? expf(v - m_new) : 0.0f;
-            float sum = p;
-            for (uint32_t off = 8u; off > 0u; off >>= 1u) sum += __shfl_xor_sync(0xffffffffu, sum, off);
-            l_row = l_row * a + sum;
-            m_row = m_new;
-            if (SPLIT) qwen35_split_f32(p, &ps[0][srow][skey], &ps[NP - 1u][srow][skey]);
-            else ps[0][srow][skey] = __float2bfloat16(p);
-            if (skey == 0u) alpha_s[srow] = a;
-        }
-        __syncthreads();
-        /* output: rescale the rows, then P (16 x 16 keys) times the tile's
-         * values over this warp's 32 dims */
-        {
-            const float a0 = alpha_s[lane >> 2u];
-            const float a1 = alpha_s[(lane >> 2u) + 8u];
-            const uint32_t pr = (lane & 7u) + ((lane >> 3u) & 1u) * 8u;
-            const uint32_t pc = (lane >> 4u) * 8u;
-            uint32_t ph[4], pl[4] = { 0u, 0u, 0u, 0u };
-            qwen35_ldsm_x4(ph, &ps[0][pr][pc]);
-            if (SPLIT) qwen35_ldsm_x4(pl, &ps[NP - 1u][pr][pc]);
-            const uint32_t key = (lane & 7u) + ((lane >> 3u) & 1u) * 8u;
-            for (uint32_t j = 0; j < 4u; j++) {
-                const uint32_t d = warp * 32u + j * 8u;
-                uint32_t bh[2];
-                qwen35_ldsm_x2_trans(bh, &vs[key][d]);
-                o[j][0] *= a0;
-                o[j][1] *= a0;
-                o[j][2] *= a1;
-                o[j][3] *= a1;
-                qwen35_mma_bf16(o[j], ph, bh[0], bh[1]);
-                if (SPLIT) qwen35_mma_bf16(o[j], pl, bh[0], bh[1]);
-            }
-        }
-        __syncthreads();   /* the next gather overwrites the tiles */
-    }
-    if (skey == 0u) lsum_s[srow] = l_row;
+        qwen35_cp_async_commit();
+    };
+    /* the keys' metadata of a tile, by the first warp, into the tile's half of the pair */
+    auto tile_meta = [&](uint32_t it) {
+        if (tid < KT) key_of(it, tid, &kcell[it & 1u][tid], &kmask[it & 1u][tid]);
+    };
+    tile_meta(0u);
     __syncthreads();
-    for (uint32_t half = 0; half < 2u; half++) {
-        const uint32_t r = (lane >> 2u) + half * 8u;
-        if (r >= group) continue;
-        const float inv = 1.0f / lsum_s[r];
-        const uint64_t head = (uint64_t)t * n_head + head0 + r;
-        const float *gate = qg + head * 2u * hd + hd;
-        for (uint32_t j = 0; j < 4u; j++) {
-            const uint32_t d = warp * 32u + j * 8u + (lane & 3u) * 2u;
-            const float v0 = o[j][half * 2u] * inv * qwen35_cuda_sigmoid(gate[d]);
-            const float v1 = o[j][half * 2u + 1u] * inv * qwen35_cuda_sigmoid(gate[d + 1u]);
-            if (att_bf16) {   /* the out projection's operand */
-                *(__nv_bfloat162 *)(att_bf16 + head * hd + d) = __floats2bfloat162_rn(v0, v1);
-            } else {
-                att[head * hd + d] = v0;
-                att[head * hd + d + 1u] = v1;
+    load_tile(ks, row.p0, 0u);   /* with the queries */
+    load_tile(vs, row.p1, 0u);
+
+    /* this warp's token and rows: a = lane/4, b = a + 8 of its m16 tile (rows >= group are padding) */
+    const uint32_t t = t0 + warp;
+    const bool vt = t < n_tokens;
+    const uint32_t ra = lane >> 2u, rb = ra + 8u;
+    const bool va = vt && ra < group, vb = vt && rb < group;
+    const __nv_bfloat16 *qrow = (lane & 15u) < group ? qs + (warp * group + (lane & 15u)) * LD : zero;
+    const float scale = rsqrtf((float)hd);
+    float o[hd / 8u][4];
+#pragma unroll
+    for (uint32_t d = 0; d < hd / 8u; d++) o[d][0] = o[d][1] = o[d][2] = o[d][3] = 0.0f;
+    float ma = -INFINITY, mb = -INFINITY, la = 0.0f, lb = 0.0f;
+
+    for (uint32_t it = 0; it < n_iter; it++) {
+        qwen35_cp_async_wait<1>();   /* this thread's K copies landed (V may be in flight) */
+        __syncthreads();
+        /* the warp's keys of this tile: lane l looks at key l, the valid ones compact in order */
+        const uint32_t mine = __ballot_sync(0xffffffffu, vt && ((kmask[it & 1u][lane] >> warp) & 1u));
+        const uint32_t nk = __popc(mine);
+        if (mine & (1u << lane)) kidx[warp][__popc(mine & ((1u << lane) - 1u))] = (uint8_t)lane;
+        __syncwarp();
+        tile_meta(it + 1u);          /* the next tile's keys, read after the syncs below */
+        /* S = Q K^T over the warp's keys, n-tile nt = keys 8nt..8nt+7 of its list */
+        float s[KT / 8u][4];
+#pragma unroll
+        for (uint32_t j = 0; j < KT / 8u; j++) s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.0f;
+        const uint32_t n_nt = (nk + 7u) / 8u;
+        const __nv_bfloat16 *krow[KT / 8u];
+#pragma unroll
+        for (uint32_t j = 0; j < KT / 8u; j++) {
+            const uint32_t ki = j * 8u + (lane & 7u);
+            krow[j] = ki < nk ? ks + kidx[warp][ki] * LD : zero;
+        }
+#pragma unroll
+        for (uint32_t ks_ = 0; ks_ < hd / 16u; ks_++) {
+            uint32_t a[4];
+            qwen35_ldsm_x4(a, qrow + ks_ * 16u + (lane >> 4u) * 8u);
+#pragma unroll
+            for (uint32_t j = 0; j < KT / 8u; j++) {
+                if (j < n_nt) {
+                    uint32_t b[2];
+                    qwen35_ldsm_x2(b, krow[j] + ks_ * 16u + ((lane >> 3u) & 1u) * 8u);
+                    qwen35_mma_bf16(s[j], a, b[0], b[1]);
+                }
             }
         }
+        __syncthreads();             /* the K tile is consumed */
+        if (it + 1u < n_iter) load_tile(ks, row.p0, it + 1u); else qwen35_cp_async_commit();
+
+        /* online softmax on the fragments: lane holds keys j*8 + (lane%4)*2 + {0,1} of the list */
+        float mxa = -INFINITY, mxb = -INFINITY;
+#pragma unroll
+        for (uint32_t j = 0; j < KT / 8u; j++) {
+#pragma unroll
+            for (uint32_t h = 0; h < 2u; h++) {
+                const bool in = j * 8u + (lane & 3u) * 2u + h < nk;
+                s[j][h] = va && in ? s[j][h] * scale : -INFINITY;
+                s[j][2u + h] = vb && in ? s[j][2u + h] * scale : -INFINITY;
+                mxa = fmaxf(mxa, s[j][h]);
+                mxb = fmaxf(mxb, s[j][2u + h]);
+            }
+        }
+        mxa = fmaxf(mxa, __shfl_xor_sync(0xffffffffu, mxa, 1u));
+        mxa = fmaxf(mxa, __shfl_xor_sync(0xffffffffu, mxa, 2u));
+        mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, 1u));
+        mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, 2u));
+        const float mna = fmaxf(ma, mxa), mnb = fmaxf(mb, mxb);
+        /* a row that has seen no key yet (max still -inf) keeps its zero
+         * probabilities: exp of -inf minus zero */
+        const float aa = mna == -INFINITY ? 1.0f : expf(ma - mna);
+        const float ab = mnb == -INFINITY ? 1.0f : expf(mb - mnb);
+        const float ba = mna == -INFINITY ? 0.0f : mna, bb = mnb == -INFINITY ? 0.0f : mnb;
+        float suma = 0.0f, sumb = 0.0f;
+        uint32_t p[KT / 16u][4];
+#pragma unroll
+        for (uint32_t j = 0; j < KT / 8u; j++) {
+            const float p0 = expf(s[j][0] - ba);
+            const float p1 = expf(s[j][1] - ba);
+            const float p2 = expf(s[j][2] - bb);
+            const float p3 = expf(s[j][3] - bb);
+            suma += p0 + p1;
+            sumb += p2 + p3;
+            /* keys j*8.. are k-step j/2, half j%2 of the P fragment */
+            p[j >> 1u][(j & 1u) * 2u] = qwen35_pack_bf16x2(p0, p1);
+            p[j >> 1u][(j & 1u) * 2u + 1u] = qwen35_pack_bf16x2(p2, p3);
+        }
+        suma += __shfl_xor_sync(0xffffffffu, suma, 1u);
+        suma += __shfl_xor_sync(0xffffffffu, suma, 2u);
+        sumb += __shfl_xor_sync(0xffffffffu, sumb, 1u);
+        sumb += __shfl_xor_sync(0xffffffffu, sumb, 2u);
+        la = la * aa + suma;
+        lb = lb * ab + sumb;
+        ma = mna;
+        mb = mnb;
+        if (__any_sync(0xffffffffu, aa != 1.0f || ab != 1.0f)) {   /* the maxima settle early; then no rescale */
+#pragma unroll
+            for (uint32_t d = 0; d < hd / 8u; d++) {
+                o[d][0] *= aa;
+                o[d][1] *= aa;
+                o[d][2] *= ab;
+                o[d][3] *= ab;
+            }
+        }
+
+        qwen35_cp_async_wait<1>();   /* the V tile landed (the next K may be in flight) */
+        __syncthreads();
+        /* O += P V over the warp's keys (k-step kk = keys 16kk..16kk+15 of its list) and all 256 dims */
+        const uint32_t n_kk = (nk + 15u) / 16u;
+#pragma unroll
+        for (uint32_t kk = 0; kk < KT / 16u; kk++) {
+            if (kk < n_kk) {
+                const uint32_t ki = kk * 16u + (lane & 7u) + ((lane >> 3u) & 1u) * 8u;
+                const __nv_bfloat16 *vrow = ki < nk ? vs + kidx[warp][ki] * LD : zero;
+#pragma unroll
+                for (uint32_t d = 0; d < hd / 8u; d++) {
+                    uint32_t b[2];
+                    qwen35_ldsm_x2_trans(b, vrow + d * 8u);
+                    qwen35_mma_bf16(o[d], p[kk], b[0], b[1]);
+                }
+            }
+        }
+        __syncthreads();             /* the V tile is consumed */
+        if (it + 1u < n_iter) load_tile(vs, row.p1, it + 1u); else qwen35_cp_async_commit();
     }
+    qwen35_cp_async_wait<0>();
+
+    /* the rows' outputs, normalised and gated */
+#pragma unroll
+    for (uint32_t h = 0; h < 2u; h++) {
+        const uint32_t rr = h ? rb : ra;
+        if (!(h ? vb : va)) continue;
+        const float inv = 1.0f / (h ? lb : la);
+        const uint64_t head = (uint64_t)t * n_head + head0 + rr;
+        const float *gate = qg + head * 2u * hd + hd;
+#pragma unroll
+        for (uint32_t d = 0; d < hd / 8u; d++) {
+            const uint32_t col = d * 8u + (lane & 3u) * 2u;
+            const float v0 = o[d][h * 2u] * inv * qwen35_cuda_sigmoid(gate[col]);
+            const float v1 = o[d][h * 2u + 1u] * inv * qwen35_cuda_sigmoid(gate[col + 1u]);
+            if (att_bf16) *(__nv_bfloat162 *)(att_bf16 + head * hd + col) = __floats2bfloat162_rn(v0, v1);
+            else *(float2 *)(att + head * hd + col) = make_float2(v0, v1);
+        }
+    }
+}
+
+static int qwen35_attention_tiled(
+        float *out, __nv_bfloat16 *out_bf16, const float *qg, const __nv_bfloat16 *qh, const ds4_qwen_batch_slot *rows,
+        const int32_t *sel, uint32_t max_sel, uint32_t qsa_ratio, uint32_t qsa_budget, uint32_t pos0,
+        uint32_t n_head, uint32_t n_kv, uint32_t n_tokens, int tier, cudaStream_t stream) {
+    static uint32_t smem_ready = 0;   /* the dynamic shared memory opted in so far */
+    const uint32_t qt = QWEN35_AT_TOKENS;
+    const uint32_t group = n_head / n_kv;
+    const uint32_t n_tiles = (n_tokens + qt - 1u) / qt;
+    const uint32_t cap = qt * qsa_budget;
+    /* the queries, a zero row, a K and a V tile */
+    const uint32_t smem = (qt * group + 1u + 2u * QWEN35_AT_KEYS) * QWEN35_TC_LD * 2u;
+    if (group > 16u || smem > 99u * 1024u ||
+        (sel && (cap > QWEN35_AT_UNION_MAX || qsa_ratio == 0u || QWEN35_AT_KEYS % qsa_ratio != 0u ||
+                 qt + qsa_ratio > QWEN35_AT_KEYS))) {
+        return 0;
+    }
+    if (smem_ready < smem) {
+        if (cudaFuncSetAttribute(qwen35_attention_tile_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)smem) != cudaSuccess ||
+            cudaFuncSetAttribute(qwen35_qsa_tile_union_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)(QWEN35_AT_UNION_MAX * 2u * sizeof(uint32_t))) != cudaSuccess) {
+            fprintf(stderr, "ds4: Qwen tiled attention needs %u bytes of shared memory\n", (unsigned)smem);
+            return 0;
+        }
+        smem_ready = smem;
+    }
+    uint2 *lists = NULL;
+    uint32_t *list_n = NULL;
+    if (sel) {
+        /* one scratch (the tmp slab is a single block): the lists, then the counts */
+        const uint64_t list_bytes = (uint64_t)n_tiles * cap * sizeof(uint2);
+        char *scratch = (char *)cuda_tmp_alloc_on(tier, list_bytes + (uint64_t)n_tiles * sizeof(uint32_t), "QSA tile unions");
+        if (!scratch) return 0;
+        lists = (uint2 *)scratch;
+        list_n = (uint32_t *)(scratch + list_bytes);
+        uint32_t len = 1;
+        while (len < cap) len <<= 1;
+        qwen35_qsa_tile_union_kernel<<<n_tiles, 256, len * 2u * sizeof(uint32_t), stream>>>(
+            lists, list_n, cap, len, sel, max_sel, qt, qsa_ratio, qsa_budget, pos0, n_tokens);
+        if (!cuda_ok(cudaGetLastError(), "Qwen QSA tile union launch")) return 0;
+    }
+    qwen35_attention_tile_kernel<<<dim3(n_tiles, n_kv, 1u), QWEN35_AT_THREADS, smem, stream>>>(
+        out, out_bf16, qg, qh, rows, lists, list_n, cap, qsa_ratio, n_head, n_kv, n_tokens);
+    return cuda_ok(cudaGetLastError(), "Qwen tiled attention launch");
 }
 
 extern "C" int ds4_gpu_qwen35_attention(
         ds4_gpu_tensor       *att,          /* [n_tok][n_head * hd] */
         ds4_gpu_tensor       *att_bf16,     /* optional: a prefill chunk's output goes there in bf16 instead */
-        int                   exact,        /* prefill queries and probabilities as hi/lo pairs (f32-exact) or plain bf16 */
         ds4_gpu_tensor       *part,         /* split partials, see QWEN35_ATTN_SPLIT_MAX */
-        ds4_gpu_tensor       *split,        /* prefill: bf16 hi/lo copies of the queries, see below */
+        ds4_gpu_tensor       *qsplit,       /* prefill: a bf16 copy of the prepared queries */
         ds4_gpu_tensor       *qg,           /* [n_tok][n_head * 2 * hd], modified in place */
         const ds4_gpu_tensor *slots,        /* row table: p0 the bf16 K cache [ctx][n_kv * hd], p1 the V cache */
         uint32_t              slot0,
@@ -2076,6 +2284,8 @@ extern "C" int ds4_gpu_qwen35_attention(
         const ds4_gpu_tensor *n_sel,        /* QSA: uint32 [n_tok] */
         uint32_t              max_sel,
         uint32_t              dense_keys,   /* QSA, batched: rows with at most this many keys attend to their prefix instead */
+        uint32_t              qsa_ratio,    /* QSA: cells per block and blocks per token (0 without a selection) */
+        uint32_t              qsa_budget,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              q_norm_offset,
@@ -2115,36 +2325,32 @@ extern "C" int ds4_gpu_qwen35_attention(
     const float *k_norm = glm53_cuda_weight_f32(model_map, model_size, k_norm_offset, hd, tier, "attn k norm");
     if (!q_norm || !k_norm) return 0;
     cudaStream_t stream = cuda_decode_stream();
-    /* Prefill chunks take the tensor-core kernel over the caches and
-     * split-bf16 copies of the prepared queries: split = [Q hi | Q lo]. */
+    /* Prefill chunks take the tiled tensor-core kernel over the caches and a
+     * bf16 copy of the prepared queries (qsplit). */
     const bool tc = n_tokens > QWEN35_ATTN_SPLIT_ROWS && hd == 256u && n_head / n_kv <= 16u;
-    const uint64_t q_elems = (uint64_t)n_tokens * n_head * hd;
-    __nv_bfloat16 *qh = NULL, *ql = NULL;
+    __nv_bfloat16 *qh = NULL;
     if (tc) {
-        if (!split || split->bytes < 2u * q_elems * sizeof(__nv_bfloat16)) return 0;
-        qh = (__nv_bfloat16 *)split->ptr;
-        ql = qh + q_elems;
+        if (!qsplit || qsplit->bytes < (uint64_t)n_tokens * n_head * hd * sizeof(__nv_bfloat16)) return 0;
+        qh = (__nv_bfloat16 *)qsplit->ptr;
     }
     qwen35_attn_prepare_kernel<<<dim3(n_tokens, n_head + 2u * n_kv, 1u), hd, 0, stream>>>(
-        (float *)qg->ptr, rows, (const float *)k->ptr, (const float *)v->ptr, q_norm, k_norm, qh, ql,
+        (float *)qg->ptr, rows, (const float *)k->ptr, (const float *)v->ptr, q_norm, k_norm, qh,
         n_head, n_kv, hd, n_rot, n_tokens, b, freq_base, eps);
     if (tc) {
         if (att_bf16 && att_bf16->bytes < (uint64_t)n_tokens * n_head * hd * sizeof(__nv_bfloat16)) return 0;
-        const dim3 grid(n_tokens, n_kv, 1u);
-        float *out = (float *)att->ptr;
-        __nv_bfloat16 *out_bf16 = att_bf16 ? (__nv_bfloat16 *)att_bf16->ptr : NULL;
-        const int32_t *cells = sel ? (const int32_t *)sel->ptr : NULL;
-        const uint32_t *n_cells = sel ? (const uint32_t *)n_sel->ptr : NULL;
-        if (exact) {
-            qwen35_attention_tc_kernel<true><<<grid, 256, 0, stream>>>(
-                out, out_bf16, (const float *)qg->ptr, qh, ql, rows, cells, n_cells, max_sel,
-                n_head, n_kv, n_tokens);
-        } else {
-            qwen35_attention_tc_kernel<false><<<grid, 256, 0, stream>>>(
-                out, out_bf16, (const float *)qg->ptr, qh, ql, rows, cells, n_cells, max_sel,
-                n_head, n_kv, n_tokens);
+        /* a shape the tiled kernel declines (a group over 16 heads, a union
+         * over its capacity) takes the f32 kernel below, one split per row;
+         * that one writes f32 only */
+        if (qwen35_attention_tiled((float *)att->ptr, att_bf16 ? (__nv_bfloat16 *)att_bf16->ptr : NULL,
+                                   (const float *)qg->ptr, qh, rows, sel ? (const int32_t *)sel->ptr : NULL, max_sel,
+                                   qsa_ratio, qsa_budget, pos_end - n_tokens, n_head, n_kv, n_tokens, tier, stream)) {
+            return 1;
         }
-        return cuda_ok(cudaGetLastError(), "Qwen tensor-core attention launch");
+        if (att_bf16) {
+            fprintf(stderr, "ds4: Qwen tiled attention declined %u heads per KV head, ratio %u, budget %u\n",
+                    n_head / n_kv, qsa_ratio, qsa_budget);
+            return 0;
+        }
     }
     /* Decode-sized passes split the key range so enough blocks are in
      * flight; the grid covers the longest row's plan and each row follows
