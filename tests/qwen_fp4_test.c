@@ -132,9 +132,72 @@ static int run(int K, int M, int out_bf16) {
     return bad == 0 && qerr < 1.0 ? 0 : 1;
 }
 
+/* The fused gate/up pass must write the same NVFP4 down input, byte for
+ * byte, as the separate bf16 gate and up GEMMs followed by the quantiser. */
+static int run_gate_up(int K, int M) {
+    const int n_super = K / 64;
+    uint32_t seed = 3u + (uint32_t)K;
+    const size_t w_bytes = (size_t)N_EXPERT * M * n_super * 36;
+    uint8_t *wg = malloc(w_bytes), *wu = malloc(w_bytes);
+    for (size_t i = 0; i < w_bytes; i++) {
+        const size_t in_blk = i % 36;
+        wg[i] = in_blk < 4 ? (uint8_t)(0x28 + (lcg(&seed) % 16)) : (uint8_t)(lcg(&seed) & 0xff);
+        wu[i] = in_blk < 4 ? (uint8_t)(0x28 + (lcg(&seed) % 16)) : (uint8_t)(lcg(&seed) & 0xff);
+    }
+    float sg[N_EXPERT], su[N_EXPERT];
+    for (int e = 0; e < N_EXPERT; e++) { sg[e] = 0.5f + 0.1f * e; su[e] = 0.7f + 0.05f * e; }
+    float *x = malloc((size_t)ROWS * K * sizeof(float));
+    for (size_t i = 0; i < (size_t)ROWS * K; i++) x[i] = ((float)(lcg(&seed) % 2001) - 1000.0f) / 250.0f;
+    int32_t esel[SLOTS];
+    for (int s = 0; s < SLOTS; s++) esel[s] = (int32_t)(lcg(&seed) % N_EXPERT);
+    uint32_t plan[4][N_EXPERT + 1];
+    memset(plan, 0, sizeof plan);
+    for (int s = 0; s < SLOTS; s++) plan[0][esel[s]]++;
+    for (int e = 0; e < N_EXPERT; e++) {
+        plan[1][e + 1] = plan[1][e] + plan[0][e];
+        plan[2][e + 1] = plan[2][e] + (plan[0][e] + TILE - 1) / TILE;
+        plan[3][e] = plan[1][e];
+    }
+    int32_t order[SLOTS];
+    for (int s = 0; s < SLOTS; s++) order[plan[3][esel[s]]++] = s;
+
+    const size_t xq_bytes = (size_t)ROWS * n_super * 36, oq_bytes = (size_t)SLOTS * (M / 64) * 36;
+    void *dwg = dev_copy(wg, w_bytes), *dwu = dev_copy(wu, w_bytes);
+    void *dsg = dev_copy(sg, sizeof sg), *dsu = dev_copy(su, sizeof su);
+    void *dx = dev_copy(x, (size_t)ROWS * K * sizeof(float)), *dxq = dev_copy(NULL, xq_bytes);
+    void *dord = dev_copy(order, sizeof order), *dplan = dev_copy(plan, sizeof plan);
+    void *deg = dev_copy(NULL, (size_t)SLOTS * M * 2), *deu = dev_copy(NULL, (size_t)SLOTS * M * 2);
+    void *dq_ref = dev_copy(NULL, oq_bytes), *dq_fused = dev_copy(NULL, oq_bytes);
+    if (!dwg || !dwu || !dsg || !dsu || !dx || !dxq || !dord || !dplan || !deg || !deu || !dq_ref || !dq_fused) return 1;
+    if (ds4_qwen_fp4_quantize(dx, NULL, 0, dxq, ROWS, K, 0) != 0 ||
+        ds4_qwen_fp4_moe_gemm(dwg, dsg, dxq, 0, dord, dplan, N_EXPERT, N_USED, K, M, ROWS, deg, 1, 0) != 0 ||
+        ds4_qwen_fp4_moe_gemm(dwu, dsu, dxq, 0, dord, dplan, N_EXPERT, N_USED, K, M, ROWS, deu, 1, 0) != 0 ||
+        ds4_qwen_fp4_quantize(deg, deu, 1, dq_ref, SLOTS, M, 0) != 0 ||
+        ds4_qwen_fp4_moe_gate_up(dwg, dsg, dwu, dsu, dxq, dord, dplan, N_EXPERT, N_USED, K, M, ROWS, dq_fused, 0) != 0 ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        fprintf(stderr, "fp4-test: gate/up launch failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        return 1;
+    }
+    uint8_t *ref = malloc(oq_bytes), *fused = malloc(oq_bytes);
+    if (cudaMemcpy(ref, dq_ref, oq_bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(fused, dq_fused, oq_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return 1;
+    size_t bad = 0, nonzero = 0;
+    for (size_t i = 0; i < oq_bytes; i++) {
+        bad += ref[i] != fused[i];
+        nonzero += ref[i] != 0;
+    }
+    printf("fp4-test: gate/up K %d M %d: %zu of %zu bytes differ from the separate pass (%zu nonzero)\n",
+           K, M, bad, oq_bytes, nonzero);
+    cudaFree(dwg); cudaFree(dwu); cudaFree(dsg); cudaFree(dsu); cudaFree(dx); cudaFree(dxq); cudaFree(dord);
+    cudaFree(dplan); cudaFree(deg); cudaFree(deu); cudaFree(dq_ref); cudaFree(dq_fused);
+    free(wg); free(wu); free(x); free(ref); free(fused);
+    return bad == 0 && nonzero > oq_bytes / 2 ? 0 : 1;
+}
+
 int main(void) {
     const int ok = run(640, 200, 0) == 0 && run(2560, 136, 0) == 0 &&
-                   run(640, 200, 1) == 0 && run(2560, 136, 1) == 0;
+                   run(640, 200, 1) == 0 && run(2560, 136, 1) == 0 &&
+                   run_gate_up(2560, 640) == 0 && run_gate_up(640, 128) == 0;
     printf("fp4-test: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

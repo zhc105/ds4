@@ -1,7 +1,8 @@
 /* Timing of the Flash-Next FP4 expert GEMM (cuda/mmq/ds4_qwen_fp4.cu) at
  * the shapes a prefill chunk gives it: 512 experts, 10 per token, a chunk
- * of ROWS tokens, the gate/up projection (K 2560, M 640, per-token rows)
- * and the down projection (K 640, M 2560, per-slot rows).  Random routing,
+ * of ROWS tokens, the gate/up projection (K 2560, M 640, per-token rows),
+ * the down projection (K 640, M 2560, per-slot rows) and the fused gate+up
+ * pass that quantises the down input in its epilogue.  Random routing,
  * random operands; the kernel's cost does not depend on the values.  A
  * device-to-device memcpy goes first as the card's achievable streaming
  * rate.  Built by `make tests/qwen_fp4_bench`. */
@@ -24,7 +25,7 @@ static void *dev_copy(const void *src, size_t bytes) {
     return d;
 }
 
-static int run(const char *name, int K, int M, int x_per_slot) {
+static int run(const char *name, int K, int M, int x_per_slot, int gate_up) {
     const int n_super = K / 64;
     uint32_t seed = 11u + (uint32_t)K;
     const size_t w_bytes = (size_t)N_EXPERT * M * n_super * 36;
@@ -57,21 +58,25 @@ static int run(const char *name, int K, int M, int x_per_slot) {
     void *dw = dev_copy(w, w_bytes), *dsc = dev_copy(scales, N_EXPERT * sizeof(float));
     void *dxq = dev_copy(xq, xq_bytes), *dord = dev_copy(order, SLOTS * sizeof(int32_t));
     void *dplan = dev_copy(plan, 4 * sizeof(*plan));
-    void *dout = dev_copy(NULL, (size_t)SLOTS * M * sizeof(uint16_t));
-    if (!dw || !dsc || !dxq || !dord || !dplan || !dout) { fprintf(stderr, "fp4-bench: cudaMalloc failed\n"); return 1; }
+    void *dout = dev_copy(NULL, gate_up ? (size_t)SLOTS * (M / 64) * 36 : (size_t)SLOTS * M * sizeof(uint16_t));
+    void *dw2 = gate_up ? dev_copy(w, w_bytes) : NULL;   /* the up experts, their own rows in memory */
+    if (!dw || !dsc || !dxq || !dord || !dplan || !dout || (gate_up && !dw2)) {
+        fprintf(stderr, "fp4-bench: cudaMalloc failed\n");
+        return 1;
+    }
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0);
     cudaEventCreate(&t1);
     const int reps = 20;
-    for (int i = 0; i < 3; i++) {
-        if (ds4_qwen_fp4_moe_gemm(dw, dsc, dxq, x_per_slot, dord, dplan, N_EXPERT, N_USED, K, M, ROWS, dout, 1, 0) != 0) {
+    for (int i = 0; i < 3 + reps; i++) {
+        if (i == 3) cudaEventRecord(t0, 0);
+        const int rc = gate_up
+            ? ds4_qwen_fp4_moe_gate_up(dw, dsc, dw2, dsc, dxq, dord, dplan, N_EXPERT, N_USED, K, M, ROWS, dout, 0)
+            : ds4_qwen_fp4_moe_gemm(dw, dsc, dxq, x_per_slot, dord, dplan, N_EXPERT, N_USED, K, M, ROWS, dout, 1, 0);
+        if (rc != 0) {
             fprintf(stderr, "fp4-bench: launch failed\n");
             return 1;
         }
-    }
-    cudaEventRecord(t0, 0);
-    for (int i = 0; i < reps; i++) {
-        ds4_qwen_fp4_moe_gemm(dw, dsc, dxq, x_per_slot, dord, dplan, N_EXPERT, N_USED, K, M, ROWS, dout, 1, 0);
     }
     cudaEventRecord(t1, 0);
     if (cudaEventSynchronize(t1) != cudaSuccess) {
@@ -81,11 +86,11 @@ static int run(const char *name, int K, int M, int x_per_slot) {
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, t0, t1);
     ms /= (float)reps;
-    const double flop = 2.0 * SLOTS * (double)K * M;
-    const double bytes = (double)w_bytes + (double)xq_bytes + (double)SLOTS * M * 2.0;
+    const double flop = 2.0 * SLOTS * (double)K * M * (gate_up ? 2.0 : 1.0);
+    const double bytes = (double)w_bytes * (gate_up ? 2.0 : 1.0) + (double)xq_bytes + (gate_up ? (double)SLOTS * (M / 64) * 36.0 : (double)SLOTS * M * 2.0);
     printf("fp4-bench: %-5s K %4d M %4d: %.3f ms  %.1f TFLOP/s  %.0f GB/s over weights+activations+outputs (%.2f GB)\n",
            name, K, M, ms, flop / ms / 1e9, bytes / ms / 1e6, bytes / 1e9);
-    cudaFree(dw); cudaFree(dsc); cudaFree(dxq); cudaFree(dord); cudaFree(dplan); cudaFree(dout);
+    cudaFree(dw); cudaFree(dsc); cudaFree(dxq); cudaFree(dord); cudaFree(dplan); cudaFree(dout); cudaFree(dw2);
     free(w); free(scales); free(xq); free(esel); free(plan); free(order);
     return 0;
 }
@@ -110,5 +115,5 @@ static void memcpy_ref(void) {
 
 int main(void) {
     memcpy_ref();
-    return run("gate", 2560, 640, 0) || run("down", 640, 2560, 1);
+    return run("gate", 2560, 640, 0, 0) || run("down", 640, 2560, 1, 0) || run("gate+up", 2560, 640, 0, 1);
 }

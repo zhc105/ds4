@@ -49,6 +49,26 @@ int ds4_qwen_fp4_moe_gemm(
     int             out_bf16,
     cudaStream_t    stream);
 
+/* The gate and up projections (both [n_expert][M][K], M % 64 == 0) over
+ * per-token xq rows, fused with the down input: out_xq gets one NVFP4 row
+ * per slot of SiLU(gate) * up, the values ds4_qwen_fp4_quantize would make
+ * of the two bf16 outputs, which never touch memory. */
+int ds4_qwen_fp4_moe_gate_up(
+    const void     *W_gate,
+    const float    *scales_gate,
+    const void     *W_up,
+    const float    *scales_up,
+    const void     *xq,
+    const int32_t  *order,
+    const uint32_t *plan,
+    int             n_expert,
+    int             n_used,
+    int             K,
+    int             M,
+    int             rows,
+    void           *out_xq,
+    cudaStream_t    stream);
+
 #ifdef __cplusplus
 }
 #endif

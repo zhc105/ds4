@@ -2915,6 +2915,48 @@ extern "C" int ds4_gpu_qwen4exp_expert_fp4(
            cuda_ok(cudaGetLastError(), "Flash-Next FP4 expert GEMM launch");
 }
 
+/* The gate and up expert projections fused with the down input's
+ * quantisation (see ds4_qwen_fp4_moe_gate_up): out_xq gets one NVFP4 row
+ * per slot. */
+extern "C" int ds4_gpu_qwen4exp_expert_gate_up_fp4(
+        ds4_gpu_tensor       *out_xq,       /* [rows * n_used] NVFP4 rows of ff_dim */
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,   /* [n_expert][ff_dim][in_dim] NVFP4 */
+        uint64_t              gate_scales_offset,
+        uint64_t              up_offset,
+        uint64_t              up_scales_offset,
+        const ds4_gpu_tensor *xq,            /* NVFP4 rows per token */
+        const ds4_gpu_tensor *order,
+        const ds4_gpu_tensor *plan,
+        uint32_t              n_expert,
+        uint32_t              n_used,
+        uint32_t              in_dim,
+        uint32_t              ff_dim,
+        uint32_t              rows) {
+    const uint64_t expert_bytes = qwen35_weight_bytes(QWEN35_W_NVFP4, in_dim, ff_dim);
+    const uint64_t slots = (uint64_t)rows * n_used;
+    if (!model_map || rows == 0u || n_used == 0u || n_expert == 0u || expert_bytes == 0u || ff_dim % 64u != 0u ||
+        gate_offset > model_size || expert_bytes * n_expert > model_size - gate_offset ||
+        up_offset > model_size || expert_bytes * n_expert > model_size - up_offset ||
+        !out_xq || out_xq->bytes < slots * (ff_dim / 64u) * 36u ||
+        !xq || xq->bytes < (uint64_t)rows * (in_dim / 64u) * 36u ||
+        !order || order->bytes < slots * sizeof(int32_t) ||
+        !plan || plan->bytes < 4ull * (n_expert + 1u) * sizeof(uint32_t)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(out_xq);
+    const char *wg = cuda_resolve_weight_ptr(model_map, gate_offset, expert_bytes * n_expert, tier, "Flash-Next gate experts");
+    const char *wu = cuda_resolve_weight_ptr(model_map, up_offset, expert_bytes * n_expert, tier, "Flash-Next up experts");
+    const float *sg = glm53_cuda_weight_f32(model_map, model_size, gate_scales_offset, n_expert, tier, "Flash-Next gate scales");
+    const float *su = glm53_cuda_weight_f32(model_map, model_size, up_scales_offset, n_expert, tier, "Flash-Next up scales");
+    if (!wg || !wu || !sg || !su) return 0;
+    return ds4_qwen_fp4_moe_gate_up(wg, sg, wu, su, xq->ptr, (const int32_t *)order->ptr, (const uint32_t *)plan->ptr,
+                                    (int)n_expert, (int)n_used, (int)in_dim, (int)ff_dim, (int)rows,
+                                    out_xq->ptr, cuda_decode_stream()) == 0 &&
+           cuda_ok(cudaGetLastError(), "Flash-Next FP4 gate/up launch");
+}
+
 /* y = sum over slots of selw * ed, plus the shared expert already in y
  * scaled by its sigmoid gate. */
 /* y (the shared expert's output, f32 or bf16 as its GEMM stored it) times

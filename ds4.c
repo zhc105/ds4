@@ -17141,11 +17141,18 @@ static bool qwen_graph_moe(
          * checkpoint's recipe (see the plan's precision notes) */
         if (ok) ok = ds4_gpu_qwen4exp_expert_plan(g->eplan, g->eorder, g->esel, DS4_N_EXPERT, (uint32_t)slots) != 0;
         if (ok) ok = ds4_gpu_qwen4exp_quantize_fp4(g->hq, g->h, NULL, 0, n, DS4_N_EMBD) != 0;
-        /* the expert outputs are bf16, as the checkpoint's recipe has them,
-         * and the swiglu is folded into the quantisation of the down input */
-        if (ok) ok = qwen_graph_expert_fp4(g, m, l->ffn_gate_exps, g->eg, g->hq, false, true, n);
-        if (ok) ok = qwen_graph_expert_fp4(g, m, l->ffn_up_exps, g->eu, g->hq, false, true, n);
-        if (ok) ok = ds4_gpu_qwen4exp_quantize_fp4(g->egq, g->eg, g->eu, 1, (uint32_t)slots, DS4_N_FF_EXP) != 0;
+        /* gate and up in one pass whose epilogue applies the swiglu and
+         * quantises the down input (the bf16 outputs of the checkpoint's
+         * recipe, rounded exactly as when they were stored); the down
+         * projection's output is bf16 as that recipe has it */
+        if (ok) {
+            const ds4_tensor *gw = l->ffn_gate_exps, *uw = l->ffn_up_exps;
+            ok = ds4_gpu_qwen4exp_expert_gate_up_fp4(g->egq, m->map, m->size,
+                                                     gw->abs_offset, (uint64_t)((const uint8_t *)gw->scales - m->map),
+                                                     uw->abs_offset, (uint64_t)((const uint8_t *)uw->scales - m->map),
+                                                     g->hq, g->eorder, g->eplan, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                                                     DS4_N_EMBD, DS4_N_FF_EXP, n) != 0;
+        }
         if (ok) ok = qwen_graph_expert_fp4(g, m, l->ffn_down_exps, g->ed, g->egq, true, true, n);
     } else {
         if (ok) ok = qwen_graph_expert_proj(g, m, l->ffn_gate_exps, g->eg, g->h, false, n);

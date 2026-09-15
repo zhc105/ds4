@@ -3462,6 +3462,22 @@ int ds4_gpu_qwen4exp_expert_fp4(
         uint32_t              out_dim,
         uint32_t              rows,
         int                   out_bf16);
+int ds4_gpu_qwen4exp_expert_gate_up_fp4(
+        ds4_gpu_tensor       *out_xq,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              gate_scales_offset,
+        uint64_t              up_offset,
+        uint64_t              up_scales_offset,
+        const ds4_gpu_tensor *xq,
+        const ds4_gpu_tensor *order,
+        const ds4_gpu_tensor *plan,
+        uint32_t              n_expert,
+        uint32_t              n_used,
+        uint32_t              in_dim,
+        uint32_t              ff_dim,
+        uint32_t              rows);
 int ds4_gpu_qwen4exp_moe_combine(
         ds4_gpu_tensor       *y,
         int                   y_bf16,

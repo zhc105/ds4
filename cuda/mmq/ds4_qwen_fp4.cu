@@ -116,11 +116,21 @@ __host__ __device__ constexpr int stage_bytes() { return (TILE_ROWS + COLS) * (i
  * are gathered from that layout with 32-bit shared loads: the two
  * operands share a 16-value scale block, so any fixed order of the values
  * inside it is exact.  Warp w owns rows 32*(w/4).. as two m16 fragments
- * and columns (COLS/4)*(w%4).. . */
-template <int KS, int COLS>
+ * and columns (COLS/4)*(w%4).. .
+ *
+ * GATE_UP fuses the gate and up projections with the activation that
+ * feeds the down projection: the column tile is COLS/2 outputs of each,
+ * the B rows the gate's then the up's (W2, scales2), and the epilogue
+ * writes SiLU(gate) * up straight into the down input's NVFP4 blocks (a
+ * 64-column tile is one super-block per row), the values the separate
+ * bf16 gate, up and quantisation pass would produce, without the two
+ * bf16 tensors' round trip through memory. */
+template <int KS, int COLS, bool GATE_UP>
 __global__ void __launch_bounds__(NTHREADS, 2) moe_gemm_kernel(
-        void *out, uint32_t out_bf16, const block_nvfp4 *W, const float *scales, const block_nvfp4 *xq, uint32_t x_per_slot,
+        void *out, uint32_t out_bf16, const block_nvfp4 *W, const float *scales, const block_nvfp4 *W2, const float *scales2,
+        const block_nvfp4 *xq, uint32_t x_per_slot,
         const int32_t *order, const uint32_t *plan, uint32_t n_expert, uint32_t n_used, uint32_t K, uint32_t M) {
+    static_assert(!GATE_UP || COLS == 2 * QK_NVFP4, "a fused tile is one super-block of outputs per row");
     typedef moe_seg<KS> seg;
     constexpr uint32_t CPR = seg::BYTES / seg::CB;              /* copies per row segment */
     constexpr uint32_t ITEMS = (TILE_ROWS + COLS) * CPR;        /* copies per step */
@@ -160,19 +170,22 @@ __global__ void __launch_bounds__(NTHREADS, 2) moe_gemm_kernel(
         xrow_of[tid] = slot < 0 ? -1 : (x_per_slot ? slot : slot / (int32_t)n_used);
     }
     __syncthreads();
-    const uint32_t col0 = blockIdx.x * COLS;
+    constexpr uint32_t BCOLS = GATE_UP ? COLS / 2u : COLS;   /* output columns per tile */
+    const uint32_t col0 = blockIdx.x * BCOLS;
     const uint32_t n_super = K / QK_NVFP4;
     const uint32_t n_steps = n_super / KS;
     const uint32_t row_bytes = n_super * 36u;
     const char *xb = (const char *)xq;
     const char *wb = (const char *)(W + (size_t)e * M * n_super);
+    const char *w2b = GATE_UP ? (const char *)(W2 + (size_t)e * M * n_super) : wb;
 
     /* the tile's weight rows into L2, whole */
     {
         const uint32_t lpr = (row_bytes + 127u) / 128u;
         for (uint32_t i = tid; i < COLS * lpr; i += NTHREADS) {
-            const uint32_t r = col0 + i / lpr, l = (i % lpr) * 128u;
-            if (r < M && l < row_bytes) prefetch_l2(wb + (size_t)r * row_bytes + l);
+            const uint32_t b = i / lpr, l = (i % lpr) * 128u;
+            const uint32_t r = col0 + (b % BCOLS);
+            if (r < M && l < row_bytes) prefetch_l2((b < BCOLS ? wb : w2b) + (size_t)r * row_bytes + l);
         }
     }
 
@@ -188,8 +201,8 @@ __global__ void __launch_bounds__(NTHREADS, 2) moe_gemm_kernel(
             if (r < TILE_ROWS) {
                 const int32_t xr = xrow_of[r];
                 if (xr >= 0) src_off[p] = (uint32_t)xr * row_bytes + c * seg::CB;
-            } else if (col0 + r - TILE_ROWS < M) {
-                src_off[p] = (col0 + r - TILE_ROWS) * row_bytes + c * seg::CB;
+            } else if (col0 + (r - TILE_ROWS) % BCOLS < M) {
+                src_off[p] = (col0 + (r - TILE_ROWS) % BCOLS) * row_bytes + c * seg::CB;
             }
         }
     }
@@ -201,7 +214,8 @@ __global__ void __launch_bounds__(NTHREADS, 2) moe_gemm_kernel(
             if (i >= ITEMS) continue;
             const uint32_t r = i / CPR, c = i % CPR;
             const uint32_t off = src_off[p];
-            const char *src = (r < TILE_ROWS ? xb : wb) + (off == NONE ? 0u : off + step * seg::BYTES);
+            const char *base = r < TILE_ROWS ? xb : (r < TILE_ROWS + BCOLS ? wb : w2b);
+            const char *src = base + (off == NONE ? 0u : off + step * seg::BYTES);
             cp_async<seg::CB>(stage + r * seg::STRIDE + c * seg::CB, src, off == NONE ? 0u : seg::CB);
         }
         cp_async_commit();
@@ -257,7 +271,8 @@ __global__ void __launch_bounds__(NTHREADS, 2) moe_gemm_kernel(
     cp_async_wait<0>();
     __syncthreads();   /* the stages are free for the output tile */
     const float gscale = scales[e];
-    if (out_bf16 && M % 8u == 0u) {
+    const float gscale2 = GATE_UP ? scales2[e] : gscale;
+    if (GATE_UP || (out_bf16 && M % 8u == 0u)) {
         /* The fragments scatter 2-byte values over 16 rows per warp, which
          * the memory system pays for in whole sectors; the tile's outputs
          * are staged and each slot row leaves as contiguous 16-byte stores. */
@@ -271,11 +286,39 @@ __global__ void __launch_bounds__(NTHREADS, 2) moe_gemm_kernel(
                 for (int l = 0; l < 4; l++) {
                     const uint32_t row = wr + rf * 16u + lane / 4u + (l >> 1) * 8u;
                     const uint32_t col = wc + f * 8u + (lane % 4u) * 2u + (l & 1);
-                    cs[row * LD + col] = __float2bfloat16(C[rf][f][l] * gscale);
+                    cs[row * LD + col] = __float2bfloat16(C[rf][f][l] * (col < BCOLS ? gscale : gscale2));
                 }
             }
         }
         __syncthreads();
+        if (GATE_UP) {
+            /* thread per (row, 16-value sub-block): the bf16 gate and up
+             * values combine and quantise exactly as quantize_kernel does */
+            const uint32_t row = tid / 4u, s = tid % 4u;
+            const int32_t slot = slot_of[row];
+            if (slot < 0 || col0 >= M) return;
+            const __nv_bfloat16 *g = cs + row * LD + s * QK_NVFP4_SUB;
+            float v[QK_NVFP4_SUB];
+            float amax = 0.0f;
+#pragma unroll
+            for (int k = 0; k < QK_NVFP4_SUB; k++) {
+                const float x = __bfloat162float(g[k]);
+                v[k] = x / (1.0f + expf(-x)) * __bfloat162float(g[BCOLS + k]);
+                amax = fmaxf(amax, fabsf(v[k]));
+            }
+            const uint8_t code = ggml_cuda_fp32_to_ue4m3(amax / 6.0f);
+            const float half_scale = ggml_cuda_ue4m3_to_fp32(code);
+            const float inv = half_scale > 0.0f ? 0.5f / half_scale : 0.0f;
+            block_nvfp4 *blk = (block_nvfp4 *)out + (size_t)slot * (M / QK_NVFP4) + blockIdx.x;
+            blk->d[s] = code;
+            uint8_t *qs = blk->qs + s * (QK_NVFP4_SUB / 2);
+#pragma unroll
+            for (int b = 0; b < QK_NVFP4_SUB / 2; b++) {
+                qs[b] = (uint8_t)(ggml_cuda_float_to_fp4_e2m1(v[b], inv) |
+                                  (ggml_cuda_float_to_fp4_e2m1(v[b + QK_NVFP4_SUB / 2], inv) << 4));
+            }
+            return;
+        }
         constexpr uint32_t VEC = COLS / 8u;   /* uint4 of 8 bf16 per row */
         for (uint32_t i = tid; i < TILE_ROWS * VEC; i += NTHREADS) {
             const uint32_t row = i / VEC, col = col0 + (i % VEC) * 8u;
@@ -302,29 +345,54 @@ __global__ void __launch_bounds__(NTHREADS, 2) moe_gemm_kernel(
     }
 }
 
-template <int KS, int COLS>
+template <int KS, int COLS, bool GATE_UP>
 int launch_moe_gemm(
-        void *out, int out_bf16, const block_nvfp4 *W, const float *scales, const block_nvfp4 *xq, int x_per_slot,
-        const int32_t *order, const uint32_t *plan, int n_expert, int n_used, int K, int M, int rows,
-        cudaStream_t stream) {
+        void *out, int out_bf16, const block_nvfp4 *W, const float *scales, const block_nvfp4 *W2, const float *scales2,
+        const block_nvfp4 *xq, int x_per_slot, const int32_t *order, const uint32_t *plan,
+        int n_expert, int n_used, int K, int M, int rows, cudaStream_t stream) {
     constexpr int STAGED_OUT = TILE_ROWS * (COLS + 8) * 2;   /* the bf16 output tile of the epilogue */
     constexpr int STAGES = NSTAGE * stage_bytes<KS, COLS>();
     constexpr int SMEM = STAGES > STAGED_OUT ? STAGES : STAGED_OUT;
+    constexpr int BCOLS = GATE_UP ? COLS / 2 : COLS;
     static bool attr_ok = false;   /* the stages may exceed the 48 KiB default: opt in once per instantiation */
     if (!attr_ok) {
-        if (cudaFuncSetAttribute(moe_gemm_kernel<KS, COLS>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess ||
-            cudaFuncSetAttribute(moe_gemm_kernel<KS, COLS>, cudaFuncAttributePreferredSharedMemoryCarveout, 100) != cudaSuccess) {
+        if (cudaFuncSetAttribute(moe_gemm_kernel<KS, COLS, GATE_UP>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess ||
+            cudaFuncSetAttribute(moe_gemm_kernel<KS, COLS, GATE_UP>, cudaFuncAttributePreferredSharedMemoryCarveout, 100) != cudaSuccess) {
             return -3;
         }
         attr_ok = true;
     }
     /* every expert adds at most one partial tile to the slots' full tiles */
     const unsigned max_tiles = (unsigned)(((long long)rows * n_used + TILE_ROWS - 1) / TILE_ROWS) + (unsigned)n_expert;
-    const dim3 grid((unsigned)((M + COLS - 1) / COLS), max_tiles, 1u);
-    moe_gemm_kernel<KS, COLS><<<grid, dim3(32, NTHREADS / 32, 1), SMEM, stream>>>(
-        out, (uint32_t)(out_bf16 != 0), W, scales, xq, (uint32_t)(x_per_slot != 0), order, plan,
+    const dim3 grid((unsigned)((M + BCOLS - 1) / BCOLS), max_tiles, 1u);
+    moe_gemm_kernel<KS, COLS, GATE_UP><<<grid, dim3(32, NTHREADS / 32, 1), SMEM, stream>>>(
+        out, (uint32_t)(out_bf16 != 0), W, scales, W2, scales2, xq, (uint32_t)(x_per_slot != 0), order, plan,
         (uint32_t)n_expert, (uint32_t)n_used, (uint32_t)K, (uint32_t)M);
     return 0;
+}
+
+/* 4 super-blocks a step when the rows allow 16-byte copies (K % 256), else
+ * 2 with 8-byte ones: the gate/up rows of 2560 take the first, the down
+ * rows of 640 the second. */
+template <bool GATE_UP>
+int launch_moe_gemm_for(
+        void *out, int out_bf16, const void *W, const float *scales, const void *W2, const float *scales2,
+        const void *xq, int x_per_slot, const int32_t *order, const uint32_t *plan,
+        int n_expert, int n_used, int K, int M, int rows, cudaStream_t stream) {
+    if (!W || !scales || !xq || !order || !plan || !out || n_expert <= 0 || n_expert > MAX_EXPERT ||
+        n_used <= 0 || K <= 0 || K % (2 * QK_NVFP4) != 0 || M <= 0 || rows <= 0 ||
+        (GATE_UP && (!W2 || !scales2 || M % QK_NVFP4 != 0))) {
+        return -1;
+    }
+    const block_nvfp4 *w = (const block_nvfp4 *)W, *w2 = (const block_nvfp4 *)W2;
+    const block_nvfp4 *x = (const block_nvfp4 *)xq;
+    const int rc = (K / QK_NVFP4) % 4 == 0
+        ? launch_moe_gemm<4, 128, GATE_UP>(out, out_bf16, w, scales, w2, scales2, x, x_per_slot, order, plan,
+                                           n_expert, n_used, K, M, rows, stream)
+        : launch_moe_gemm<2, 128, GATE_UP>(out, out_bf16, w, scales, w2, scales2, x, x_per_slot, order, plan,
+                                           n_expert, n_used, K, M, rows, stream);
+    if (rc != 0) return rc;
+    return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }
 
 } // namespace
@@ -346,18 +414,14 @@ extern "C" int ds4_qwen_fp4_moe_gemm(
         const void *W, const float *scales, const void *xq, int x_per_slot,
         const int32_t *order, const uint32_t *plan, int n_expert, int n_used,
         int K, int M, int rows, void *out, int out_bf16, cudaStream_t stream) {
-    if (!W || !scales || !xq || !order || !plan || !out || n_expert <= 0 || n_expert > MAX_EXPERT ||
-        n_used <= 0 || K <= 0 || K % (2 * QK_NVFP4) != 0 || M <= 0 || rows <= 0) {
-        return -1;
-    }
-    const block_nvfp4 *w = (const block_nvfp4 *)W;
-    const block_nvfp4 *x = (const block_nvfp4 *)xq;
-    /* 4 super-blocks a step when the rows allow 16-byte copies (K % 256),
-     * else 2 with 8-byte ones: the gate/up rows of 2560 take the first,
-     * the down rows of 640 the second */
-    const int rc = (K / QK_NVFP4) % 4 == 0
-        ? launch_moe_gemm<4, 128>(out, out_bf16, w, scales, x, x_per_slot, order, plan, n_expert, n_used, K, M, rows, stream)
-        : launch_moe_gemm<2, 128>(out, out_bf16, w, scales, x, x_per_slot, order, plan, n_expert, n_used, K, M, rows, stream);
-    if (rc != 0) return rc;
-    return cudaGetLastError() == cudaSuccess ? 0 : -2;
+    return launch_moe_gemm_for<false>(out, out_bf16, W, scales, NULL, NULL, xq, x_per_slot, order, plan,
+                                      n_expert, n_used, K, M, rows, stream);
+}
+
+extern "C" int ds4_qwen_fp4_moe_gate_up(
+        const void *W_gate, const float *scales_gate, const void *W_up, const float *scales_up, const void *xq,
+        const int32_t *order, const uint32_t *plan, int n_expert, int n_used,
+        int K, int M, int rows, void *out_xq, cudaStream_t stream) {
+    return launch_moe_gemm_for<true>(out_xq, 1, W_gate, scales_gate, W_up, scales_up, xq, 0, order, plan,
+                                     n_expert, n_used, K, M, rows, stream);
 }
