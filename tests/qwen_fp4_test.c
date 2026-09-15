@@ -13,7 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { N_EXPERT = 5, N_USED = 3, ROWS = 45, TILE = 32, SLOTS = ROWS * N_USED };
+/* enough slots that experts get more than one tile, and partial ones */
+enum { N_EXPERT = 5, N_USED = 3, ROWS = 300, TILE = DS4_QWEN_FP4_TILE_ROWS, SLOTS = ROWS * N_USED };
 
 static const float e2m1[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
 
@@ -44,7 +45,7 @@ static void *dev_copy(const void *src, size_t bytes) {
     return d;
 }
 
-static int run(int K, int M) {
+static int run(int K, int M, int out_bf16) {
     const int n_super = K / 64;
     uint32_t seed = 7u + (uint32_t)K;
     /* random experts: valid UE4M3 scales (small exponents) and random nibbles */
@@ -79,7 +80,7 @@ static int run(int K, int M) {
     void *dout = dev_copy(NULL, (size_t)SLOTS * M * sizeof(float));
     if (!dw || !dsc || !dx || !dxq || !dord || !dplan || !dout) return 1;
     if (ds4_qwen_fp4_quantize(dx, NULL, 0, dxq, ROWS, K, 0) != 0 ||
-        ds4_qwen_fp4_moe_gemm(dw, dsc, dxq, 0, dord, dplan, N_EXPERT, N_USED, K, M, ROWS, dout, 0, 0) != 0 ||
+        ds4_qwen_fp4_moe_gemm(dw, dsc, dxq, 0, dord, dplan, N_EXPERT, N_USED, K, M, ROWS, dout, out_bf16, 0) != 0 ||
         cudaDeviceSynchronize() != cudaSuccess) {
         fprintf(stderr, "fp4-test: launch failed: %s\n", cudaGetErrorString(cudaGetLastError()));
         return 1;
@@ -88,6 +89,13 @@ static int run(int K, int M) {
     float *out = malloc((size_t)SLOTS * M * sizeof(float));
     if (cudaMemcpy(xq, dxq, xq_bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||
         cudaMemcpy(out, dout, (size_t)SLOTS * M * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return 1;
+    if (out_bf16) {   /* the bf16 outputs unpack in place, from the end */
+        const uint16_t *h = (const uint16_t *)out;
+        for (size_t i = (size_t)SLOTS * M; i-- > 0;) {
+            const uint32_t bits = (uint32_t)h[i] << 16;
+            memcpy(&out[i], &bits, sizeof(float));
+        }
+    }
 
     /* the quantiser must keep every value near its E2M1 grid point */
     double qerr = 0.0;
@@ -112,20 +120,21 @@ static int run(int K, int M) {
             const double got = out[(size_t)s * M + c];
             const double rel = fabs(got - ref) / (fabs(ref) + 1e-3);
             if (rel > maxrel) maxrel = rel;
-            if (rel > 1e-4 && bad++ < 5) {
+            if (rel > (out_bf16 ? 4e-3 : 1e-4) && bad++ < 5) {
                 fprintf(stderr, "fp4-test: K %d slot %d (expert %d) col %d: got %.6g want %.6g\n", K, s, e, c, got, ref);
             }
         }
     }
-    printf("fp4-test: K %d M %d: quantise max abs err %.3g (values up to 4), gemm max rel err %.3g, %d bad of %d\n",
-           K, M, qerr, maxrel, bad, SLOTS * M);
+    printf("fp4-test: K %d M %d %s: quantise max abs err %.3g (values up to 4), gemm max rel err %.3g, %d bad of %d\n",
+           K, M, out_bf16 ? "bf16" : "f32", qerr, maxrel, bad, SLOTS * M);
     cudaFree(dw); cudaFree(dsc); cudaFree(dx); cudaFree(dxq); cudaFree(dord); cudaFree(dplan); cudaFree(dout);
     free(w); free(x); free(xq); free(out);
     return bad == 0 && qerr < 1.0 ? 0 : 1;
 }
 
 int main(void) {
-    const int ok = run(640, 200) == 0 && run(2560, 136) == 0;
+    const int ok = run(640, 200, 0) == 0 && run(2560, 136, 0) == 0 &&
+                   run(640, 200, 1) == 0 && run(2560, 136, 1) == 0;
     printf("fp4-test: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

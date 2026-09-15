@@ -16,6 +16,11 @@
 extern "C" {
 #endif
 
+/* Slots per tile of the grouped GEMM: the expert plan counts tiles by it,
+ * and a tile holds one expert's whole share of a prefill chunk so its
+ * weight columns are read once (see moe_gemm_kernel). */
+#define DS4_QWEN_FP4_TILE_ROWS 64
+
 /* Quantise `rows` rows of K values (f32, or bf16 with in_bf16) into NVFP4
  * super-blocks (K % 64 == 0): per 16 values a UE4M3 scale of amax/6 and
  * nearest E2M1 codes.  With `up` the values are SiLU(x) * up (the expert
@@ -24,7 +29,7 @@ int ds4_qwen_fp4_quantize(const void *x, const void *up, int in_bf16, void *xq, 
 
 /* Grouped expert GEMM: out[slot][col] = scales[e] * xq[row(slot)] . W[e][col]
  * for every (token, slot) pair, with `plan`/`order` the expert grouping made
- * by ds4_gpu_qwen4exp_expert_plan (32-slot tiles).  W is the stacked
+ * by ds4_gpu_qwen4exp_expert_plan (DS4_QWEN_FP4_TILE_ROWS-slot tiles).  W is the stacked
  * [n_expert][M][K] NVFP4 tensor; xq has one NVFP4 row per slot (x_per_slot)
  * or per token (row = slot / n_used).  K % 128 == 0.  The output is f32, or
  * bf16 with out_bf16 (the checkpoint's recipe for the expert outputs). */

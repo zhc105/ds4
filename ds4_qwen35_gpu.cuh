@@ -2634,8 +2634,8 @@ extern "C" int ds4_gpu_qwen4exp_expert_matvec(
 
 /* Prefill grouping: the (token, slot) pairs sorted by expert so each expert's
  * weights are read once per chunk.  plan holds four [n_expert + 1] uint32
- * arrays: counts, slot starts, tile starts (QWEN35_MMA_ROWS slots per
- * tile), and the scatter cursors.
+ * arrays: counts, slot starts, tile starts (DS4_QWEN_FP4_TILE_ROWS slots
+ * per tile, the FP4 GEMM's), and the scatter cursors.
  * Slots inside an expert land in atomic order, which is harmless: every
  * output row is computed independently and written back to its own slot. */
 enum { QWEN4EXP_PLAN_COUNT = 0, QWEN4EXP_PLAN_START = 1, QWEN4EXP_PLAN_TILE = 2, QWEN4EXP_PLAN_CURSOR = 3 };
@@ -2655,7 +2655,8 @@ __global__ static void qwen4exp_expert_plan_kernel(uint32_t *plan, uint32_t n_ex
     uint32_t *tile = plan + QWEN4EXP_PLAN_TILE * (n_expert + 1u);
     uint32_t *cursor = plan + QWEN4EXP_PLAN_CURSOR * (n_expert + 1u);
     for (uint32_t pass = 0; pass < 2u; pass++) {
-        const uint32_t v = e < n_expert ? (pass == 0u ? count[e] : (count[e] + QWEN35_MMA_ROWS - 1u) / QWEN35_MMA_ROWS) : 0u;
+        const uint32_t v = e < n_expert ? (pass == 0u ? count[e] :
+                                           (count[e] + DS4_QWEN_FP4_TILE_ROWS - 1u) / DS4_QWEN_FP4_TILE_ROWS) : 0u;
         scan[e] = v;
         __syncthreads();
         for (uint32_t off = 1; off < n_expert; off <<= 1) {
