@@ -999,20 +999,33 @@ static void qwen35_matvec_q8p_rows(
 
 /* Prefill dequantises a slice of rows back to bf16 for the tensor-core
  * GEMM: the same bf16 x bf16 recipe as an unquantised bypass weight, with
- * the weights carrying q8_0's rounding. */
+ * the weights carrying q8_0's rounding.  A thread's block leaves as four
+ * 16-byte stores. */
+__device__ __forceinline__ uint32_t qwen35_bf16x2_bits(float a, float b) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
+    return *(const uint32_t *)&v;
+}
+
 __global__ static void qwen35_q8p_to_bf16_kernel(
         __nv_bfloat16 *dst, const int8_t *q, const __half *s, uint64_t n_blocks) {
     const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
     const float d = __half2float(s[b]);
     const uint4 *src = (const uint4 *)(q + b * 32u);
+    uint4 *o = (uint4 *)(dst + b * 32u);
     for (uint32_t h = 0; h < 2u; h++) {
         const uint4 w = src[h];
         float f[16];
         qwen35_unpack8(w.x, w.y, f);
         qwen35_unpack8(w.z, w.w, f + 8);
-        __nv_bfloat162 *o = (__nv_bfloat162 *)(dst + b * 32u + h * 16u);
-        for (uint32_t i = 0; i < 8u; i++) o[i] = __floats2bfloat162_rn(f[2u * i] * d, f[2u * i + 1u] * d);
+        uint4 v[2];
+        for (uint32_t i = 0; i < 2u; i++) {
+            const float *g = f + i * 8u;
+            v[i] = make_uint4(qwen35_bf16x2_bits(g[0] * d, g[1] * d), qwen35_bf16x2_bits(g[2] * d, g[3] * d),
+                              qwen35_bf16x2_bits(g[4] * d, g[5] * d), qwen35_bf16x2_bits(g[6] * d, g[7] * d));
+        }
+        o[2u * h] = v[0];
+        o[2u * h + 1u] = v[1];
     }
 }
 
@@ -1033,7 +1046,10 @@ static int qwen35_matmul_q8p(
         if (!cuda_ok(cudaGetLastError(), "Qwen bf16 convert launch")) return 0;
         a = buf;
     }
-    /* row slices of at most 64 MiB of bf16 weights through one scratch */
+    /* Row slices of at most 64 MiB of bf16 weights through one scratch,
+     * every bypass projection in one.  Smaller slices with the dequant of
+     * the next on a side stream measured slower: cuBLAS loses more on the
+     * narrower GEMMs than the overlap hides (16 MiB slices cost 8%). */
     static __nv_bfloat16 *scratch = NULL;
     static uint64_t scratch_elems = 0;
     const uint32_t slice_rows = p->in_dim ? (uint32_t)((32ull << 20) / p->in_dim) : 0u;
