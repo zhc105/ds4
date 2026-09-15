@@ -36,6 +36,38 @@ class NVFP4Tests(unittest.TestCase):
                 expect = (1 + man / 8) * 2.0 ** (exp - 7)
             self.assertEqual(float(got[b]), expect, msg=f"bits {b:#04x}")
 
+    def test_e4m3_is_signed(self):
+        bits = np.array([0x00, 0x38, 0xB8, 0x7E, 0xFE, 0x01, 0x81], dtype=np.uint8)
+        np.testing.assert_array_equal(hg.e4m3_to_f32(bits), [0.0, 1.0, -1.0, 448.0, -448.0, 2.0 ** -9, -(2.0 ** -9)])
+
+    def test_fp8_block_dequant(self):
+        codes = np.zeros((129, 257), dtype=np.uint8)
+        codes[0, 0], codes[0, 256], codes[128, 0], codes[128, 256] = 0x38, 0x38, 0xB8, 0x40
+        scale_inv = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
+        w = hg.fp8_block_dequant(codes, scale_inv)
+        self.assertEqual(w.shape, codes.shape)
+        self.assertEqual((w[0, 0], w[0, 256], w[128, 0], w[128, 256]), (1.0, 3.0, -4.0, 12.0))
+        self.assertEqual(np.count_nonzero(w), 4)
+
+    def test_quantize_scale_search_lowers_error(self):
+        rng = np.random.default_rng(7)
+        w = rng.standard_normal((16, 512)).astype(np.float32)
+        trials = hg.NVFP4_SCALE_TRIALS
+        try:
+            hg.NVFP4_SCALE_TRIALS = (0,)
+            raw0, s0 = hg.nvfp4_quantize(w)
+        finally:
+            hg.NVFP4_SCALE_TRIALS = trials
+        raw, s = hg.nvfp4_quantize(w)
+        self.assertEqual(s, s0)
+        err0 = np.sum((hg.nvfp4_dequant_gguf(raw0, 512, s0) - w) ** 2)
+        err = np.sum((hg.nvfp4_dequant_gguf(raw, 512, s) - w) ** 2)
+        self.assertLess(err, 0.85 * err0)
+        # Every block keeps a scale from the tried set around the amax code.
+        d0 = hg.f32_to_ue4m3(np.max(np.abs(w.reshape(16, 32, 16)), axis=-1) / 6.0 / s).astype(np.int32)
+        d = raw.reshape(16, 8, 36)[:, :, :4].reshape(16, 32).astype(np.int32)
+        self.assertTrue(np.all(np.isin(d - d0, trials)))
+
     def test_repack_preserves_values(self):
         rng = np.random.default_rng(1)
         weight, scale = random_modelopt(rng, 6, 192)

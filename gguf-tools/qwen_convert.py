@@ -2,7 +2,8 @@
 """Convert Qwen3.5 (dense) and Qwen3.8-Flash-Next (qwen4_exp) HF checkpoints to GGUF.
 
 Accepts BF16 checkpoints and ModelOpt NVFP4 checkpoints (AxionML/Qwen3.5-2B-NVFP4,
-RadixArk/Qwen3.8-Flash-Next-NVFP4).  Output follows llama.cpp's `qwen35` /
+nvidia/Qwen3.8-Flash-Next-NVFP4, RadixArk/Qwen3.8-Flash-Next-NVFP4; the MTP
+drafter's experts may be BF16 or block-scaled FP8).  Output follows llama.cpp's `qwen35` /
 `qwen4exp` layouts:
 
   blk.N.attn_qkv / attn_gate / ssm_alpha / ssm_beta / ssm_out   GDN projections
@@ -39,7 +40,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hf_gguf import (  # noqa: E402
     GGUFWriter, Q8_0_BLOCK, Q8_0_BLOCK_BYTES, SafeTensors, T_BF16, T_F16, T_F32, T_NVFP4,
-    T_Q8_0, TYPE_NAMES, bf16_to_f32, export_tokenizer, fail, ngram_header, nvfp4_quantize,
+    T_Q8_0, TYPE_NAMES, bf16_to_f32, export_tokenizer, fail, fp8_block_dequant, ngram_header, nvfp4_quantize,
     nvfp4_repack, nvfp4_stack_experts, q8_0_quantize, reorder_heads, v_head_perm,
 )
 
@@ -57,7 +58,9 @@ def load_config(hf_dir):
     text.setdefault("image_token_id", config.get("image_token_id"))
     quant = config.get("quantization_config", {})
     algo = quant.get("quant_algo") or ""
-    if algo and algo != "NVFP4":
+    # MIXED_PRECISION is NVIDIA's NVFP4 experts + FP8 MTP experts and PLE
+    # table; every tensor is recognised by its own companion scales below.
+    if algo and algo not in ("NVFP4", "MIXED_PRECISION"):
         fail(f"unsupported quantization {algo}; only NVFP4 ModelOpt checkpoints or BF16 are supported")
     return text
 
@@ -310,6 +313,25 @@ class Converter:
                     self.writer.add_tensor(gguf_base + suffix, [n_expert], T_F32, 4 * n_expert,
                                            lambda key=key: np.array([float(st.read_f32(name(e, key)).reshape(-1)[0])
                                                                      for e in range(n_expert)], dtype=np.float32))
+            return
+        if name(0, "weight_scale_inv") in st:
+            # nvidia/Qwen3.8-Flash-Next-NVFP4 ships the MTP drafter's experts
+            # as 128x128 block-scaled FP8.  The expert kernels are NVFP4 only,
+            # so dequantize and requantize; FP8 adds a tenth to the NVFP4 error.
+            self.uses_nvfp4 = True
+            out_features, n_cols = st.shape(name(0, "weight"))
+            scales = np.zeros(n_expert, dtype=np.float32)
+
+            def produce():
+                out = np.empty((n_expert, out_features, n_cols // 64 * 36), dtype=np.uint8)
+                for e in range(n_expert):
+                    w = fp8_block_dequant(st.read(name(e, "weight")), st.read_f32(name(e, "weight_scale_inv")))
+                    out[e], scales[e] = nvfp4_quantize(w)
+                return out
+
+            self.writer.add_tensor(gguf_base + ".weight", [n_expert, out_features, n_cols], T_NVFP4,
+                                   n_expert * out_features * (n_cols // 64 * 36), produce)
+            self.writer.add_tensor(gguf_base + ".scale", [n_expert], T_F32, 4 * n_expert, lambda: scales)
             return
         dtype = st.dtype(name(0, "weight"))
         if dtype not in SOURCE_TYPES:
