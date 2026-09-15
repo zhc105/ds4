@@ -16974,28 +16974,41 @@ static bool qwen_graph_alloc(ds4_qwen_gpu_graph *g, uint32_t ctx, uint32_t max_r
     return ok;
 }
 
+/* Whether a prefill chunk's projections leave their outputs in bf16: the
+ * checkpoint's recipe rounds every linear to bf16, and the f32 store of a
+ * wide projection was a quarter of its GEMM time.  Decode keeps f32 (its
+ * matvecs and the captured islands read it), as does the dense 2B model,
+ * the exact-against-the-CPU-reference guardrail. */
+static bool qwen_graph_bf16_out(uint32_t n_tok) {
+    return n_tok > 8u && ds4_qwen_has_hc();
+}
+
 /* out[n_tok][out_dim] = x[n_tok][in_dim] W^T with the global scale applied,
- * for any linear type the loader accepts. */
+ * for any linear type the loader accepts; the output f32, or bf16 when
+ * out_bf16 (its consumer then reads it so). */
 static bool qwen_graph_matmul(
         ds4_gpu_tensor   *out,
         const ds4_model  *m,
         const ds4_tensor *w,
         ds4_gpu_tensor   *x,
-        uint32_t          n_tok) {
+        uint32_t          n_tok,
+        bool              out_bf16) {
     return ds4_gpu_qwen35_matmul(out, m->map, m->size, w->abs_offset, w->type, w->scale,
-                                 (uint32_t)w->dim[0], (uint32_t)w->dim[1], x, NULL, n_tok) != 0;
+                                 (uint32_t)w->dim[0], (uint32_t)w->dim[1], x, NULL, n_tok, out_bf16) != 0;
 }
 
-/* The same with a bf16 copy of x that the producer already wrote. */
+/* The same with a bf16 copy of x that the producer already wrote (x itself
+ * may be NULL when only the copy exists). */
 static bool qwen_graph_matmul_bf16(
         ds4_gpu_tensor   *out,
         const ds4_model  *m,
         const ds4_tensor *w,
         ds4_gpu_tensor   *x,
         ds4_gpu_tensor   *x_bf16,
-        uint32_t          n_tok) {
+        uint32_t          n_tok,
+        bool              out_bf16) {
     return ds4_gpu_qwen35_matmul(out, m->map, m->size, w->abs_offset, w->type, w->scale,
-                                 (uint32_t)w->dim[0], (uint32_t)w->dim[1], x, x_bf16, n_tok) != 0;
+                                 (uint32_t)w->dim[0], (uint32_t)w->dim[1], x, x_bf16, n_tok, out_bf16) != 0;
 }
 
 /* The same over the sub-layer input h, whose bf16 copy qwen_graph_sublayer_in
@@ -17005,9 +17018,10 @@ static bool qwen_graph_matmul_h(
         ds4_gpu_tensor     *out,
         const ds4_model    *m,
         const ds4_tensor   *w,
-        uint32_t            n_tok) {
+        uint32_t            n_tok,
+        bool                out_bf16) {
     return ds4_gpu_qwen35_matmul(out, m->map, m->size, w->abs_offset, w->type, w->scale,
-                                 (uint32_t)w->dim[0], (uint32_t)w->dim[1], g->h, g->h_bf16, n_tok) != 0;
+                                 (uint32_t)w->dim[0], (uint32_t)w->dim[1], g->h, g->h_bf16, n_tok, out_bf16) != 0;
 }
 
 /* Hyper-connection mix of the n rows of x into mixed; inject, when given,
@@ -17028,7 +17042,7 @@ static bool qwen_graph_hc_mix(
               ds4_gpu_qwen4exp_stream_norm(n > 8u ? NULL : g->xn, g->xn_bf16, x, m->map, m->size, hc->norm->abs_offset,
                                            DS4_N_EMBD, DS4_N_HC, n, DS4_RMS_EPS) != 0;
     g->xn_ready = false;
-    if (ok) ok = qwen_graph_matmul_bf16(g->lo, m, hc->down, g->xn, xn_bf16, n);
+    if (ok) ok = qwen_graph_matmul_bf16(g->lo, m, hc->down, g->xn, xn_bf16, n, false);
     /* prefill: SiLU, the gate GEMM written in bf16 (its f32 output was its
      * whole cost), the mix.  Decode: the three in one launch, the gate
      * never stored. */
@@ -17041,7 +17055,7 @@ static bool qwen_graph_hc_mix(
         ok = ds4_gpu_qwen4exp_hc_gate_mix(mixed, m->map, m->size, hc->up->abs_offset, hc->up->type, hc->up->scale,
                                           g->lo, g->xn_bf16, DS4_N_HC_LOW, DS4_N_EMBD, DS4_N_HC, n) != 0;
     }
-    if (ok && inject) ok = qwen_graph_matmul_bf16(inject, m, hc->inject, g->xn, xn_bf16, n);
+    if (ok && inject) ok = qwen_graph_matmul_bf16(inject, m, hc->inject, g->xn, xn_bf16, n, false);
     return ok;
 }
 
@@ -17068,9 +17082,10 @@ static bool qwen_graph_sublayer_out(
         const ds4_model           *m,
         const ds4_qwen_hc_weights *next,
         uint32_t                   n) {
+    const bool y_bf16 = qwen_graph_bf16_out(n);
     if (!ds4_qwen_has_hc()) return ds4_gpu_add_tensor(g->x, g->x, g->y, n * DS4_N_EMBD) != 0;
-    if (!next) return ds4_gpu_qwen4exp_hc_combine(g->x, g->y, g->inject, DS4_N_EMBD, DS4_N_HC, n) != 0;
-    g->xn_ready = ds4_gpu_qwen4exp_hc_combine_norm(g->x, n > 8u ? NULL : g->xn, g->xn_bf16, g->y, g->inject,
+    if (!next) return ds4_gpu_qwen4exp_hc_combine(g->x, g->y, y_bf16, g->inject, DS4_N_EMBD, DS4_N_HC, n) != 0;
+    g->xn_ready = ds4_gpu_qwen4exp_hc_combine_norm(g->x, n > 8u ? NULL : g->xn, g->xn_bf16, g->y, y_bf16, g->inject,
                                                    m->map, m->size, next->norm->abs_offset,
                                                    DS4_N_EMBD, DS4_N_HC, n, DS4_RMS_EPS) != 0;
     return g->xn_ready;
@@ -17117,7 +17132,8 @@ static bool qwen_graph_moe(
         uint32_t                 n) {
     const uint32_t n_used = DS4_N_EXPERT_USED;
     const uint64_t slots = (uint64_t)n * n_used;
-    bool ok = qwen_graph_matmul_h(g, g->router, m, l->ffn_gate_inp, n);
+    const bool bf16 = qwen_graph_bf16_out(n);
+    bool ok = qwen_graph_matmul_h(g, g->router, m, l->ffn_gate_inp, n, false);   /* exact f32: the top-k depends on it */
     if (ok) ok = ds4_gpu_qwen4exp_router(g->esel, g->selw, g->router, DS4_N_EXPERT, n_used, n) != 0;
     if (n > 8u) {
         /* prefill: group the slots by expert and run the three projections
@@ -17137,12 +17153,20 @@ static bool qwen_graph_moe(
         if (ok) ok = ds4_gpu_swiglu_tensor(g->eg, g->eg, g->eu, (uint32_t)(slots * DS4_N_FF_EXP), 0.0f, 1.0f) != 0;
         if (ok) ok = qwen_graph_expert_proj(g, m, l->ffn_down_exps, g->ed, g->eg, true, n);
     }
-    if (ok) ok = qwen_graph_matmul_h(g, g->mixed, m, l->ffn_gate_shexp, n);
-    if (ok) ok = qwen_graph_matmul_h(g, g->z, m, l->ffn_up_shexp, n);
-    if (ok) ok = ds4_gpu_swiglu_tensor(g->mixed, g->mixed, g->z, n * DS4_N_FF_SHEXP, 0.0f, 1.0f) != 0;
-    if (ok) ok = qwen_graph_matmul(g->y, m, l->ffn_down_shexp, g->mixed, n);
-    if (ok) ok = qwen_graph_matmul_h(g, g->sg, m, l->ffn_gate_inp_shexp, n);
-    if (ok) ok = ds4_gpu_qwen4exp_moe_combine(g->y, g->ed, n > 8u, g->selw, g->sg, DS4_N_EMBD, n_used, n) != 0;
+    /* the shared expert: gate and up, their swiglu, down.  A prefill chunk
+     * keeps all three in bf16, the down GEMM reading the product as its
+     * bf16 operand directly. */
+    if (ok) ok = qwen_graph_matmul_h(g, g->mixed, m, l->ffn_gate_shexp, n, bf16);
+    if (ok) ok = qwen_graph_matmul_h(g, g->z, m, l->ffn_up_shexp, n, bf16);
+    if (bf16) {
+        if (ok) ok = ds4_gpu_qwen4exp_swiglu_bf16(g->mixed, g->mixed, g->z, (uint64_t)n * DS4_N_FF_SHEXP) != 0;
+        if (ok) ok = qwen_graph_matmul_bf16(g->y, m, l->ffn_down_shexp, NULL, g->mixed, n, true);
+    } else {
+        if (ok) ok = ds4_gpu_swiglu_tensor(g->mixed, g->mixed, g->z, n * DS4_N_FF_SHEXP, 0.0f, 1.0f) != 0;
+        if (ok) ok = qwen_graph_matmul(g->y, m, l->ffn_down_shexp, g->mixed, n, false);
+    }
+    if (ok) ok = qwen_graph_matmul_h(g, g->sg, m, l->ffn_gate_inp_shexp, n, false);
+    if (ok) ok = ds4_gpu_qwen4exp_moe_combine(g->y, bf16, g->ed, n > 8u, g->selw, g->sg, DS4_N_EMBD, n_used, n) != 0;
     return ok;
 }
 
@@ -17156,8 +17180,8 @@ static bool qwen_graph_ple(
         uint32_t                 il,
         uint32_t                 n,
         bool                     batched) {
-    bool ok = qwen_graph_matmul(g->pkey, m, l->ple_key, g->emb, n);
-    if (ok) ok = qwen_graph_matmul(g->pval, m, l->ple_value, g->emb, n);
+    bool ok = qwen_graph_matmul(g->pkey, m, l->ple_key, g->emb, n, false);
+    if (ok) ok = qwen_graph_matmul(g->pval, m, l->ple_value, g->emb, n, false);
     if (ok) ok = ds4_gpu_qwen4exp_ple_gate(g->hgate, g->pnorm, g->pkey, g->x, g->pval, m->map, m->size,
                                            l->ple_norm_key->abs_offset, l->ple_norm_query->abs_offset,
                                            l->ple_norm_conv->abs_offset, DS4_N_EMBD, DS4_N_HC, n, DS4_RMS_EPS) != 0;
@@ -17270,7 +17294,7 @@ static bool qwen_graph_qsa_select(
     const uint32_t d = DS4_N_INDEXER_HEAD_DIM;
     const uint32_t budget = DS4_N_INDEXER_TOP_K / r;
     const uint32_t slot = qwen_slot(QWEN_SLOT_QSA, il);
-    *ok = qwen_graph_matmul_h(g, g->ikraw, m, l->indexer_k, n) &&
+    *ok = qwen_graph_matmul_h(g, g->ikraw, m, l->indexer_k, n, false) &&
           ds4_gpu_qwen4exp_block_keys(g->slots, slot, g->ikraw, m->map, m->size,
                                       l->indexer_k_norm->abs_offset, d, r, DS4_N_ROT, g->ctx, pos_end, n, batched,
                                       DS4_ROPE_FREQ_BASE, DS4_RMS_EPS, g->snapshot ? g->snap_khist[il] : NULL) != 0;
@@ -17279,7 +17303,7 @@ static bool qwen_graph_qsa_select(
      * row, which is safe, since within the budget the selection is every
      * cell (the select kernel's short-row case). */
     if (!*ok || dense || pos_end / r <= budget) return false;
-    *ok = qwen_graph_matmul_h(g, g->iq, m, l->indexer_q, n) &&
+    *ok = qwen_graph_matmul_h(g, g->iq, m, l->indexer_q, n, false) &&
           ds4_gpu_qwen4exp_indexer_query(g->iq, g->slots, slot, m->map, m->size, l->indexer_q_norm->abs_offset,
                                          DS4_N_INDEXER_HEAD, d, DS4_N_ROT, n, batched,
                                          DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) != 0 &&
@@ -17298,6 +17322,7 @@ static bool qwen_graph_qsa_select(
  * activations through the same helper so build_direction.py works unchanged. */
 static void metal_graph_debug_dump_tensor(const char *name, ds4_gpu_tensor *t,
                                           uint64_t n_f32, uint32_t il, uint32_t pos);
+static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos);
 
 /* Directional steering: y -= scale * dir[il] * dot(dir[il], y).  The
  * direction is DS4_N_EMBD wide and the edit lands on the sub-layer output,
@@ -17306,6 +17331,7 @@ static void metal_graph_debug_dump_tensor(const char *name, ds4_gpu_tensor *t,
 static bool qwen_graph_apply_steering(
         ds4_qwen_gpu_graph *g,
         ds4_gpu_tensor     *y,
+        bool                y_bf16,
         uint32_t            il,
         uint32_t            rows,
         float               scale) {
@@ -17314,8 +17340,10 @@ static bool qwen_graph_apply_steering(
      * the last row of the table: the predictor carries no direction, so it
      * runs unsteered rather than reading off the end of the tensor. */
     if (il >= directional_steering_layer_count()) return true;
-    if (ds4_gpu_directional_steering_project_tensor(y, g->steering_dirs, il,
-                                                    DS4_N_EMBD, rows, scale) != 0) {
+    const int steered = y_bf16
+        ? ds4_gpu_qwen4exp_steer_bf16(y, g->steering_dirs, il, DS4_N_EMBD, rows, scale)
+        : ds4_gpu_directional_steering_project_tensor(y, g->steering_dirs, il, DS4_N_EMBD, rows, scale);
+    if (steered != 0) {
         return true;
     }
     fprintf(stderr, "ds4: directional steering failed on layer %u\n", il);
@@ -17331,19 +17359,20 @@ static bool qwen_graph_layer_tail(
         ds4_gpu_tensor          *att_bf16,
         uint32_t                 il,
         uint32_t                 n) {
-    bool ok = qwen_graph_matmul_bf16(g->y, m, out_proj, g->att, att_bf16, n);
-    if (ok) ok = qwen_graph_apply_steering(g, g->y, il, n, g->steering_attn_scale);
+    const bool bf16 = qwen_graph_bf16_out(n);
+    bool ok = qwen_graph_matmul_bf16(g->y, m, out_proj, g->att, att_bf16, n, bf16);
+    if (ok) ok = qwen_graph_apply_steering(g, g->y, bf16, il, n, g->steering_attn_scale);
     if (ok) ok = qwen_graph_sublayer_out(g, m, &l->hc_mix_ffn, n);
     if (ok) ok = qwen_graph_sublayer_in(g, m, l->post_attention_norm, &l->hc_mix_ffn, n);
     if (ds4_qwen_is_moe()) {
         if (ok) ok = qwen_graph_moe(g, m, l, n);
     } else {
-        if (ok) ok = qwen_graph_matmul_h(g, g->mixed, m, l->ffn_gate, n);
-        if (ok) ok = qwen_graph_matmul_h(g, g->z, m, l->ffn_up, n);
+        if (ok) ok = qwen_graph_matmul_h(g, g->mixed, m, l->ffn_gate, n, false);
+        if (ok) ok = qwen_graph_matmul_h(g, g->z, m, l->ffn_up, n, false);
         if (ok) ok = ds4_gpu_swiglu_tensor(g->mixed, g->mixed, g->z, n * DS4_N_FF_DENSE, 0.0f, 1.0f) != 0;
-        if (ok) ok = qwen_graph_matmul(g->y, m, l->ffn_down, g->mixed, n);
+        if (ok) ok = qwen_graph_matmul(g->y, m, l->ffn_down, g->mixed, n, false);
     }
-    if (ok) ok = qwen_graph_apply_steering(g, g->y, il, n, g->steering_ffn_scale);
+    if (ok) ok = qwen_graph_apply_steering(g, g->y, bf16, il, n, g->steering_ffn_scale);
     return ok && qwen_graph_sublayer_out(g, m, next ? &next->hc_mix_attn : NULL, n);
 }
 
@@ -17368,17 +17397,20 @@ static bool qwen_graph_layer_island(
     if (ds4_qwen_layer_has_ple(il)) ok = qwen_graph_ple(g, m, l, il, n, batched);
     if (ok) ok = qwen_graph_sublayer_in(g, m, l->attn_norm, &l->hc_mix_attn, n);
     if (!ds4_qwen_layer_is_gdn(il)) {
-        if (ok) ok = qwen_graph_matmul_h(g, g->proj, m, l->attn_q, n);
-        if (ok) ok = qwen_graph_matmul_h(g, g->k, m, l->attn_k, n);
-        if (ok) ok = qwen_graph_matmul_h(g, g->v, m, l->attn_v, n);
+        if (ok) ok = qwen_graph_matmul_h(g, g->proj, m, l->attn_q, n, false);
+        if (ok) ok = qwen_graph_matmul_h(g, g->k, m, l->attn_k, n, false);
+        if (ok) ok = qwen_graph_matmul_h(g, g->v, m, l->attn_v, n, false);
         return ok;
     }
-    if (ok) ok = qwen_graph_matmul_h(g, g->proj, m, l->attn_qkv, n);
-    if (ok) ok = qwen_graph_matmul_h(g, g->z, m, l->attn_gate, n);
-    if (ok) ok = qwen_graph_matmul_h(g, g->alpha, m, l->ssm_alpha, n);
-    if (ok) ok = qwen_graph_matmul_h(g, g->beta, m, l->ssm_beta, n);
+    /* the wide qkv and gate projections in bf16 for a prefill chunk; the
+     * per-head alpha and beta stay f32 */
+    const bool bf16 = qwen_graph_bf16_out(n);
+    if (ok) ok = qwen_graph_matmul_h(g, g->proj, m, l->attn_qkv, n, bf16);
+    if (ok) ok = qwen_graph_matmul_h(g, g->z, m, l->attn_gate, n, bf16);
+    if (ok) ok = qwen_graph_matmul_h(g, g->alpha, m, l->ssm_alpha, n, false);
+    if (ok) ok = qwen_graph_matmul_h(g, g->beta, m, l->ssm_beta, n, false);
     if (ok) ok = ds4_gpu_qwen35_gdn(g->att, att_bf16, g->mixed, g->slots, qwen_slot(QWEN_SLOT_GDN, il),
-                                    g->proj, g->z, g->alpha, g->beta, m->map, m->size,
+                                    g->proj, g->z, g->alpha, g->beta, bf16, m->map, m->size,
                                     l->ssm_conv1d->abs_offset, l->ssm_a->abs_offset,
                                     l->ssm_dt->abs_offset, l->ssm_norm->abs_offset,
                                     DS4_N_KDA_HEAD, DS4_N_KDA_V_HEAD, DS4_N_KDA_CONV,
@@ -17476,10 +17508,17 @@ static bool qwen_graph_layer(
      * whole chunk goes out, not just the first row: row 0 is the prompt's
      * first token, which a shared system prompt makes identical for every
      * prompt, and the builder reads the last row (the prompt's last token). */
-    if (ok) metal_graph_debug_dump_tensor("ffn_out", g->y, (uint64_t)n * DS4_N_EMBD, il, pos_end - n);
+    ds4_gpu_tensor *y = g->y;
+    if (ok && qwen_graph_bf16_out(n) && (trace || metal_graph_debug_wants("ffn_out", il, pos_end - n))) {
+        /* the diagnostics read f32 rows: widen the chunk's bf16 y into the
+         * free FFN scratch */
+        y = g->mixed;
+        ok = ds4_gpu_qwen35_f32(y, g->y, (uint64_t)n * DS4_N_EMBD) != 0;
+    }
+    if (ok) metal_graph_debug_dump_tensor("ffn_out", y, (uint64_t)n * DS4_N_EMBD, il, pos_end - n);
     /* DS4_QWEN_TRACE=1: the CPU reference's per-layer norms for the chunk's
      * last row, to locate a divergence by layer and position. */
-    if (ok && getenv("DS4_QWEN_TRACE")) {
+    if (ok && trace) {
         const uint64_t nx = ds4_qwen_has_hc() ? (uint64_t)DS4_N_HC * DS4_N_EMBD : DS4_N_EMBD;
         float *buf = xmalloc(nx * sizeof(float));
         double sx = 0, sh = 0, sy = 0;
@@ -17499,7 +17538,7 @@ static bool qwen_graph_layer(
         if (ds4_gpu_tensor_read(g->h, (uint64_t)(n - 1u) * DS4_N_EMBD * sizeof(float), buf, DS4_N_EMBD * sizeof(float))) {
             for (uint64_t i = 0; i < DS4_N_EMBD; i++) sh += (double)buf[i] * buf[i];
         }
-        if (ds4_gpu_tensor_read(g->y, (uint64_t)(n - 1u) * DS4_N_EMBD * sizeof(float), buf, DS4_N_EMBD * sizeof(float))) {
+        if (ds4_gpu_tensor_read(y, (uint64_t)(n - 1u) * DS4_N_EMBD * sizeof(float), buf, DS4_N_EMBD * sizeof(float))) {
             for (uint64_t i = 0; i < DS4_N_EMBD; i++) sy += (double)buf[i] * buf[i];
         }
         fprintf(stderr, "trace pos %u layer %u |x|=%.4g |h|=%.4g |ffn|=%.4g\n", pos_end - 1u, il,
@@ -17563,10 +17602,10 @@ static bool qwen_graph_mtp_forward(
               (g->image_count == 0 || qwen_graph_overlay_images(g, g->h, 1u, pos0 + 1u, n)) &&
               ds4_gpu_rms_norm_weight_rows_tensor(g->y, g->h, mm->map, mm->size, mw->enorm->abs_offset,
                                                   DS4_N_EMBD, n, DS4_RMS_EPS) != 0 &&
-              qwen_graph_matmul(g->proj, mm, mw->fc_embedding, g->y, n) &&
+              qwen_graph_matmul(g->proj, mm, mw->fc_embedding, g->y, n, false) &&
               ds4_gpu_qwen4exp_mtp_norm(g->xn, g->mtp_hid, mm->map, mm->size, mw->hnorm->abs_offset,
                                         (uint32_t)x_dim, n, DS4_RMS_EPS) != 0 &&
-              qwen_graph_matmul(g->hgate, mm, mw->fc_hidden, g->xn, n * DS4_N_HC) &&
+              qwen_graph_matmul(g->hgate, mm, mw->fc_hidden, g->xn, n * DS4_N_HC, false) &&
               ds4_gpu_qwen4exp_mtp_fuse(g->x, g->hgate, g->proj, DS4_N_EMBD, DS4_N_HC, n) != 0;
     g->xn_ready = false;
     if (ok) ok = qwen_graph_layer(g, mm, &mw->layer, NULL, DS4_N_LAYER, n, pos0 + n, false);
@@ -17574,8 +17613,8 @@ static bool qwen_graph_mtp_forward(
         ds4_gpu_tensor *x = ds4_gpu_tensor_view(g->x, (uint64_t)(n - 1u) * x_dim * 2u, x_dim * 2u);
         ds4_gpu_tensor *h = ds4_gpu_tensor_view(g->h, 0, (uint64_t)DS4_N_EMBD * sizeof(float));
         ok = x && h && qwen_graph_hc_mix(g, mm, &mw->mixer, x, 1, h, NULL) &&
-             (mw->output ? qwen_graph_matmul(g->logits, mm, mw->output, h, 1)
-                         : qwen_graph_matmul(g->logits, m, w->output, h, 1)) &&
+             (mw->output ? qwen_graph_matmul(g->logits, mm, mw->output, h, 1, false)
+                         : qwen_graph_matmul(g->logits, m, w->output, h, 1, false)) &&
              ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         if (x) ds4_gpu_tensor_free(x);
         if (h) ds4_gpu_tensor_free(h);
@@ -17602,7 +17641,7 @@ static bool qwen_graph_head(
             : ds4_gpu_rms_norm_weight_tensor(h, x, m->map, m->size, w->output_norm->abs_offset,
                                              DS4_N_EMBD, DS4_RMS_EPS) != 0;
     }
-    if (ok) ok = qwen_graph_matmul(g->logits, m, w->output, h, 1);
+    if (ok) ok = qwen_graph_matmul(g->logits, m, w->output, h, 1, false);
     if (x) ds4_gpu_tensor_free(x);
     if (h) ds4_gpu_tensor_free(h);
     return ok;
@@ -17619,7 +17658,7 @@ static bool qwen_graph_head_rows(
         ? qwen_graph_hc_mix(g, m, &w->output_hc_mix, g->x, n, g->h, NULL)
         : ds4_gpu_rms_norm_weight_rows_tensor(g->h, g->x, m->map, m->size, w->output_norm->abs_offset,
                                               DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
-    return ok && qwen_graph_matmul(g->logits, m, w->output, g->h, n);
+    return ok && qwen_graph_matmul(g->logits, m, w->output, g->h, n, false);
 }
 
 /* Fold n tokens into the state, in max_rows chunks.  logits_out, when set,

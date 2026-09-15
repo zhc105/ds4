@@ -3207,8 +3207,10 @@ int ds4_gpu_qwen35_matmul(
         uint32_t              out_dim,
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *x_bf16,
-        uint32_t              n_tok);
+        uint32_t              n_tok,
+        int                   out_bf16);
 int ds4_gpu_qwen35_bf16(ds4_gpu_tensor *dst, const ds4_gpu_tensor *x, uint64_t n);
+int ds4_gpu_qwen35_f32(ds4_gpu_tensor *dst, const ds4_gpu_tensor *x, uint64_t n);
 /* Quantise (bf16) or re-lay (q8_0) a bypass weight into the packed q8
  * buffers the decode kernels stream; its span is then not cached. */
 int ds4_gpu_qwen35_q8_pack(
@@ -3235,6 +3237,7 @@ int ds4_gpu_qwen35_gdn(
         const ds4_gpu_tensor *z,
         const ds4_gpu_tensor *alpha,
         const ds4_gpu_tensor *beta,
+        int                   proj_bf16,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              conv_w_offset,
@@ -3373,6 +3376,7 @@ int ds4_gpu_qwen4exp_hc_mix(
 int ds4_gpu_qwen4exp_hc_combine(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *y,
+        int                   y_bf16,
         const ds4_gpu_tensor *inject,
         uint32_t              n_embd,
         uint32_t              n_hc,
@@ -3382,6 +3386,7 @@ int ds4_gpu_qwen4exp_hc_combine_norm(
         ds4_gpu_tensor       *xn,
         ds4_gpu_tensor       *xn_bf16,
         const ds4_gpu_tensor *y,
+        int                   y_bf16,
         const ds4_gpu_tensor *inject,
         const void           *model_map,
         uint64_t              model_size,
@@ -3459,6 +3464,7 @@ int ds4_gpu_qwen4exp_expert_fp4(
         int                   out_bf16);
 int ds4_gpu_qwen4exp_moe_combine(
         ds4_gpu_tensor       *y,
+        int                   y_bf16,
         const ds4_gpu_tensor *ed,
         int                   ed_bf16,
         const ds4_gpu_tensor *selw,
@@ -3466,6 +3472,18 @@ int ds4_gpu_qwen4exp_moe_combine(
         uint32_t              n_embd,
         uint32_t              n_used,
         uint32_t              rows);
+int ds4_gpu_qwen4exp_swiglu_bf16(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint64_t              n);
+int ds4_gpu_qwen4exp_steer_bf16(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *directions,
+        uint32_t              layer,
+        uint32_t              width,
+        uint32_t              rows,
+        float                 scale);
 int ds4_gpu_qwen4exp_ple_gate(
         ds4_gpu_tensor       *gated,
         ds4_gpu_tensor       *pnorm,
