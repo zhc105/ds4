@@ -41,7 +41,9 @@ typedef struct {
     char sha[41];          /* of the key bytes */
     uint64_t offset;       /* the state blob */
     uint64_t bytes;
-    uint64_t key_offset;   /* the key bytes when they are not the text's prefix; 0 otherwise */
+    uint64_t key_offset;   /* the state's own key when it is not the text's prefix:
+                            * the u32 length that precedes the key bytes, which
+                            * start four bytes further; 0 otherwise */
 } ds4_kvstore_state;
 
 /* A checkpoint file holds one conversation: the blocks of its history
@@ -193,10 +195,13 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
                                        char *err,
                                        size_t err_len);
 /* A file with the tokens and text of a history but no state: the agent's
- * stripped sessions, rebuilt from text when opened. */
+ * stripped sessions, rebuilt from text when opened.  `key_override` is the
+ * one state's key when it is not the text's own prefix (the visible
+ * transcript of a Responses/thinking checkpoint), as in the store. */
 bool ds4_kvstore_write_text_only(const char *path, uint8_t model_id, uint8_t quant_bits,
                                  uint8_t reason, uint8_t ext_flags, uint32_t tokens,
                                  uint32_t ctx_size, uint64_t created_at, const char *text,
+                                 const char *key_override,
                                  const ds4_kvstore_trailer_hooks *hooks,
                                  char *err, size_t err_len);
 
@@ -221,6 +226,9 @@ bool ds4_kvstore_read_index(FILE *fp, ds4_kvstore_entry *e);
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
                                  ds4_kvstore_entry *out);
 char *ds4_kvstore_read_text(FILE *fp, const ds4_kvstore_entry *e);
+/* The key bytes of one state: the file text's prefix, or the state's own. */
+char *ds4_kvstore_read_state_key(FILE *fp, const ds4_kvstore_entry *e,
+                                 const ds4_kvstore_state *st);
 /* Record a use of the file: its hit count and when (0: now). */
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits, uint64_t used_at);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);

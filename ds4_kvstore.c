@@ -541,9 +541,15 @@ char *ds4_kvstore_read_text(FILE *fp, const ds4_kvstore_entry *e) {
     return text;
 }
 
-/* The key bytes of a state: the file text's prefix, or its own. */
-static char *kv_read_key(FILE *fp, const ds4_kvstore_entry *e, const ds4_kvstore_state *st) {
-    const uint64_t at = st->key_offset ? st->key_offset : e->text_offset;
+/* The key bytes of a state: the file text's prefix, or its own.  A state's own
+ * key is written as a u32 length followed by the bytes, and key_offset points
+ * at that length, so the key starts four bytes later: reading at the offset
+ * itself returned a key shifted by four bytes, which never prefixes a prompt,
+ * and every Responses/thinking checkpoint — the ones whose state carries a
+ * visible transcript key — was then rejected as "does not begin the prompt". */
+char *ds4_kvstore_read_state_key(FILE *fp, const ds4_kvstore_entry *e,
+                                 const ds4_kvstore_state *st) {
+    const uint64_t at = st->key_offset ? st->key_offset + 4u : e->text_offset;
     if (at > (uint64_t)INT64_MAX || fseeko(fp, (off_t)at, SEEK_SET) != 0) return NULL;
     char *key = kv_xmalloc((size_t)st->key_len + 1);
     if (fread(key, 1, st->key_len, fp) != st->key_len) {
@@ -1125,7 +1131,7 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
             s->blob = kv_xmalloc((size_t)a->bytes);
             bool ok = fp && kv_copy_bytes(fp, a->offset, a->bytes, s->blob);
             if (ok && a->key_offset) {
-                s->key = kv_read_key(fp, &old, a);
+                s->key = ds4_kvstore_read_state_key(fp, &old, a);
                 ok = s->key != NULL;
             }
             if (fp) fclose(fp);
@@ -1270,6 +1276,7 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
 bool ds4_kvstore_write_text_only(const char *path, uint8_t model_id, uint8_t quant_bits,
                                  uint8_t reason, uint8_t ext_flags, uint32_t tokens,
                                  uint32_t ctx_size, uint64_t created_at, const char *text,
+                                 const char *key_override,
                                  const ds4_kvstore_trailer_hooks *hooks,
                                  char *err, size_t err_len) {
     if (err && err_len) err[0] = '\0';
@@ -1293,10 +1300,18 @@ bool ds4_kvstore_write_text_only(const char *path, uint8_t model_id, uint8_t qua
     hdr.last_used = (uint64_t)time(NULL);
     hdr.tail_offset = DS4_KVSTORE_FIXED_HEADER;
     /* no tokens are kept, the text is the history; the one state, keyed by
-     * the text, has no blob: a reader rebuilds from the text */
+     * the text (or by `key_override` when it is not the text's prefix), has no
+     * blob: a reader rebuilds from the text */
     ds4_tokens none = {0};
-    kv_state_src st = { .position = tokens, .key_len = (uint32_t)text_len, .blob = (uint8_t *)"" };
-    sha1_bytes(text ? text : "", text_len, st.sha);
+    kv_state_src st = { .position = tokens, .blob = (uint8_t *)"" };
+    if (key_override && key_override[0]) {
+        st.key = (char *)key_override;
+        st.key_len = (uint32_t)strlen(key_override);
+        sha1_bytes(st.key, st.key_len, st.sha);
+    } else {
+        st.key_len = (uint32_t)text_len;
+        sha1_bytes(text ? text : "", text_len, st.sha);
+    }
     uint8_t zero[DS4_KVSTORE_FIXED_HEADER] = {0};
     bool ok = fp && fwrite(zero, 1, sizeof(zero), fp) == sizeof(zero) &&
               kv_write_tail(fp, NULL, NULL, &none, text ? text : "", text_len, 0, 0, &st, 1,
@@ -1449,7 +1464,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         return 0;
     }
     /* the hash chose the state; the bytes themselves settle it */
-    char *key = kv_read_key(fp, e, st);
+    char *key = ds4_kvstore_read_state_key(fp, e, st);
     char err[160] = {0};
     int loaded = 0;
     if (!key || !ds4_kvstore_byte_prefix_match(prompt_text, prompt_bytes, key, st->key_len)) {

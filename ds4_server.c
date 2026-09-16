@@ -20221,7 +20221,7 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     text[payload_bytes] = '\0';
     char err[160] = {0};
     TEST_ASSERT(ds4_kvstore_write_text_only(path, 0, 2, reason, 0, tokens, 32768, 100,
-                                            text, NULL, err, sizeof(err)));
+                                            text, NULL, NULL, err, sizeof(err)));
     TEST_ASSERT(ds4_kvstore_touch_file(path, hits, last_used));
     free(text);
     free(path);
@@ -20248,13 +20248,88 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     char *path = path_join(dir, name);
     char err[160] = {0};
     TEST_ASSERT(ds4_kvstore_write_text_only(path, model_id, 2, reason, 0, tokens, 32768, 100,
-                                            text, NULL, err, sizeof(err)));
+                                            text, NULL, NULL, err, sizeof(err)));
     free(path);
 }
 
 static void test_kv_text_stub_file(const char *dir, const char *text,
                                    uint8_t reason, uint32_t tokens) {
     test_kv_text_stub_file_model(dir, text, 0, reason, tokens);
+}
+
+/* A state whose key is its own visible transcript rather than the rendered
+ * text's prefix: the key is written after a u32 length, and a reader that
+ * started at the state's key_offset handed back those bytes four early.  The
+ * lookup still found the file (it goes by the key's sha), so the load rejected
+ * it as "does not begin the prompt" and the conversation it stood for was
+ * prefilled from token zero.  The Responses and thinking checkpoints are the
+ * ones that carry such a key. */
+static void test_kv_state_own_key_reads_back(void) {
+    char tmpl[] = "/tmp/ds4-kv-state-key-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* the rendered turn, and what a client that never saw the reasoning
+     * replays for it (an emptied think block) */
+    const char *rendered =
+        "<|im_start|>system\n# Tools<|im_end|>\n"
+        "<|im_start|>user\nhi<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nlet me look\n</think>\n\nhello";
+    const char *visible =
+        "<|im_start|>system\n# Tools<|im_end|>\n"
+        "<|im_start|>user\nhi<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\nhello";
+    const char *prompt =
+        "<|im_start|>system\n# Tools<|im_end|>\n"
+        "<|im_start|>user\nhi<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\nhello<|im_end|>\n"
+        "<|im_start|>user\nmore<|im_end|>\n<|im_start|>assistant\n";
+
+    char sha[41];
+    sha1_bytes_hex(rendered, strlen(rendered), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    TEST_ASSERT(path != NULL);
+    if (!path) return;
+
+    char err[160] = {0};
+    TEST_ASSERT(ds4_kvstore_write_text_only(path, 0, 2, KV_REASON_EVICT,
+                                            DS4_KVSTORE_EXT_RESPONSES_VISIBLE, 512,
+                                            32768, 100, rendered, visible, NULL,
+                                            err, sizeof(err)));
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    /* the lookup goes by the key's sha */
+    TEST_ASSERT(kv_cache_find_text_prefix(&kc, prompt, 2, 32768) >= 0);
+
+    /* the key bytes themselves have to read back as the visible transcript */
+    FILE *fp = fopen(path, "rb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        ds4_kvstore_entry e = {0};
+        TEST_ASSERT(ds4_kvstore_read_index(fp, &e));
+        TEST_ASSERT(e.n_states == 1);
+        if (e.n_states == 1) {
+            char *key = ds4_kvstore_read_state_key(fp, &e, &e.state[0]);
+            TEST_ASSERT(key != NULL);
+            TEST_ASSERT(key && !strcmp(key, visible));
+            TEST_ASSERT(key && ds4_kvstore_byte_prefix_match(prompt, strlen(prompt),
+                                                             key, strlen(key)));
+            free(key);
+        }
+        ds4_kvstore_entry_free(&e);
+        fclose(fp);
+    }
+    kv_cache_close(&kc);
+    unlink(path);
+    free(path);
+    rmdir(dir);
 }
 
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
@@ -20344,7 +20419,7 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
 
     char err[160] = {0};
     TEST_ASSERT(ds4_kvstore_write_text_only(path, 0, 2, KV_REASON_COLD, 0, 512, 32768, 100,
-                                            text, NULL, err, sizeof(err)));
+                                            text, NULL, NULL, err, sizeof(err)));
     FILE *fp = fopen(path, "r+b");
     TEST_ASSERT(fp != NULL);
     if (fp) {
@@ -20509,7 +20584,7 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(&src, NULL);
     char err[160] = {0};
     TEST_ASSERT(ds4_kvstore_write_text_only(path, 0, 2, KV_REASON_CONTINUED, 0, 512, 32768, 100,
-                                            text, &hooks, err, sizeof(err)));
+                                            text, NULL, &hooks, err, sizeof(err)));
 
     server dst = {0};
     pthread_mutex_init(&dst.tool_mu, NULL);
@@ -21372,6 +21447,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
+    test_kv_state_own_key_reads_back();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();

@@ -5883,6 +5883,7 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
     ds4_kvstore_trailer_hooks hooks = agent_title_hooks(title);
     ok = ds4_kvstore_write_text_only(path, hdr.model_id, hdr.quant_bits, hdr.reason, 0,
                                      stripped_token_count, hdr.ctx_size, hdr.created_at, text,
+                                     NULL,
                                      (hdr.ext_flags & DS4_KVSTORE_EXT_SESSION_TITLE) ? &hooks : NULL,
                                      err, err_len);
     if (!ok) {
