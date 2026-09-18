@@ -970,12 +970,18 @@ static bool kv_write_tail(FILE *fp, ds4_engine *engine, ds4_session *session,
 /* How the file at path relates to the history about to be stored: it is
  * that history so far (same layout, its history a prefix of the live one,
  * its blocks covering all of it), so the store appends to it; or it holds
- * that history already and more (the session was replayed from an earlier
- * point), so the store has nothing to add; or it is another history. */
+ * that history and more and can already resume where the store would (a
+ * state at that position under the same key), so the store has nothing to
+ * add; or it is another history.  A file whose tokens merely begin with the
+ * history is another history: its blocks hold those positions, but a
+ * resume needs the state there, and a file only ever grows, so the store
+ * forks a file of its own (the slot's file after an eviction is the
+ * previous conversation's, which shares the system prompt). */
 typedef enum { KV_FILE_OTHER, KV_FILE_EXTENDS, KV_FILE_COVERS } kv_file_relation;
 
 static kv_file_relation kv_file_relates(ds4_session *session, const char *path,
-                                        const ds4_tokens *tokens, int model_id, int quant_bits,
+                                        const ds4_tokens *tokens, const char *live_sha,
+                                        int model_id, int quant_bits,
                                         bool reject_quant, ds4_kvstore_entry *e) {
     const uint32_t block_positions = ds4_session_block_positions(session);
     if (!path || block_positions == 0) return KV_FILE_OTHER;
@@ -1000,11 +1006,17 @@ static kv_file_relation kv_file_relates(ds4_session *session, const char *path,
         }
         if (fp) fclose(fp);
     }
-    if (!ok) {
+    if (ok && e->tokens < (uint32_t)tokens->len) return KV_FILE_EXTENDS;
+    bool resumes = false;
+    for (uint32_t i = 0; ok && i < e->n_states; i++) {
+        resumes |= e->state[i].position == (uint32_t)tokens->len &&
+                   !strcmp(e->state[i].sha, live_sha);
+    }
+    if (!resumes) {
         ds4_kvstore_entry_free(e);
         return KV_FILE_OTHER;
     }
-    return e->tokens < (uint32_t)tokens->len ? KV_FILE_EXTENDS : KV_FILE_COVERS;
+    return KV_FILE_COVERS;
 }
 
 char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *session,
@@ -1074,15 +1086,17 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
     }
 
     /* the file to write: the session's own, an explicit path, or a new one */
+    char live_sha[41];
+    hex20(st[0].sha, live_sha);
     const bool reject_quant = kc ? kc->reject_different_quant : true;
     ds4_kvstore_entry old = {0};
     char *path = NULL;
     kv_file_relation relation = KV_FILE_OTHER;
     if (req->path) {
         path = kv_xstrdup(req->path);
-        relation = kv_file_relates(session, path, &tokens, model_id, quant_bits, reject_quant, &old);
+        relation = kv_file_relates(session, path, &tokens, live_sha, model_id, quant_bits, reject_quant, &old);
     } else if (req->extend_path &&
-               (relation = kv_file_relates(session, req->extend_path, &tokens, model_id, quant_bits,
+               (relation = kv_file_relates(session, req->extend_path, &tokens, live_sha, model_id, quant_bits,
                                            reject_quant, &old)) != KV_FILE_OTHER) {
         path = kv_xstrdup(req->extend_path);
     } else {
@@ -1092,7 +1106,7 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
         if (access(path, F_OK) == 0) {
             /* the same history so far is one file; another conversation's
              * file may happen to bear this text's name */
-            relation = kv_file_relates(session, path, &tokens, model_id, quant_bits, reject_quant, &old);
+            relation = kv_file_relates(session, path, &tokens, live_sha, model_id, quant_bits, reject_quant, &old);
             if (relation == KV_FILE_OTHER) {
                 const uint64_t now = (uint64_t)time(NULL);
                 kv_buf b = {0};
@@ -1116,12 +1130,16 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
         return path;
     }
     const bool extend = relation == KV_FILE_EXTENDS;
-    /* the file's first state stays: the anchor other conversations share */
+    /* The file's earliest state stays: the anchor other conversations share
+     * (a system prompt and tools, stored early in the history).  The tail
+     * lists the live state first, so the earliest is found by position. */
     if (extend && old.n_states > 0) {
+        const ds4_kvstore_state *a = &old.state[0];
+        for (uint32_t i = 1; i < old.n_states; i++)
+            if (old.state[i].position < a->position) a = &old.state[i];
         bool have = false;
-        for (uint32_t i = 0; i < n; i++) have |= st[i].position == old.state[0].position;
+        for (uint32_t i = 0; i < n; i++) have |= st[i].position == a->position;
         if (!have && n < 64) {
-            const ds4_kvstore_state *a = &old.state[0];
             FILE *fp = fopen(path, "rb");
             kv_state_src *s = &st[n];
             memset(s, 0, sizeof(*s));
