@@ -3534,6 +3534,16 @@ static void append_qwen_assistant_prefix(buf *out, bool think) {
     buf_puts(out, think ? "<think>\n" : "<think>\n\n</think>\n\n");
 }
 
+/* The system/developer messages that open the conversation.  Only these join
+ * the template's single system turn: one that arrives later (Codex appends
+ * developer messages mid-session) is rendered in place as a user turn, since
+ * hoisting it would rewrite the prompt's head and cost a full re-prefill. */
+static int qwen_leading_system_count(const chat_msgs *msgs) {
+    int n = 0;
+    while (msgs && n < msgs->len && role_is_system(msgs->v[n].role)) n++;
+    return n;
+}
+
 /* ChatML turns from `start` on, as the Qwen3.8 template renders them.  Every
  * assistant turn carries a <think> block; it keeps its reasoning only for
  * turns after `drop_reasoning_through`, which the full renderer sets so old
@@ -3542,6 +3552,7 @@ static void append_qwen_assistant_prefix(buf *out, bool think) {
 static void append_qwen_turns(buf *out, const chat_msgs *msgs, int start,
                               const tool_schema_orders *tool_orders,
                               bool think, int drop_reasoning_through) {
+    const int leading_system = qwen_leading_system_count(msgs);
     bool pending_assistant = false;
     bool response_open = false;
     for (int i = start; msgs && i < msgs->len; i++) {
@@ -3555,8 +3566,9 @@ static void append_qwen_turns(buf *out, const chat_msgs *msgs, int start,
         }
         if (response_open) buf_puts(out, "<|im_end|>\n");
         response_open = false;
-        if (role_is_system(m->role)) continue;
-        if (!strcmp(m->role, "user")) {
+        if (role_is_system(m->role) &&
+            (i < leading_system || text_is_blank(m->content))) continue;
+        if (!strcmp(m->role, "user") || role_is_system(m->role)) {
             buf_puts(out, "<|im_start|>user\n");
             append_trimmed_text(out, m->content);
             buf_puts(out, "<|im_end|>\n");
@@ -3588,12 +3600,13 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     const bool tools = tool_schemas && tool_schemas[0];
+    const int leading_system = qwen_leading_system_count(msgs);
     int last_user_idx = -1;
     buf system = {0};
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_user_like(m->role)) last_user_idx = i;
-        if (!role_is_system(m->role) || text_is_blank(m->content)) continue;
+        if (i >= leading_system || text_is_blank(m->content)) continue;
         if (system.len) buf_puts(&system, "\n\n");
         append_trimmed_text(&system, m->content);
     }
@@ -17647,6 +17660,49 @@ static void test_render_qwen_reference_cases(void) {
     tool_schema_orders_free(&orders);
 }
 
+/* A developer message appended mid-session (Codex does this) must leave the
+ * rendered history in front of it untouched: only the opening run of
+ * system/developer messages joins the system turn, later ones stay in place
+ * as user turns, so the next request still continues the cached prefix. */
+static void test_render_qwen_late_developer_keeps_prefix(void) {
+    chat_msgs msgs = {0};
+    chat_msgs_push_text(&msgs, "system", "BASE");
+    chat_msgs_push_text(&msgs, "developer", "PERMISSIONS");
+    chat_msgs_push_text(&msgs, "user", "hi");
+    chat_msg reply = {0};
+    reply.role = xstrdup("assistant");
+    reply.content = xstrdup("Hello!");
+    chat_msgs_push(&msgs, reply);
+    char *before = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(!strcmp(before,
+        "<|im_start|>system\nBASE\n\nPERMISSIONS<|im_end|>\n"
+        "<|im_start|>user\nhi<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\nHello!<|im_end|>\n"));
+
+    chat_msgs_push_text(&msgs, "developer", "SKILLS");
+    chat_msgs_push_text(&msgs, "user", "next");
+    char *after = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(!strncmp(after, before, strlen(before)));
+    TEST_ASSERT(!strcmp(after + strlen(before),
+        "<|im_start|>user\nSKILLS<|im_end|>\n"
+        "<|im_start|>user\nnext<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+
+    /* the live tool tail renders a late developer message the same way */
+    char *tail = render_live_tool_tail_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, 4, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(!strcmp(tail, "<|im_end|>\n"
+        "<|im_start|>user\nSKILLS<|im_end|>\n"
+        "<|im_start|>user\nnext<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    free(tail);
+    free(after);
+    free(before);
+    chat_msgs_free(&msgs);
+}
+
 static void test_parse_qwen_tool_call_message(void) {
     tool_schema_orders orders = {0};
     tool_schema_orders_add_json(&orders,
@@ -21340,6 +21396,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_preserves_reasoning_with_tools();
     test_render_glm_groups_tool_results();
     test_render_qwen_reference_cases();
+    test_render_qwen_late_developer_keeps_prefix();
     test_parse_qwen_tool_call_message();
     test_qwen_tool_checkpoint_suffix_is_canonical();
     test_tool_schema_order_from_anthropic_schema();
