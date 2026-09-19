@@ -168,48 +168,90 @@ __global__ static void qwen_vision_qkv_rope_kernel(
                     glm53_vision_bf16(bias + 2u * QWEN_VISION_DIM + b + QWEN_VISION_HALF);
 }
 
-/* Full bidirectional attention, one block per (patch, head), 36 lanes
- * holding two values each and an online softmax over the keys. */
-__global__ static void qwen_vision_attention_kernel(
-        float       *out,
-        const float *q,
-        const float *k,
-        const float *v,
-        uint32_t     rows) {
-    __shared__ float dot[64];
-    const uint32_t row = blockIdx.x;
-    const uint32_t head = blockIdx.y;
-    const uint32_t lane = threadIdx.x;
-    const bool active = lane < QWEN_VISION_HALF;
-    const uint64_t base = (uint64_t)row * QWEN_VISION_DIM + (uint64_t)head * QWEN_VISION_HEAD_DIM;
-    const float q0 = active ? q[base + lane] : 0.0f;
-    const float q1 = active ? q[base + lane + QWEN_VISION_HALF] : 0.0f;
-    const float scale = rsqrtf((float)QWEN_VISION_HEAD_DIM);
-    float acc0 = 0.0f, acc1 = 0.0f, max_score = -INFINITY, denom = 0.0f;
-    for (uint32_t key_row = 0; key_row < rows; key_row++) {
-        const uint64_t kb = (uint64_t)key_row * QWEN_VISION_DIM + (uint64_t)head * QWEN_VISION_HEAD_DIM;
-        dot[lane] = active ? q0 * k[kb + lane] + q1 * k[kb + lane + QWEN_VISION_HALF] : 0.0f;
-        __syncthreads();
-        for (uint32_t stride = 32u; stride != 0u; stride >>= 1u) {
-            if (lane < stride) dot[lane] += dot[lane + stride];
-            __syncthreads();
-        }
-        const float score = dot[0] * scale;
-        const float next_max = fmaxf(max_score, score);
-        const float old_scale = key_row == 0u ? 0.0f : expf(max_score - next_max);
-        const float new_scale = expf(score - next_max);
-        denom = denom * old_scale + new_scale;
-        if (active) {
-            acc0 = acc0 * old_scale + new_scale * v[kb + lane];
-            acc1 = acc1 * old_scale + new_scale * v[kb + lane + QWEN_VISION_HALF];
-        }
-        max_score = next_max;
+/* One block per row of attention scores (a query of one head against every
+ * key): softmax in place, the threads striding over the keys. */
+__global__ static void qwen_vision_softmax_kernel(float *scores, uint32_t keys) {
+    __shared__ float partial[256];
+    const uint32_t tid = threadIdx.x;
+    float *s = scores + ((uint64_t)blockIdx.y * gridDim.x + blockIdx.x) * keys;
+    float top = -INFINITY;
+    for (uint32_t i = tid; i < keys; i += blockDim.x) top = fmaxf(top, s[i]);
+    partial[tid] = top;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2u; stride != 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] = fmaxf(partial[tid], partial[tid + stride]);
         __syncthreads();
     }
-    if (active) {
-        out[base + lane] = acc0 / denom;
-        out[base + lane + QWEN_VISION_HALF] = acc1 / denom;
+    top = partial[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (uint32_t i = tid; i < keys; i += blockDim.x) {
+        s[i] = expf(s[i] - top);
+        sum += s[i];
     }
+    partial[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2u; stride != 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float inv = 1.0f / partial[0];
+    for (uint32_t i = tid; i < keys; i += blockDim.x) s[i] *= inv;
+}
+
+static int qwen_vision_launch_ok(const char *label) {
+    return cuda_ok(cudaGetLastError(), label);
+}
+
+/* Full bidirectional attention over the patches.  A screenshot is 8000 of
+ * them and every one attends to every other in 27 blocks, so the products
+ * are cuBLAS's: for a chunk of queries, the scores of every head against all
+ * keys, their softmax, and the weighted sum of the values.  q, k, v and out
+ * are [patch][head][72]; read with a leading dimension of a whole patch row
+ * and a stride of one head, each head is a matrix of its own as it lies, so
+ * nothing is repacked.  `scores` holds a chunk: [head][query][key].  The
+ * products are pedantic f32 whatever the handle's math mode: TF32's ten
+ * mantissa bits on a logit go through the exponential. */
+#define QWEN_VISION_SCORE_BYTES ((uint64_t)512 << 20)
+
+static uint32_t qwen_vision_attention_chunk(uint32_t rows) {
+    const uint64_t fit = QWEN_VISION_SCORE_BYTES / ((uint64_t)QWEN_VISION_HEADS * rows * sizeof(float));
+    return fit >= rows ? rows : fit > 0u ? (uint32_t)fit : 1u;
+}
+
+static int qwen_vision_attention(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        ds4_gpu_tensor       *scores,
+        uint32_t              rows) {
+    const uint32_t chunk = qwen_vision_attention_chunk(rows);
+    const float scale = 1.0f / sqrtf((float)QWEN_VISION_HEAD_DIM), one = 1.0f, zero = 0.0f;
+    const cublasHandle_t handle = cuda_cublas_for_tier(ds4_tensor_device_idx(out));
+    for (uint32_t at = 0; at < rows; at += chunk) {
+        const uint32_t n = rows - at < chunk ? rows - at : chunk;
+        cublasStatus_t st = cublasGemmStridedBatchedEx(
+                handle, CUBLAS_OP_T, CUBLAS_OP_N, (int)rows, (int)n, (int)QWEN_VISION_HEAD_DIM, &scale,
+                k->ptr, CUDA_R_32F, (int)QWEN_VISION_DIM, (long long)QWEN_VISION_HEAD_DIM,
+                (const float *)q->ptr + (uint64_t)at * QWEN_VISION_DIM, CUDA_R_32F, (int)QWEN_VISION_DIM,
+                (long long)QWEN_VISION_HEAD_DIM, &zero,
+                scores->ptr, CUDA_R_32F, (int)rows, (long long)rows * n, (int)QWEN_VISION_HEADS,
+                CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "Qwen vision attention scores")) return 0;
+        qwen_vision_softmax_kernel<<<dim3(n, QWEN_VISION_HEADS, 1u), 256u, 0,
+            DS4_QWEN_VISION_STREAM>>>((float *)scores->ptr, rows);
+        if (!qwen_vision_launch_ok("Qwen vision attention softmax")) return 0;
+        st = cublasGemmStridedBatchedEx(
+                handle, CUBLAS_OP_N, CUBLAS_OP_N, (int)QWEN_VISION_HEAD_DIM, (int)n, (int)rows, &one,
+                v->ptr, CUDA_R_32F, (int)QWEN_VISION_DIM, (long long)QWEN_VISION_HEAD_DIM,
+                scores->ptr, CUDA_R_32F, (int)rows, (long long)rows * n, &zero,
+                (float *)out->ptr + (uint64_t)at * QWEN_VISION_DIM, CUDA_R_32F, (int)QWEN_VISION_DIM,
+                (long long)QWEN_VISION_HEAD_DIM, (int)QWEN_VISION_HEADS,
+                CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "Qwen vision attention values")) return 0;
+    }
+    return 1;
 }
 
 /* Bias plus GELU in place: the blocks use the tanh form, the merger the
@@ -228,10 +270,6 @@ __global__ static void qwen_vision_gelu_bias_kernel(
     } else {
         x[i] = 0.5f * v * (1.0f + erff(v * 0.7071067811865475f));
     }
-}
-
-static int qwen_vision_launch_ok(const char *label) {
-    return cuda_ok(cudaGetLastError(), label);
 }
 
 static int qwen_vision_layernorm(
@@ -267,6 +305,22 @@ static int qwen_vision_gelu(
     return qwen_vision_launch_ok(label);
 }
 
+extern "C" int ds4_gpu_qwen_vision_attention(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              rows) {
+    const uint64_t bytes = (uint64_t)rows * QWEN_VISION_DIM * sizeof(float);
+    if (!out || !q || !k || !v || rows == 0u || !g_cublas_ready ||
+        out->bytes < bytes || q->bytes < bytes || k->bytes < bytes || v->bytes < bytes) return 0;
+    ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc(
+            (uint64_t)QWEN_VISION_HEADS * qwen_vision_attention_chunk(rows) * rows * sizeof(float));
+    const int ok = scores && qwen_vision_attention(out, q, k, v, scores, rows);
+    ds4_gpu_tensor_free(scores);
+    return ok;
+}
+
 extern "C" int ds4_gpu_qwen_vision_encode(
         float                         *out,
         const float                   *patches,
@@ -285,7 +339,7 @@ extern "C" int ds4_gpu_qwen_vision_encode(
     if (row_ff > SIZE_MAX / sizeof(float)) return 0;
 
     ds4_gpu_tensor *patch = NULL, *a = NULL, *b = NULL, *qkv = NULL;
-    ds4_gpu_tensor *q = NULL, *k = NULL, *v = NULL, *attn = NULL, *mid = NULL, *proj = NULL;
+    ds4_gpu_tensor *q = NULL, *k = NULL, *v = NULL, *attn = NULL, *scores = NULL, *mid = NULL, *proj = NULL;
     ds4_gpu_tensor *cur = NULL, *tmp = NULL;
     int ok = 0;
 #define VISION_ALLOC(name_, count_) do { \
@@ -300,6 +354,7 @@ extern "C" int ds4_gpu_qwen_vision_encode(
     VISION_ALLOC(k, row_dim);
     VISION_ALLOC(v, row_dim);
     VISION_ALLOC(attn, row_dim);
+    VISION_ALLOC(scores, (uint64_t)QWEN_VISION_HEADS * qwen_vision_attention_chunk(rows) * rows);
     VISION_ALLOC(mid, row_ff);   /* the block MLP, then the merger's 4608-wide rows */
     VISION_ALLOC(proj, merged_out);
 #undef VISION_ALLOC
@@ -340,12 +395,7 @@ extern "C" int ds4_gpu_qwen_vision_encode(
                 ok = qwen_vision_launch_ok("Qwen vision QKV");
             }
         }
-        if (ok) {
-            qwen_vision_attention_kernel<<<dim3(rows, QWEN_VISION_HEADS, 1u), 64u, 0,
-                DS4_QWEN_VISION_STREAM>>>((float *)attn->ptr, (const float *)q->ptr,
-                                          (const float *)k->ptr, (const float *)v->ptr, rows);
-            ok = qwen_vision_launch_ok("Qwen vision attention");
-        }
+        if (ok) ok = qwen_vision_attention(attn, q, k, v, scores, rows);
         if (ok) {
             ok = ds4_gpu_glm53_matmul_bf16(tmp, model_map, model_size, w->attn_proj_weight,
                                            QWEN_VISION_DIM, QWEN_VISION_DIM, attn, rows) &&
@@ -389,6 +439,7 @@ extern "C" int ds4_gpu_qwen_vision_encode(
 cleanup:
     ds4_gpu_tensor_free(proj);
     ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(scores);
     ds4_gpu_tensor_free(attn);
     ds4_gpu_tensor_free(v);
     ds4_gpu_tensor_free(k);

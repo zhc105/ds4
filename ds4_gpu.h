@@ -3177,6 +3177,16 @@ int ds4_gpu_qwen_vision_encode(
         uint64_t                       model_size,
         const ds4_qwen_vision_weights *weights);
 
+/* The tower's attention on its own: full bidirectional softmax attention of
+ * `rows` patches, 16 heads of 72, all four tensors f32 [patch][head][72]
+ * (tests/qwen_vision_attention_test.c checks it against a CPU reference). */
+int ds4_gpu_qwen_vision_attention(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              rows);
+
 /* Replace token rows of the Flash-Next residual with image embeddings: the
  * bf16 hc streams get every stream overwritten (n_hc > 1), a plain f32 row
  * buffer gets its rows replaced (n_hc == 1).  Rows past total_rows are
