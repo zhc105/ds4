@@ -523,12 +523,15 @@ static void append_python_style_json(buf *b, const char *json) {
     buf_puts(b, json ? json : "");
 }
 
-#define SERVER_IMAGE_MARKER_BYTES 64
+#define SERVER_IMAGE_MARKER_BYTES DS4_VISION_MARKER_BYTES
 
+/* A picture of a request: identified when parsed (its marker goes into the
+ * rendered text), its file kept for the engine to encode if a prefill
+ * reaches it. */
 typedef struct {
     char marker[SERVER_IMAGE_MARKER_BYTES];
+    ds4_vision_embedding picture;   /* its source is `encoded` */
     uint8_t *encoded;
-    size_t encoded_len;
 } server_image_input;
 
 typedef struct {
@@ -596,14 +599,18 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
                                             char marker[SERVER_IMAGE_MARKER_BYTES]) {
     if (!server_image_media_type(media_type)) return false;
     server_image_input image = {0};
-    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
+    size_t encoded_len = 0;
+    if (!server_decode_base64(base64, &image.encoded, &encoded_len))
         return false;
-    /* The marker names the image by content, so a conversation replayed
-     * with the same image renders byte-identical prompt text, which the
-     * visible-prefix live KV reuse compares. */
-    char digest[41];
-    ds4_kvstore_sha1_bytes_hex(image.encoded, image.encoded_len, digest);
-    snprintf(image.marker, sizeof(image.marker), "\036" "DS4_IMAGE_%.24s" "\037", digest);
+    /* The marker names the picture by the identity the engine's states
+     * hold, so a conversation replayed with the same picture renders
+     * byte-identical prompt text, and every comparison of texts (the live
+     * continuations, the disk keys) is a comparison of pictures too. */
+    if (!ds4_vision_identify_memory(image.encoded, encoded_len, &image.picture, NULL, 0)) {
+        free(image.encoded);
+        return false;
+    }
+    ds4_vision_marker(image.picture.fingerprint, image.marker);
     if (images->len == images->cap) {
         size_t cap = images->cap ? images->cap * 2 : 2;
         images->v = xrealloc(images->v, cap * sizeof(images->v[0]));
@@ -631,86 +638,6 @@ static bool server_image_inputs_push_data_uri(
         return server_image_inputs_push_base64(
             images, "image/jpg", uri + sizeof(jpg) - 1, marker);
     return false;
-}
-
-/* The vision tower's output for the pictures an agent replays every turn.
- * The K/V of a picture's tokens live in the state, but every request
- * carries the picture's embedding, and encoding a screenshot takes
- * seconds: so the last few embeddings are kept by the marker that names
- * their bytes, and a request that repeats a picture copies its embedding
- * instead of encoding it again.  Bounded by bytes, a screenshot being tens
- * of megabytes of rows. */
-#define VISION_CACHE_BYTES ((size_t)512 << 20)
-
-typedef struct {
-    char marker[SERVER_IMAGE_MARKER_BYTES];
-    ds4_vision_embedding embedding;
-    uint64_t used;                  /* the tick of its last use */
-} vision_cache_entry;
-
-static struct {
-    pthread_mutex_t mu;
-    vision_cache_entry *v;
-    size_t len, cap;
-    size_t bytes, budget;
-    uint64_t tick;
-} g_vision_cache = { PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0, 0, VISION_CACHE_BYTES, 0 };
-
-static size_t vision_embedding_bytes(const ds4_vision_embedding *e) {
-    return (size_t)e->token_count * e->dim * sizeof(float);
-}
-
-static void vision_embedding_copy(ds4_vision_embedding *dst, const ds4_vision_embedding *src) {
-    *dst = *src;
-    dst->data = xmalloc(vision_embedding_bytes(src));
-    memcpy(dst->data, src->data, vision_embedding_bytes(src));
-}
-
-static vision_cache_entry *vision_cache_find(const char *marker) {
-    for (size_t i = 0; i < g_vision_cache.len; i++)
-        if (!strcmp(g_vision_cache.v[i].marker, marker)) return &g_vision_cache.v[i];
-    return NULL;
-}
-
-/* A copy of the embedding of the picture `marker` names, when cached. */
-static bool vision_cache_get(const char *marker, ds4_vision_embedding *out) {
-    pthread_mutex_lock(&g_vision_cache.mu);
-    vision_cache_entry *e = vision_cache_find(marker);
-    if (e) {
-        e->used = ++g_vision_cache.tick;
-        vision_embedding_copy(out, &e->embedding);
-    }
-    pthread_mutex_unlock(&g_vision_cache.mu);
-    return e != NULL;
-}
-
-static void vision_cache_put(const char *marker, const ds4_vision_embedding *embedding) {
-    const size_t bytes = vision_embedding_bytes(embedding);
-    if (bytes > g_vision_cache.budget) return;
-    pthread_mutex_lock(&g_vision_cache.mu);
-    if (vision_cache_find(marker)) {    /* two requests encoded it at once */
-        pthread_mutex_unlock(&g_vision_cache.mu);
-        return;
-    }
-    while (g_vision_cache.len && g_vision_cache.bytes + bytes > g_vision_cache.budget) {
-        size_t oldest = 0;
-        for (size_t i = 1; i < g_vision_cache.len; i++)
-            if (g_vision_cache.v[i].used < g_vision_cache.v[oldest].used) oldest = i;
-        g_vision_cache.bytes -= vision_embedding_bytes(&g_vision_cache.v[oldest].embedding);
-        ds4_vision_embedding_free(&g_vision_cache.v[oldest].embedding);
-        g_vision_cache.v[oldest] = g_vision_cache.v[--g_vision_cache.len];
-    }
-    if (g_vision_cache.len == g_vision_cache.cap) {
-        g_vision_cache.cap = g_vision_cache.cap ? g_vision_cache.cap * 2 : 4;
-        g_vision_cache.v = xrealloc(g_vision_cache.v,
-                                    g_vision_cache.cap * sizeof(*g_vision_cache.v));
-    }
-    vision_cache_entry *e = &g_vision_cache.v[g_vision_cache.len++];
-    snprintf(e->marker, sizeof(e->marker), "%s", marker);
-    vision_embedding_copy(&e->embedding, embedding);
-    e->used = ++g_vision_cache.tick;
-    g_vision_cache.bytes += bytes;
-    pthread_mutex_unlock(&g_vision_cache.mu);
 }
 
 static void append_owned_text(char **dst, const char *text) {
@@ -936,7 +863,9 @@ static bool anthropic_live_has_call_id(server *s, const char *id);
 /* Where an image sits in a request: its marker's bytes in prompt_text and
  * its placeholder block's tokens in prompt (the span inside the block
  * starts at span_start; the block has the same shape wherever the picture
- * sits, so a state that holds it has its block at the same offsets). */
+ * sits, so a state that holds it has its block at the same offsets.  That
+ * holds for the Qwen and GLM blocks; a DeepSeek block's leading pad depends
+ * on its start position mod 4, which the continuations do not check). */
 typedef struct {
     size_t text_start, text_end;
     int block_start, block_end, span_start;
@@ -948,6 +877,7 @@ typedef struct {
     server_model_syntax model_syntax;
     ds4_tokens prompt;
     ds4_vision_span *images;
+    uint8_t **image_files;          /* the pictures' sources, encoded on demand */
     request_image_place *image_places;
     size_t image_count;
     char *model;
@@ -1219,9 +1149,12 @@ static bool parse_steering_object(const char **p, request *r) {
 
 static void request_free(request *r) {
     ds4_tokens_free(&r->prompt);
-    for (size_t i = 0; i < r->image_count; i++)
+    for (size_t i = 0; i < r->image_count; i++) {
         ds4_vision_embedding_free(&r->images[i].embedding);
+        free(r->image_files[i]);
+    }
     free(r->images);
+    free(r->image_files);
     free(r->image_places);
     free(r->model);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
@@ -3689,15 +3622,22 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
             inputs[next++] = &msgs->v[i].images.v[j];
     }
 
+    /* The pictures are only described: the placeholders need their sizes,
+     * every comparison their fingerprints, and the engine encodes the ones
+     * a prefill reaches (none of a replayed history's).  The request keeps
+     * their files for that.  A tower that cannot describe without encoding
+     * does GPU work here. */
+    r->image_files = xmalloc(count * sizeof(r->image_files[0]));
+    memset(r->image_files, 0, count * sizeof(r->image_files[0]));
+    const bool gpu = !ds4_engine_vision_plans(e);
     bool ok = true;
     for (size_t i = 0; ok && i < count; i++) {
-        if (vision_cache_get(inputs[i]->marker, &embeddings[i])) continue;
-        server_inference_lock(s);
-        ok = ds4_engine_vision_encode_memory(e, inputs[i]->encoded,
-                                             inputs[i]->encoded_len,
-                                             &embeddings[i], err, errlen);
-        server_inference_unlock(s);
-        if (ok) vision_cache_put(inputs[i]->marker, &embeddings[i]);
+        embeddings[i] = inputs[i]->picture;
+        r->image_files[i] = inputs[i]->encoded;
+        inputs[i]->encoded = NULL;
+        if (gpu) server_inference_lock(s);
+        ok = ds4_engine_vision_describe(e, &embeddings[i], err, errlen);
+        if (gpu) server_inference_unlock(s);
     }
     if (!ok) goto done;
 
@@ -3740,8 +3680,11 @@ done:
         ds4_tokens_free(&r->prompt);
         for (size_t i = 0; i < r->image_count; i++)
             ds4_vision_embedding_free(&r->images[i].embedding);
+        for (size_t i = 0; i < count; i++) free(r->image_files[i]);
         free(r->images);
+        free(r->image_files);
         r->images = NULL;
+        r->image_files = NULL;
         r->image_count = 0;
     }
     return ok;
@@ -11059,12 +11002,10 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     /* inference_locked: the caller is the inference thread itself (the
      * engine's page reclaim), which already holds the lock */
     if (!inference_locked) pthread_mutex_lock(&s->inference_mu);
-    /* The payload contains image-conditioned KV rows, but the disk key and
-     * trailer do not contain image fingerprints. Never let generic image
-     * placeholder tokens become a cache hit for a different image.
-     * sync_image_count covers progress-callback writes during prefill;
-     * checkpoint_image_count covers completed sessions. */
-    if (ds4_session_has_vision_state(slot->session)) {
+    /* A state's key spells its pictures, which the session knows once the
+     * sync that prefills them returns: a store from inside that sync (the
+     * progress callback) would key the new pictures' rows by placeholders. */
+    if (ds4_session_vision_sync_active(slot->session)) {
         if (!inference_locked) pthread_mutex_unlock(&s->inference_mu);
         return false;
     }
@@ -11302,9 +11243,14 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 }
 #endif
 
+/* Resume the longest state on disk whose key begins the text.  With an
+ * effective prompt to fill, the text past the key is tokenized after the
+ * state's tokens; a caller whose text holds pictures builds it itself from
+ * the key's length (kv_cache_try_load). */
 static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   const char *prompt_text,
                                   ds4_tokens *effective_prompt,
+                                  size_t *key_len_out,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
                                   bool responses_protocol) {
@@ -11314,12 +11260,6 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
-    /* Disk payloads intentionally carry no image identity. If this slot held
-     * vision state, discard it before restoring a text-only checkpoint so the
-     * next sync does not reject the fresh payload as a stale image match. */
-    if (ds4_session_has_vision_state(slot->session)) {
-        ds4_session_invalidate(slot->session);
-    }
     pthread_mutex_lock(&s->kv_mu);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
                                            prompt_text, effective_prompt, &lr,
@@ -11327,6 +11267,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
+        if (key_len_out) *key_len_out = lr.key_len;
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
         free(slot->kv_path);
@@ -11334,17 +11275,6 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     }
     ds4_kvstore_load_result_free(&lr);
     return loaded;
-}
-
-static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
-                             ds4_tokens *effective_prompt,
-                             char **loaded_path_out,
-                             uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
-                                  effective_prompt,
-                                  loaded_path_out,
-                                  loaded_ext_flags_out,
-                                  req && req->api == API_RESPONSES);
 }
 
 /* The effective prompt of a request continued from a state's tokens (the
@@ -11394,13 +11324,34 @@ static bool build_prompt_after_state(server *s, request *req,
     return true;
 }
 
-static void append_tokens_text(buf *b, ds4_engine *engine,
-                               const ds4_tokens *tokens, int from, int to) {
-    const ds4_tokens span = { tokens->v + from, to - from, 0 };
-    size_t len = 0;
-    char *text = render_tokens_text(engine, &span, &len);
-    buf_append(b, text, len);
-    free(text);
+/* A request continued from a state on disk: the key's text spells the
+ * state's pictures by their markers, as the request does, so the key that
+ * begins the request holds the request's first pictures, and the prompt goes
+ * on from the state's tokens like any other continuation. */
+static int kv_cache_try_load(server *s, server_slot *slot, request *req,
+                             ds4_tokens *effective_prompt,
+                             char **loaded_path_out,
+                             uint8_t *loaded_ext_flags_out) {
+    size_t key_len = 0;
+    const int loaded = kv_cache_try_load_text(s, slot, req->prompt_text, NULL, &key_len,
+                                              loaded_path_out, loaded_ext_flags_out,
+                                              req->api == API_RESPONSES);
+    if (loaded <= 0) return 0;
+    pthread_mutex_lock(&s->inference_mu);
+    size_t n_ids = 0;
+    const ds4_vision_identity *ids = ds4_session_vision_identities(slot->session, &n_ids);
+    const bool ok = build_prompt_after_state(s, req, ids, n_ids, ds4_session_tokens(slot->session),
+                                             key_len, effective_prompt);
+    if (!ok) ds4_session_invalidate(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
+    if (ok) return loaded;
+    server_log(DS4_LOG_WARNING, "ds4-server: kv cache state at %d does not continue into the request's pictures",
+               loaded);
+    if (loaded_path_out) {
+        free(*loaded_path_out);
+        *loaded_path_out = NULL;
+    }
+    return 0;
 }
 
 /* `text` as a client that never saw the reasoning replays it: every closed
@@ -11427,9 +11378,8 @@ static void qwen_visible_text(buf *out, const char *text, size_t len) {
  * byte-wise against the text of the state's tokens and only the bytes past
  * its end are tokenized: the request's own token suffix may have merged
  * across that boundary.  The state's text spells its pictures the way the
- * request does, as their markers, at the block offsets the request's own
- * copy of the picture has.  Returns the state's length on a match, with
- * the effective prompt built. */
+ * request does and a disk key does, as their markers.  Returns the state's
+ * length on a match, with the effective prompt built. */
 static int state_text_prefix_prompt(server *s, request *req,
                                     const ds4_tokens *tokens,
                                     const ds4_vision_identity *ids, size_t n_ids,
@@ -11439,21 +11389,8 @@ static int state_text_prefix_prompt(server *s, request *req,
     if (!ds4_vision_identities_prefix(ids, n_ids, req->images, req->image_count)) return 0;
 
     buf text = {0};
-    int cursor = 0;
-    for (size_t i = 0; i < n_ids; i++) {
-        const request_image_place *place = &req->image_places[i];
-        const int start = (int)ids[i].token_start - (place->span_start - place->block_start);
-        const int end = start + (place->block_end - place->block_start);
-        if (start < cursor || end > tokens->len) {
-            buf_free(&text);
-            return 0;
-        }
-        append_tokens_text(&text, s->engine, tokens, cursor, start);
-        buf_append(&text, req->prompt_text + place->text_start,
-                   place->text_end - place->text_start);
-        cursor = end;
-    }
-    append_tokens_text(&text, s->engine, tokens, cursor, tokens->len);
+    text.ptr = ds4_kvstore_render_history_text(s->engine, tokens, ids, n_ids, &text.len);
+    if (!text.ptr) return 0;   /* the state stops inside a picture */
     const size_t prompt_len = strlen(req->prompt_text);
     bool ok = byte_prefix_match(req->prompt_text, prompt_len, text.ptr, text.len);
     size_t offset = text.len;
@@ -12347,6 +12284,23 @@ static int server_piece_end(const ds4_vision_span *images, size_t image_count,
     return target;
 }
 
+/* A history stored at `target` must not stop inside a picture's block (the
+ * key spells a picture whole): the boundary moves back before the block it
+ * would split.  Also how many pictures lie before it. */
+static int server_store_boundary(ds4_engine *e, const ds4_vision_span *images, size_t image_count,
+                                 int target, size_t *stored_images) {
+    size_t n = 0;
+    for (size_t i = 0; i < image_count; i++) {
+        const ds4_vision_identity id = { images[i].token_start, images[i].embedding.token_count, {0} };
+        int start = 0, end = 0;
+        ds4_engine_vision_block(e, &id, &start, &end);
+        if (target > start && target < end) target = start;
+        if (end <= target) n = i + 1;
+    }
+    *stored_images = n;
+    return target;
+}
+
 /* Synchronize one resident slot with a prompt, text or with pictures.  A
  * batched server hands the prompt over in pieces so the other slots' decode
  * steps can interleave (server_prefill_enter).  The first piece must reach
@@ -12357,7 +12311,7 @@ static int server_piece_end(const ds4_vision_span *images, size_t image_count,
  * compressor alignment is independent of scheduler order. */
 static int server_session_sync(server *s, server_slot *slot,
                                const ds4_tokens *prompt,
-                               const ds4_vision_span *images, size_t image_count,
+                               ds4_vision_span *images, size_t image_count,
                                char *err, size_t errlen) {
     if (!s || !slot || !prompt || (image_count != 0 && !images)) return 1;
     if (!s->batched_mode) {
@@ -12810,7 +12764,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, slot,
                                             rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path, NULL, false);
+                                            &effective, NULL, &path, NULL, false);
         if (loaded == 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_invalidate(slot->session);
@@ -13336,7 +13290,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    if (!multimodal && s->kv.enabled && cached == 0 &&
+    /* A history with pictures lives on disk only as a file of blocks, which
+     * lists them (ds4_kvstore_store): the families whose sessions keep no
+     * blocks hold such a history in memory alone, as before. */
+    const bool disk = !multimodal || ds4_session_block_positions(slot->session) != 0;
+    if (disk && s->kv.enabled && cached == 0 &&
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
@@ -13344,7 +13302,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         kv_cache_touch_prompt_file(s, j->req.prompt_text);
         kv_cache_store_current(s, slot, "evict", false);
     }
-    if (!multimodal && cached == 0) {
+    if (disk && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
@@ -13455,7 +13413,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (!multimodal && cached == 0 &&
+    size_t cold_images = 0;
+    if (disk && cached == 0 &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
@@ -13466,6 +13425,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                                     ds4_token_assistant(s->engine));
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        cold_store_len = server_store_boundary(s->engine, j->req.images, j->req.image_count,
+                                               cold_store_len, &cold_images);
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -13485,7 +13446,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync(s, slot, &prefix, NULL, 0, err, sizeof(err)) != 0) {
+        if (server_session_sync(s, slot, &prefix, j->req.images, cold_images, err, sizeof(err)) != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
@@ -13557,7 +13518,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    if (disk) kv_cache_maybe_store_continued(s, slot);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -13566,7 +13527,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                req_flags,
                now_sec() - t0);
     if (cold_store_len == prompt_for_sync->len) {
-        if (!multimodal && kv_cache_store_live_prefix(s, slot, prompt_for_sync,
+        if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
             kv_cache_slot_note_store(slot, cold_store_len);
             suppressed_continued_last = -1;
@@ -13692,7 +13653,7 @@ decode_again:
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+            if (disk) kv_cache_maybe_store_continued(s, slot);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -21214,7 +21175,7 @@ static void test_openai_inline_image_content(void) {
     TEST_ASSERT(msgs.v[0].images.len == 1);
     TEST_ASSERT(strstr(msgs.v[0].content, "describe ") == msgs.v[0].content);
     TEST_ASSERT(strstr(msgs.v[0].content, " please") != NULL);
-    TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 8);
+    TEST_ASSERT(msgs.v[0].images.v[0].picture.source_len >= 8);
     TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded, "\x89PNG\r\n\x1a\n", 8));
     chat_msgs_free(&msgs);
     buf_free(&json);
@@ -21334,29 +21295,21 @@ static void test_responses_tool_output_image_content(void) {
     buf_free(&json);
 }
 
-/* Repeated pictures come from the embedding cache: a copy of their rows,
- * the least recently used evicted when the byte budget is exceeded. */
-static void test_vision_cache_keeps_recent_embeddings(void) {
-    float rows[4][4] = {{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}};
-    ds4_vision_embedding e = { .data = NULL, .token_count = 1, .dim = 4 };
-    const size_t budget = g_vision_cache.budget;
-    g_vision_cache.budget = 2 * sizeof(rows[0]);
-    e.data = rows[0]; vision_cache_put("a", &e);
-    e.data = rows[1]; vision_cache_put("b", &e);
-    ds4_vision_embedding got = {0};
-    TEST_ASSERT(vision_cache_get("a", &got) && got.data != rows[0] && got.data[3] == 4);
-    got.data[3] = 0;                                    /* the caller owns its copy */
-    ds4_vision_embedding_free(&got);
-    e.data = rows[2]; vision_cache_put("c", &e);        /* over budget: b goes, a was used */
-    TEST_ASSERT(!vision_cache_get("b", &got));
-    TEST_ASSERT(vision_cache_get("a", &got) && got.data[3] == 4);
-    ds4_vision_embedding_free(&got);
-    TEST_ASSERT(vision_cache_get("c", &got) && got.data[0] == 9);
-    ds4_vision_embedding_free(&got);
-    e.data = rows[3]; vision_cache_put("c", &e);        /* already cached: kept as is */
-    TEST_ASSERT(vision_cache_get("c", &got) && got.data[0] == 9);
-    ds4_vision_embedding_free(&got);
-    g_vision_cache.budget = budget;
+/* A parsed picture is identified, not encoded: its marker spells the
+ * fingerprint the engine's states hold (so the same picture renders the
+ * same text), it has no rows, and its file stays for the engine. */
+static void test_parsed_image_is_identified_by_fingerprint(void) {
+    server_image_inputs images = {0};
+    char first[SERVER_IMAGE_MARKER_BYTES], again[SERVER_IMAGE_MARKER_BYTES], want[DS4_VISION_MARKER_BYTES];
+    TEST_ASSERT(server_image_inputs_push_base64(&images, "image/png", test_inline_png_base64, first));
+    TEST_ASSERT(server_image_inputs_push_base64(&images, "image/png", test_inline_png_base64, again));
+    TEST_ASSERT(images.len == 2 && !strcmp(first, again));
+    const ds4_vision_embedding *p = &images.v[0].picture;
+    ds4_vision_marker(p->fingerprint, want);
+    TEST_ASSERT(!strcmp(first, want));
+    TEST_ASSERT(p->width != 0 && p->height != 0 && !p->data && p->source == images.v[0].encoded);
+    TEST_ASSERT(!server_image_inputs_push_base64(&images, "image/png", "bm90IGFuIGltYWdl", first));
+    server_image_inputs_free(&images);
 }
 
 /* A state's text with its reasoning dropped reads like a replay that never
@@ -21376,7 +21329,7 @@ static void test_qwen_visible_text_empties_think_blocks(void) {
 
 static void ds4_server_unit_tests_run(void) {
     test_qwen_visible_text_empties_think_blocks();
-    test_vision_cache_keeps_recent_embeddings();
+    test_parsed_image_is_identified_by_fingerprint();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_batched_live_continuation_slot_binding();

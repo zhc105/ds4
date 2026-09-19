@@ -41,6 +41,16 @@ static int check_resize(uint32_t width, uint32_t height,
                 patches.content_width, patches.content_height, want_width, want_height);
         ok = 0;
     }
+    /* the plan is that geometry without the pixels: a prompt sizes a
+     * picture's placeholder span from it alone */
+    ds4_image_patches plan = {0}, shape = patches;
+    shape.patches = NULL;
+    if (ok && (!ds4_image_plan_qwen(&plan, width, height, MIN_PIXELS, MAX_PIXELS,
+                                    error, sizeof(error)) ||
+               memcmp(&plan, &shape, sizeof(plan)) != 0)) {
+        fprintf(stderr, "%ux%u: the plan differs from the preprocessed geometry\n", width, height);
+        ok = 0;
+    }
     ds4_image_patches_free(&patches);
     free(image.rgb);
     return ok;

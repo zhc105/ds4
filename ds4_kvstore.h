@@ -15,6 +15,7 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+#define DS4_KVSTORE_EXT_PICTURES          (1u << 4)   /* the tail lists the history's pictures */
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -48,8 +49,10 @@ typedef struct {
 
 /* A checkpoint file holds one conversation: the blocks of its history
  * (what every position contributes, written once and appended to) and a
- * tail with the tokens, the rendered text, the states the session can
- * resume from, and the protocol trailers. */
+ * tail with the tokens, the rendered text, the pictures of the history (a
+ * state is its tokens and the pictures that begin inside them; the text
+ * spells each by its marker, so the keys tell pictures apart), the states
+ * the session can resume from, and the protocol trailers. */
 typedef struct {
     char sha[41];          /* the file name */
     char *path;
@@ -71,6 +74,7 @@ typedef struct {
     uint64_t tokens_offset;
     uint64_t text_offset;
     uint64_t trailer_offset;
+    uint32_t n_pictures;   /* after the text: a count, then token_start, token_count, fingerprint each */
     ds4_kvstore_state *state;
     uint32_t n_states;
 } ds4_kvstore_entry;
@@ -151,6 +155,13 @@ void ds4_kvstore_entry_free(ds4_kvstore_entry *e);
 char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      const ds4_tokens *tokens,
                                      size_t *out_len);
+/* The text of a history with pictures, each spelled by its marker: what a
+ * state's key is, and what a request's prompt text is compared with.  NULL
+ * when the pictures do not lie whole and in order inside the tokens. */
+char *ds4_kvstore_render_history_text(ds4_engine *engine,
+                                      const ds4_tokens *tokens,
+                                      const ds4_vision_identity *images, size_t n_images,
+                                      size_t *out_len);
 bool ds4_kvstore_byte_prefix_match(const char *text, size_t text_len,
                                    const char *prefix, size_t prefix_len);
 void ds4_kvstore_tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n);

@@ -7,7 +7,8 @@ turns must see the pictures.  Reasoning is replayed as agents do; pass
 to the live text (the memory-text path instead of thinking-visible).
 The cached count a response reports is what the engine reused; with the
 server log given, a prefill piece reporting no progress or a warning that
-the engine resumed short of the cache's claim fails the test too.
+the engine resumed short of the cache's claim fails the test too, and so
+does a vision tower run for anything but a turn's new picture.
 
 usage: qwen_vision_cache_test.py http://HOST:8000 STORY.txt [SERVER.log] [--no-think]
 """
@@ -23,12 +24,15 @@ def log_lines(mark):
     return open(LOG, errors="replace").read().splitlines()[mark:] if LOG else []
 
 
-def log_check(mark, tag):
+def log_check(mark, tag, encodes):
     lines = log_lines(mark)
     zero = [l for l in lines if "prefill chunk 0/" in l]
     errs = [l for l in lines if re.search(r"engine resumes at|prefill failed|rejected |cancelled during prefill", l)]
     check(len(zero) <= 1, f"{tag}: {len(zero)} prefill pieces from the start: the history was recomputed")
     check(not errs, f"{tag}: the server logged " + (errs[0][errs[0].find("ds4-server"):][:140] if errs else ""))
+    # the tower runs for the pictures a prefill reaches: the new one, never the history's
+    ran = len([l for l in lines if "vision tower encoded" in l])
+    check(not LOG or ran == encodes, f"{tag}: the vision tower ran {ran} times, expected {encodes}")
 
 def png(rgb):
     """A 256x256 solid-colour PNG as a data URI."""
@@ -42,7 +46,7 @@ def png(rgb):
 
 fails = 0
 
-def ask(messages, tag, expect=None):
+def ask(messages, tag, expect=None, encodes=0):
     body = {"model": "qwen3.8-flash-next", "messages": messages, "max_tokens": 60, "temperature": 0}
     if NO_THINK:
         body["reasoning_effort"] = "none"
@@ -57,7 +61,7 @@ def ask(messages, tag, expect=None):
     if expect and expect.lower() not in text.lower():
         print(f"  FAIL: expected {expect!r} in the answer", flush=True)
         globals()["fails"] += 1
-    log_check(mark, tag)
+    log_check(mark, tag, encodes)
     reply = {"role": "assistant", "content": text}
     if m.get("reasoning_content"):
         reply["reasoning_content"] = m["reasoning_content"]
@@ -73,7 +77,7 @@ base = [{"role": "system", "content": "You are a terse assistant. Answer with on
         {"role": "user", "content": "Background reading:\n" + story + "\n\nSay 'ready' and nothing else."}]
 a1, p1, _ = ask(base, "R1 text")
 msgs = base + [a1, {"role": "user", "content": [{"type": "text", "text": "What is the dominant color of this image? One word."}, png((220, 30, 30))]}]
-a2, p2, c2 = ask(msgs, "R2 adds an image", expect="red")
+a2, p2, c2 = ask(msgs, "R2 adds an image", expect="red", encodes=1)
 check(c2 >= p1, "R2 did not continue from the live state (cached < R1's prompt)")
 msgs += [a2, {"role": "user", "content": "Now say 'thanks' and nothing else."}]
 a3, p3, c3 = ask(msgs, "R3 text after the image")
@@ -83,7 +87,7 @@ stripped = base + [a1, {"role": "user", "content": "What is the dominant color o
 a4, p4, c4 = ask(stripped, "R4 image stripped")
 check(c4 > 0, "R4 prefilled from zero")
 stripped += [a4, {"role": "user", "content": [{"type": "text", "text": "And this one? One word."}, png((30, 60, 220))]}]
-a5, p5, c5 = ask(stripped, "R5 adds another image", expect="blue")
+a5, p5, c5 = ask(stripped, "R5 adds another image", expect="blue", encodes=1)
 check(c5 >= p4, "R5 did not continue from the live state")
 stripped += [a5, {"role": "user", "content": "Which two colors did you see? Two words."}]
 a6, p6, c6 = ask(stripped, "R6 text after the second image", expect="blue")

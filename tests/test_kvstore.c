@@ -38,7 +38,24 @@ struct ds4_session {
     ds4_tokens tokens;       /* the live history */
     uint32_t saved[8];       /* positions of the saved states */
     size_t n_saved;
+    ds4_vision_identity images[4];   /* the pictures of the live history */
+    size_t n_images;
 };
+
+/* A picture in a fake history is '<', one '#' per placeholder, '>'; its
+ * marker spells the first byte of its fingerprint. */
+const ds4_vision_identity *ds4_session_vision_identities(const ds4_session *s, size_t *count) {
+    *count = s->n_images;
+    return s->n_images ? s->images : NULL;
+}
+void ds4_engine_vision_block(ds4_engine *e, const ds4_vision_identity *image, int *start, int *end) {
+    (void)e;
+    *start = (int)image->token_start - 1;
+    *end = (int)(image->token_start + image->token_count) + 1;
+}
+void ds4_vision_marker(const uint8_t fingerprint[32], char out[DS4_VISION_MARKER_BYTES]) {
+    snprintf(out, DS4_VISION_MARKER_BYTES, "{%02x}", fingerprint[0]);
+}
 
 void ds4_tokens_push(ds4_tokens *tv, int token) {
     if (tv->len == tv->cap) {
@@ -107,13 +124,21 @@ int ds4_session_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_
     return fwrite(blob, sizeof(blob), 1, fp) == 1 ? 0 : 1;
 }
 int ds4_session_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position,
+                           const ds4_vision_identity *images, size_t image_count,
                            uint64_t bytes, bool live, char *err, size_t errlen) {
-    (void)tokens; (void)err; (void)errlen;
+    (void)err; (void)errlen;
     uint32_t blob[FAKE_STATE_BYTES / 4];
     if (bytes != sizeof(blob) || fread(blob, sizeof(blob), 1, fp) != 1) return 1;
     if (blob[0] != position || blob[1] != 0x57a7e) return 1;
-    if (live) s->tokens.len = (int)position;
-    else if (s->n_saved < 8) s->saved[s->n_saved++] = position;
+    if (!live) {
+        if (s->n_saved < 8) s->saved[s->n_saved++] = position;
+        return 0;
+    }
+    s->tokens.len = 0;
+    for (uint32_t i = 0; i < position; i++) ds4_tokens_push(&s->tokens, tokens[i]);
+    s->n_images = 0;   /* the state's pictures: the history's that begin inside it */
+    for (size_t i = 0; i < image_count && images[i].token_start < position && s->n_images < 4; i++)
+        s->images[s->n_images++] = images[i];
     return 0;
 }
 
@@ -122,6 +147,16 @@ int ds4_session_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t
 static void session_set(ds4_session *s, const char *text) {
     ds4_tokenize_rendered_chat(NULL, text, &s->tokens);
     s->n_saved = 0;
+    s->n_images = 0;
+}
+
+/* the picture whose placeholders start at token_start, named by one byte */
+static void session_add_image(ds4_session *s, uint32_t token_start, uint32_t token_count, uint8_t name) {
+    ds4_vision_identity *im = &s->images[s->n_images++];
+    memset(im, 0, sizeof(*im));
+    im->token_start = token_start;
+    im->token_count = token_count;
+    im->fingerprint[0] = name;
 }
 
 static char *store(ds4_kvstore *kc, ds4_session *s, const char *extend_path, const char *reason) {
@@ -386,6 +421,60 @@ static void test_random_slot_lifecycle(ds4_kvstore *kc, const char *dir) {
     ds4_tokens_free(&s.tokens);
 }
 
+/* A state is its tokens and its pictures.  The placeholders of two pictures
+ * of one size are the same tokens, so the key spells a picture by its marker,
+ * as a request's text does: the same picture resumes (and the session gets
+ * its identity back), another one of the same size does not, and neither
+ * does the placeholders' own text. */
+static void test_pictures_key_the_state(ds4_kvstore *kc, const char *dir) {
+    clear_dir(dir);
+    ds4_session s = {0};
+    session_set(&s, "system<###>question");
+    session_add_image(&s, 7, 3, 0xa1);
+    char *path = store(kc, &s, NULL, "cold");
+    CHECK(path != NULL);
+
+    ds4_session fresh = {0};
+    ds4_kvstore_load_result lr = {0};
+    CHECK(ds4_kvstore_try_load_text(kc, NULL, &fresh, "system{a1}questionmore", NULL, &lr, NULL, false) == 19);
+    CHECK(fresh.tokens.len == 19 && fresh.n_images == 1 &&
+          memcmp(&fresh.images[0], &s.images[0], sizeof(s.images[0])) == 0);
+    ds4_kvstore_load_result_free(&lr);
+    ds4_tokens_free(&fresh.tokens);
+    CHECK(resume(kc, "system{b2}questionmore") == 0);
+    CHECK(resume(kc, "system<###>questionmore") == 0);
+
+    /* the same tokens with another picture are another history: the slot's
+     * file holds the first picture's rows, so the store forks */
+    s.images[0].fingerprint[0] = 0xb2;
+    char *other = store(kc, &s, path, "cold");
+    CHECK(other != NULL && strcmp(other, path) != 0 && count_files(dir) == 2);
+    CHECK(resume(kc, "system{b2}questionmore") == 19);
+    CHECK(resume(kc, "system{a1}questionmore") == 19);
+
+    /* growing past the picture extends its own file, and the saved state
+     * before the picture resumes a prompt that carries a different one */
+    session_set(&s, "system<###>questionanswer");
+    session_add_image(&s, 7, 3, 0xb2);
+    s.saved[s.n_saved++] = 6;
+    char *grown = store(kc, &s, other, "continued");
+    CHECK(grown != NULL && strcmp(grown, other) == 0 && count_files(dir) == 2);
+    CHECK(resume(kc, "system{b2}questionanswer!") == 25);
+    CHECK(resume(kc, "system{c3}question") == 6);
+
+    /* a history that stops inside a picture has no key */
+    session_set(&s, "system<##");
+    session_add_image(&s, 7, 3, 0xa1);
+    const ds4_kvstore_store_request inside = { .tokens = &s.tokens, .store_len = s.tokens.len, .reason = "cold" };
+    char err[160] = {0};
+    CHECK(ds4_kvstore_store(kc, NULL, &s, &inside, err, sizeof(err)) == NULL && count_files(dir) == 2);
+
+    free(grown);
+    free(other);
+    free(path);
+    ds4_tokens_free(&s.tokens);
+}
+
 int main(int argc, char **argv) {
     char dir[512];
     snprintf(dir, sizeof(dir), "%s/ds4-kvstore-test-%ld", argc > 1 ? argv[1] : "/tmp",
@@ -406,6 +495,7 @@ int main(int argc, char **argv) {
     test_growth_extends_file(&kc, dir);
     test_anchor_survives_extensions(&kc, dir);
     test_random_slot_lifecycle(&kc, dir);
+    test_pictures_key_the_state(&kc, dir);
     ds4_kvstore_close(&kc);
     clear_dir(dir);
     rmdir(dir);

@@ -93,6 +93,18 @@ int ds4_image_preprocess_qwen(
         char              *error,
         size_t             error_cap);
 
+/* The geometry ds4_image_preprocess_qwen gives a picture of this size (every
+ * field but the patches), from the size alone: a prompt needs only the token
+ * count of a picture whose rows the KV state already holds. */
+int ds4_image_plan_qwen(
+        ds4_image_patches *out,
+        uint32_t           width,
+        uint32_t           height,
+        uint32_t           min_pixels,
+        uint32_t           max_pixels,
+        char              *error,
+        size_t             error_cap);
+
 void ds4_image_patches_free(ds4_image_patches *patches);
 
 int ds4_image_preprocess_deepseek4(

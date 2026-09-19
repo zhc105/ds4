@@ -601,6 +601,37 @@ static int ds4_qwen_smart_resize(
     return h_bar != 0 && w_bar != 0;
 }
 
+int ds4_image_plan_qwen(
+        ds4_image_patches *out,
+        uint32_t width,
+        uint32_t height,
+        uint32_t min_pixels,
+        uint32_t max_pixels,
+        char *error,
+        size_t error_cap) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    if (width == 0 || height == 0 || min_pixels == 0 || max_pixels < min_pixels) {
+        ds4_image_error(error, error_cap, "invalid Qwen image preprocessing parameters");
+        return 0;
+    }
+    uint32_t target_height, target_width;
+    if (!ds4_qwen_smart_resize(height, width, min_pixels, max_pixels,
+                               &target_height, &target_width)) {
+        ds4_image_error(error, error_cap, "image aspect ratio exceeds 200");
+        return 0;
+    }
+    out->content_width = target_width;
+    out->content_height = target_height;
+    out->padded_width = target_width;
+    out->padded_height = target_height;
+    out->grid_width = target_width / 16;
+    out->grid_height = target_height / 16;
+    out->patch_count = out->grid_height * out->grid_width;
+    out->image_token_count = out->patch_count / 4;
+    return 1;
+}
+
 int ds4_image_preprocess_qwen(
         ds4_image_patches *out,
         const ds4_image *image,
@@ -608,24 +639,25 @@ int ds4_image_preprocess_qwen(
         uint32_t max_pixels,
         char *error,
         size_t error_cap) {
-    if (!out) return 0;
-    memset(out, 0, sizeof(*out));
-    if (!image || !image->rgb || image->width == 0 || image->height == 0 ||
-        min_pixels == 0 || max_pixels < min_pixels) {
+    if (!image || !image->rgb) {
+        if (out) memset(out, 0, sizeof(*out));
         ds4_image_error(error, error_cap, "invalid Qwen image preprocessing parameters");
         return 0;
     }
-    uint32_t target_height, target_width;
-    if (!ds4_qwen_smart_resize(image->height, image->width, min_pixels, max_pixels,
-                               &target_height, &target_width)) {
-        ds4_image_error(error, error_cap, "image aspect ratio exceeds 200");
-        return 0;
-    }
+    if (!ds4_image_plan_qwen(out, image->width, image->height, min_pixels, max_pixels,
+                             error, error_cap)) return 0;
+    const uint32_t target_height = out->padded_height, target_width = out->padded_width;
+    const uint32_t grid_height = out->grid_height, grid_width = out->grid_width;
 
     const size_t canvas_values = (size_t)target_height * target_width * 3;
     float *canvas = malloc(canvas_values * sizeof(float));
-    if (!canvas) {
-        ds4_image_error(error, error_cap, "unable to allocate resized image");
+    const size_t patch_values = (size_t)out->patch_count * 3 * 2 * 16 * 16;
+    float *patches = malloc(patch_values * sizeof(float));
+    if (!canvas || !patches) {
+        free(canvas);
+        free(patches);
+        memset(out, 0, sizeof(*out));
+        ds4_image_error(error, error_cap, "unable to allocate vision patches");
         return 0;
     }
     if (target_width == image->width && target_height == image->height) {
@@ -636,16 +668,6 @@ int ds4_image_preprocess_qwen(
     }
     for (size_t i = 0; i < canvas_values; i++) canvas[i] = canvas[i] / 255.0f * 2.0f - 1.0f;
 
-    const uint32_t grid_height = target_height / 16;
-    const uint32_t grid_width = target_width / 16;
-    const uint32_t patch_count = grid_height * grid_width;
-    const size_t patch_values = (size_t)patch_count * 3 * 2 * 16 * 16;
-    float *patches = malloc(patch_values * sizeof(float));
-    if (!patches) {
-        free(canvas);
-        ds4_image_error(error, error_cap, "unable to allocate vision patches");
-        return 0;
-    }
     /* The conv3d kernel is [channel][temporal][y][x]; the image is its own
      * second frame. */
     float *p = patches;
@@ -667,15 +689,6 @@ int ds4_image_preprocess_qwen(
         }
     }
     free(canvas);
-
-    out->content_width = target_width;
-    out->content_height = target_height;
-    out->padded_width = target_width;
-    out->padded_height = target_height;
-    out->grid_width = grid_width;
-    out->grid_height = grid_height;
-    out->patch_count = patch_count;
-    out->image_token_count = patch_count / 4;
     out->patches = patches;
     return 1;
 }

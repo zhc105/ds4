@@ -57335,7 +57335,7 @@ struct ds4_session {
     token_vec checkpoint;
     ds4_vision_identity *checkpoint_images;
     size_t checkpoint_image_count;
-    const ds4_vision_span *sync_images;
+    ds4_vision_span *sync_images;   /* the syncing prompt's pictures (the caller's) */
     size_t sync_image_count;
     token_vec greedy_splitkv_segment;
     float *logits;
@@ -59359,7 +59359,8 @@ static size_t qwen_session_state_count(ds4_session *s);
 static const qwen_state_copy *qwen_session_saved_state(ds4_session *s, size_t i);
 static uint64_t qwen_state_blob_bytes(ds4_session *s);
 static int qwen_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_t errlen);
-static int qwen_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position, bool live,
+static int qwen_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position,
+                           const ds4_vision_identity *images, size_t image_count, bool live,
                            char *err, size_t errlen);
 #endif
 
@@ -60545,20 +60546,26 @@ int ds4_session_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_
 }
 
 int ds4_session_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position,
+                           const ds4_vision_identity *images, size_t image_count,
                            uint64_t bytes, bool live, char *err, size_t errlen) {
+    while (image_count != 0 && images[image_count - 1].token_start >= position) image_count--;
 #ifdef DS4_QWEN_GPU
     if (session_has_blocks(s)) {
         if (bytes != qwen_state_blob_bytes(s)) {
             payload_set_err(err, errlen, "KV checkpoint state has the wrong size");
             return 1;
         }
-        return qwen_read_state(s, fp, tokens, position, live, err, errlen);
+        return qwen_read_state(s, fp, tokens, position, images, image_count, live, err, errlen);
     }
 #endif
-    if (!live) {
-        payload_set_err(err, errlen, "this session has no saved states");
+    if (!live || image_count != 0) {
+        payload_set_err(err, errlen, "this session has no saved states and stores no pictures");
         return 1;
     }
+    /* the payload holds no pictures: neither does the state it restores */
+    free(s->checkpoint_images);
+    s->checkpoint_images = NULL;
+    s->checkpoint_image_count = 0;
     if (ds4_session_load_payload(s, fp, bytes, err, errlen) != 0) return 1;
     if (s->checkpoint.len != (int)position ||
         memcmp(s->checkpoint.v, tokens, (size_t)position * sizeof(int)) != 0) {
@@ -67566,12 +67573,18 @@ int ds4_prompt_append_vision(
         ds4_vision_embedding *embedding,
         char *error,
         size_t error_cap) {
-    if (!e || !tokens || !span || !embedding || !embedding->data ||
+    if (!e || !tokens || !span || !embedding ||
+        (!embedding->data && !embedding->source) ||
         embedding->token_count == 0 || !e->vision_ready) {
         if (error && error_cap) snprintf(error, error_cap, "invalid vision prompt input");
         return 0;
     }
     if (e->vision_kind == DS4_VISION_DEEPSEEK4) {
+        /* its block interleaves the rows with sentinels: never only described */
+        if (!embedding->data) {
+            if (error && error_cap) snprintf(error, error_cap, "invalid vision prompt input");
+            return 0;
+        }
         return ds4_prompt_append_deepseek4_vision(
                 e, tokens, span, embedding, error, error_cap);
     }
@@ -67664,6 +67677,29 @@ int ds4_chat_append_multimodal_message(
         tokenize_rendered_chat_vocab(vocab, "</tool_response>", tokens);
     }
     return 1;
+}
+
+/* Everything of a picture's embedding but its rows. */
+static void vision_embedding_describe(
+        ds4_vision_embedding *out,
+        const ds4_image      *image,
+        uint32_t              token_count,
+        uint32_t              layout,
+        uint32_t              grid_width,
+        uint32_t              grid_height,
+        uint32_t              content_width,
+        uint32_t              content_height) {
+    memset(out, 0, sizeof(*out));
+    out->token_count = token_count;
+    out->dim = DS4_N_EMBD;
+    out->layout = layout;
+    out->grid_width = grid_width;
+    out->grid_height = grid_height;
+    out->width = image->width;
+    out->height = image->height;
+    out->content_width = content_width;
+    out->content_height = content_height;
+    memcpy(out->fingerprint, image->fingerprint, sizeof(out->fingerprint));
 }
 
 static int ds4_engine_vision_encode_image(
@@ -67784,17 +67820,9 @@ static int ds4_engine_vision_encode_image(
                      e->vision_kind == DS4_VISION_QWEN ? "Qwen" : "GLM-5.3");
         return 0;
     }
+    vision_embedding_describe(out, image, token_count, layout, grid_width, grid_height,
+                              content_width, content_height);
     out->data = embedding;
-    out->token_count = token_count;
-    out->dim = DS4_N_EMBD;
-    out->layout = layout;
-    out->grid_width = grid_width;
-    out->grid_height = grid_height;
-    out->width = image->width;
-    out->height = image->height;
-    out->content_width = content_width;
-    out->content_height = content_height;
-    memcpy(out->fingerprint, image->fingerprint, sizeof(out->fingerprint));
     return 1;
 }
 
@@ -67823,6 +67851,73 @@ int ds4_engine_vision_encode_memory(
     int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
     ds4_image_free(&image);
     return ok;
+}
+
+/* A picture's identity needs no model: the fingerprint of its decoded
+ * pixels, which the marker spells wherever a history is text (a request's
+ * prompt, a state's key on disk), so comparing texts compares pictures. */
+int ds4_vision_identify_memory(
+        const uint8_t *encoded,
+        size_t encoded_len,
+        ds4_vision_embedding *out,
+        char *error,
+        size_t error_cap) {
+    ds4_image image = {0};
+    if (!out || !ds4_image_decode_memory(&image, encoded, encoded_len, error, error_cap)) return 0;
+    memset(out, 0, sizeof(*out));
+    out->width = image.width;
+    out->height = image.height;
+    memcpy(out->fingerprint, image.fingerprint, sizeof(out->fingerprint));
+    out->source = encoded;
+    out->source_len = encoded_len;
+    ds4_image_free(&image);
+    return 1;
+}
+
+void ds4_vision_marker(const uint8_t fingerprint[32], char out[DS4_VISION_MARKER_BYTES]) {
+    char hex[25];
+    for (int i = 0; i < 12; i++) snprintf(hex + 2 * i, 3, "%02x", fingerprint[i]);
+    snprintf(out, DS4_VISION_MARKER_BYTES, "\036" "DS4_IMAGE_%s" "\037", hex);
+}
+
+/* ds4_prompt_append_vision: a DeepSeek block is all placeholders, the others
+ * put a start and an end token around theirs. */
+void ds4_engine_vision_block(ds4_engine *e, const ds4_vision_identity *image, int *start, int *end) {
+    const int delimiter = e && e->vision_kind == DS4_VISION_DEEPSEEK4 ? 0 : 1;
+    *start = (int)image->token_start - delimiter;
+    *end = (int)(image->token_start + image->token_count) + delimiter;
+}
+
+bool ds4_engine_vision_plans(ds4_engine *e) {
+    return e && e->vision_ready && e->vision_kind == DS4_VISION_QWEN;
+}
+
+/* Size an identified picture's placeholder span.  The Qwen preprocessor
+ * plans from the size alone, and the encode reports that same plan; the
+ * other towers have no plan and encode here. */
+int ds4_engine_vision_describe(
+        ds4_engine *e,
+        ds4_vision_embedding *picture,
+        char *error,
+        size_t error_cap) {
+    if (!e || !picture || !picture->source || !e->vision_ready) {
+        if (error && error_cap) snprintf(error, error_cap, "vision encoder is not loaded");
+        return 0;
+    }
+    if (!ds4_engine_vision_plans(e)) {
+        return ds4_engine_vision_encode_memory(e, picture->source, picture->source_len,
+                                               picture, error, error_cap);
+    }
+    ds4_image_patches plan = {0};
+    if (!ds4_image_plan_qwen(&plan, picture->width, picture->height, e->vision_min_pixels,
+                             e->vision_max_pixels, error, error_cap)) return 0;
+    picture->token_count = plan.image_token_count;
+    picture->dim = DS4_N_EMBD;
+    picture->grid_width = plan.grid_width / 2u;
+    picture->grid_height = plan.grid_height / 2u;
+    picture->content_width = plan.content_width;
+    picture->content_height = plan.content_height;
+    return 1;
 }
 
 int ds4_engine_tp_vocab_split(ds4_engine *e) {
@@ -69911,6 +70006,10 @@ bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
 }
 
+bool ds4_session_vision_sync_active(const ds4_session *s) {
+    return s && s->sync_image_count != 0;
+}
+
 static bool ds4_session_vision_range_overlaps(
         const ds4_session *s,
         uint32_t           token_start,
@@ -69926,13 +70025,18 @@ static bool ds4_session_vision_range_overlaps(
     return false;
 }
 
+/* A state is its tokens and the pictures whose rows it holds: the sync's
+ * pictures that begin inside the history it reached, which is all of them
+ * unless it was interrupted.  One the history stops inside counts: only that
+ * picture may go on from there. */
 static bool ds4_session_store_vision_identities(ds4_session *s) {
-    ds4_vision_identity *copy =
-        vision_identities_from_spans(s->sync_images, s->sync_image_count);
-    if (s->sync_image_count != 0 && !copy) return false;
+    size_t n = 0;
+    while (n < s->sync_image_count && s->sync_images[n].token_start < (uint32_t)s->checkpoint.len) n++;
+    ds4_vision_identity *copy = vision_identities_from_spans(s->sync_images, n);
+    if (n != 0 && !copy) return false;
     free(s->checkpoint_images);
     s->checkpoint_images = copy;
-    s->checkpoint_image_count = s->sync_image_count;
+    s->checkpoint_image_count = n;
     return true;
 }
 
@@ -69999,13 +70103,16 @@ static bool qwen_state_copy_resumes(const ds4_session *s, const qwen_state_copy 
            ds4_vision_identities_prefix(c->images, c->image_count, images, image_count);
 }
 
-static bool qwen_session_state_save(ds4_session *s) {
+/* Copy the live state, whose pictures are `images` (the sync's, or the ones
+ * a file restored: the session's own list follows the sync). */
+static bool qwen_session_state_save(ds4_session *s, const ds4_vision_identity *images, size_t image_count) {
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
     if (!s->checkpoint_valid || s->checkpoint.len <= 0 || (uint32_t)s->checkpoint.len != g->n_tokens) return true;
     for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {   /* the same prompt again */
         const qwen_state_copy *c = &s->qwen_states[i];
-        if (c->tokens.len == s->checkpoint.len && c->image_count == s->sync_image_count &&
-            qwen_state_copy_resumes(s, c, &s->checkpoint, s->sync_images, s->sync_image_count)) return true;
+        if (c->tokens.len == s->checkpoint.len && c->image_count == image_count &&
+            ds4_tokens_starts_with(&s->checkpoint, &c->tokens) && qwen_session_kv_holds(s, &c->tokens) &&
+            (image_count == 0 || memcmp(c->images, images, image_count * sizeof(images[0])) == 0)) return true;
     }
     qwen_state_copy *c = &s->qwen_states[s->qwen_state_next];
     if (!c->state) {
@@ -70016,9 +70123,9 @@ static bool qwen_session_state_save(ds4_session *s) {
     s->qwen_state_next = (s->qwen_state_next + 1u) % QWEN_STATE_COPIES;
     c->tokens.len = 0;   /* an empty copy is never a usable prefix */
     free(c->images);
-    c->images = vision_identities_from_spans(s->sync_images, s->sync_image_count);
-    c->image_count = c->images ? s->sync_image_count : 0;
-    if (c->image_count != s->sync_image_count) return false;
+    c->images = image_count ? xmalloc(image_count * sizeof(images[0])) : NULL;
+    c->image_count = image_count;
+    if (image_count) memcpy(c->images, images, image_count * sizeof(images[0]));
     if (!qwen_graph_state_walk(g, c->state, 1)) return false;
     for (int i = 0; i < s->checkpoint.len; i++) token_vec_push(&c->tokens, s->checkpoint.v[i]);
     memcpy(c->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
@@ -70056,8 +70163,9 @@ static int qwen_session_state_restore(ds4_session *s, const ds4_tokens *prompt) 
  * slot; a state is the drafter's pending flag, the recurrent state and
  * the logits of one position.  The live state comes first, then the saved
  * prompt states whose history is a strict prefix of the live one (their
- * rows are the live rows) and which hold no pictures: the file is keyed by
- * text alone. */
+ * rows are the live rows), pictures included: the file lists the pictures
+ * of its history, and each state read back takes those that begin inside
+ * it. */
 static uint64_t qwen_block_bytes(const ds4_qwen_gpu_graph *g, uint32_t from, uint32_t to) {
     uint64_t bytes = 0;
     for (uint32_t il = 0; il <= DS4_N_LAYER; il++) {
@@ -70131,12 +70239,21 @@ static int qwen_block_io(ds4_session *s, FILE *fp, uint32_t from, uint32_t to, u
     return rc;
 }
 
+/* Whether a copy's pictures are the live history's that begin inside it: a
+ * file lists the pictures of its history once, for all of its states. */
+static bool qwen_state_copy_pictures_are_live(const ds4_session *s, const qwen_state_copy *c) {
+    size_t n = 0;
+    while (n < s->checkpoint_image_count && s->checkpoint_images[n].token_start < (uint32_t)c->tokens.len) n++;
+    return n == c->image_count &&
+           (n == 0 || memcmp(c->images, s->checkpoint_images, n * sizeof(c->images[0])) == 0);
+}
+
 /* The i-th saved prompt state a file can hold. */
 static const qwen_state_copy *qwen_session_saved_state(ds4_session *s, size_t i) {
     for (uint32_t k = 0; k < QWEN_STATE_COPIES; k++) {
         const qwen_state_copy *c = &s->qwen_states[k];
-        if (c->tokens.len <= 0 || c->tokens.len >= s->checkpoint.len || c->image_count != 0 ||
-            !qwen_session_kv_holds(s, &c->tokens)) continue;
+        if (c->tokens.len <= 0 || c->tokens.len >= s->checkpoint.len ||
+            !qwen_session_kv_holds(s, &c->tokens) || !qwen_state_copy_pictures_are_live(s, c)) continue;
         if (i-- == 0) return c;
     }
     return NULL;
@@ -70191,9 +70308,11 @@ static int qwen_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_
 }
 
 /* The live state read back replaces the session's history with
- * tokens[0..position) (whose rows the caller already read) and retires the
- * copies; a saved state read back becomes a copy of that history's prefix. */
-static int qwen_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position, bool live,
+ * tokens[0..position) (whose rows the caller already read) and its pictures
+ * with `images`, and retires the copies; a saved state read back becomes a
+ * copy of that history's prefix. */
+static int qwen_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position,
+                           const ds4_vision_identity *images, size_t image_count, bool live,
                            char *err, size_t errlen) {
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
     const uint64_t state_bytes = qwen_graph_state_walk(g, NULL, 0);
@@ -70246,6 +70365,9 @@ static int qwen_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t
     if (c) {
         if (rc != 0) return 1;
         for (uint32_t t = 0; t < position; t++) token_vec_push(&c->tokens, tokens[t]);
+        c->images = image_count ? xmalloc(image_count * sizeof(images[0])) : NULL;
+        c->image_count = image_count;
+        if (image_count) memcpy(c->images, images, image_count * sizeof(images[0]));
         c->mtp_pending = pending != 0u;
         return 0;
     }
@@ -70268,7 +70390,11 @@ static int qwen_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t
     s->qwen_mtp_pending = pending != 0u;
     s->qwen_mtp_draft = -1;
     s->checkpoint_valid = true;
-    if (!qwen_session_state_save(s)) {   /* the prompt's own copy, if the live state still is one */
+    free(s->checkpoint_images);
+    s->checkpoint_images = image_count ? xmalloc(image_count * sizeof(images[0])) : NULL;
+    s->checkpoint_image_count = image_count;
+    if (image_count) memcpy(s->checkpoint_images, images, image_count * sizeof(images[0]));
+    if (!qwen_session_state_save(s, images, image_count)) {   /* the prompt's own copy, if the live state still is one */
         payload_set_err(err, errlen, "Qwen state save failed after the KV restore");
         return 1;
     }
@@ -70289,6 +70415,10 @@ static uint64_t qwen_session_payload_bytes(ds4_session *s) {
 
 static int qwen_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
+    if (s->checkpoint_image_count != 0) {   /* the payload has no place for them: a block file does */
+        payload_set_err(err, errlen, "a session payload stores no pictures");
+        return 1;
+    }
     const uint32_t n = (uint32_t)s->checkpoint.len;
     const size_t states = qwen_session_state_count(s);
     const uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
@@ -70339,15 +70469,42 @@ static int qwen_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h
         tokens[i] = (int)tok;
     }
     if (rc == 0) rc = ds4_session_read_blocks(s, fp, 0, n, n, err, errlen);
-    if (rc == 0) rc = qwen_read_state(s, fp, tokens, n, true, err, errlen);
+    if (rc == 0) rc = qwen_read_state(s, fp, tokens, n, NULL, 0, true, err, errlen);
     for (uint32_t i = 0; rc == 0 && i < h[8]; i++) {
         uint32_t len = 0;
         rc = payload_read_u32(fp, &len, remaining, err, errlen);
-        if (rc == 0) rc = qwen_read_state(s, fp, tokens, len, false, err, errlen);
+        if (rc == 0) rc = qwen_read_state(s, fp, tokens, len, NULL, 0, false, err, errlen);
     }
     free(tokens);
     *remaining = 0;
     return rc;
+}
+
+/* The tower runs for the pictures the prefill from `start` reaches and no
+ * others: the rows of a span are read only by the passes over its own
+ * positions (qwen_graph_overlay_images), and everything else about a picture
+ * (the state identities, the saved copies, the disk key) is its fingerprint
+ * and size.  This is the one place that knows `start`, so an agent replaying
+ * a history of screenshots encodes only the new one.  The rows must be the
+ * described picture's, or the placeholders were sized for another. */
+static int qwen_session_encode_images(ds4_session *s, int start, char *err, size_t errlen) {
+    for (size_t i = 0; i < s->sync_image_count; i++) {
+        ds4_vision_embedding *im = &s->sync_images[i].embedding;
+        if (im->data || (uint64_t)s->sync_images[i].token_start + im->token_count <= (uint64_t)start) continue;
+        ds4_vision_embedding rows = {0};
+        const double t0 = now_sec();
+        if (!ds4_engine_vision_encode_memory(s->engine, im->source, im->source_len, &rows, err, errlen)) return 1;
+        if (rows.token_count != im->token_count ||
+            memcmp(rows.fingerprint, im->fingerprint, sizeof(rows.fingerprint)) != 0) {
+            ds4_vision_embedding_free(&rows);
+            snprintf(err, errlen, "an encoded image differs from its description");
+            return 1;
+        }
+        im->data = rows.data;
+        fprintf(stderr, "ds4: vision tower encoded image %zu: %u tokens in %.0f ms\n",
+                i, im->token_count, (now_sec() - t0) * 1000.0);
+    }
+    return 0;
 }
 
 static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
@@ -70374,6 +70531,21 @@ static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, ch
         s->qwen_mtp_pending = false;
         s->qwen_mtp_draft = -1;
     }
+    /* The rows of [start, prompt->len) are about to hold this prompt's
+     * pictures.  A copy's tokens are checked against the rows as they are
+     * written (qwen_session_kv_note), but the placeholders of two pictures
+     * are the same tokens: a copy reaching into the range stays usable only
+     * if its pictures there are these ones. */
+    for (uint32_t k = 0; k < QWEN_STATE_COPIES; k++) {
+        qwen_state_copy *c = &s->qwen_states[k];
+        for (size_t i = 0; i < c->image_count && c->tokens.len > start; i++) {
+            const ds4_vision_identity *im = &c->images[i];
+            if (im->token_start + im->token_count <= (uint32_t)start || im->token_start >= (uint32_t)prompt->len) continue;
+            if (i >= s->sync_image_count || im->token_start != s->sync_images[i].token_start ||
+                !ds4_vision_identities_prefix(im, 1, &s->sync_images[i], 1)) c->tokens.len = 0;
+        }
+    }
+    if (qwen_session_encode_images(s, start, err, errlen) != 0) return 1;
     /* Read the n-gram rows of everything still to come ahead of the passes,
      * once per prompt: a caller feeding pieces names the whole, and the
      * hint stands until the live history moves past it.  The first pass
@@ -70424,9 +70596,15 @@ static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, ch
     s->greedy_splitkv_segment.len = 0;
     s->greedy_splitkv_anchor_valid = false;
     /* a piece of a prompt fed in pieces ends mid-turn: the archive keeps turns */
-    if (!s->sync_whole && !qwen_session_state_save(s)) {
-        snprintf(err, errlen, "Qwen state save failed");
-        return 1;
+    if (!s->sync_whole) {
+        ds4_vision_identity *images = vision_identities_from_spans(s->sync_images, s->sync_image_count);
+        const bool saved = (images || s->sync_image_count == 0) &&
+                           qwen_session_state_save(s, images, s->sync_image_count);
+        free(images);
+        if (!saved) {
+            snprintf(err, errlen, "Qwen state save failed");
+            return 1;
+        }
     }
     return 0;
 }
@@ -70812,7 +70990,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             return rc != 0 ? rc : 1;
         }
     }
-    if (rc == 0 && !ds4_session_store_vision_identities(s)) {
+    /* an interrupted sync leaves a valid, shorter state: its pictures too */
+    if ((rc == 0 || (rc == DS4_SESSION_SYNC_INTERRUPTED && s->checkpoint_valid)) &&
+        !ds4_session_store_vision_identities(s)) {
         ds4_session_invalidate(s);
         snprintf(err, errlen, "unable to retain image prompt identity");
         return 1;
@@ -70823,7 +71003,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 int ds4_session_sync_multimodal(
         ds4_session *s,
         const ds4_tokens *prompt,
-        const ds4_vision_span *images,
+        ds4_vision_span *images,
         size_t image_count,
         char *err,
         size_t errlen) {
@@ -70840,7 +71020,8 @@ int ds4_session_sync_multimodal(
         const ds4_vision_span *span = &images[i];
         const uint64_t end = (uint64_t)span->token_start +
                              span->embedding.token_count;
-        if (!span->embedding.data || span->embedding.token_count == 0 ||
+        if ((!span->embedding.data && !span->embedding.source) ||
+            span->embedding.token_count == 0 ||
             span->token_start < previous_end || end > (uint64_t)prompt->len) {
             snprintf(err, errlen, "invalid or overlapping image token span");
             return 1;
@@ -71910,7 +72091,7 @@ bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int c
  * checkpoint before falling back to a full replay. */
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt,
-        const ds4_vision_span *images, size_t image_count, int common,
+        ds4_vision_span *images, size_t image_count, int common,
         char *err, size_t errlen) {
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");

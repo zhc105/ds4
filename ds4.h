@@ -182,8 +182,17 @@ typedef struct {
     ds4_tp_options tp;
 } ds4_engine_options;
 
+/* A picture in a prompt.  What a prompt needs of it everywhere is its
+ * identity and the size of its placeholder span (the fingerprint of its
+ * pixels and token_count, both known without the vision tower); its rows
+ * are read only by the prefill of the span's own positions.  So a described
+ * picture (ds4_engine_vision_describe_memory) has no rows, and the sync that
+ * prefills its span encodes it from `source`: a picture whose span the
+ * resumed state already covers never reaches the tower. */
 typedef struct {
-    float *data;
+    float *data;           /* token_count rows of dim, or NULL while only described */
+    const uint8_t *source; /* borrowed: the encoded file, for a described picture */
+    size_t source_len;
     uint32_t token_count;
     uint32_t dim;          /* values per token row (the model's embedding width) */
     uint32_t layout;
@@ -290,6 +299,28 @@ int ds4_engine_vision_encode_memory(ds4_engine *e,
                                     ds4_vision_embedding *out,
                                     char *error,
                                     size_t error_cap);
+/* The picture without its rows, in two steps.  Identify: decode it for its
+ * size and fingerprint (no model needed); `encoded` becomes its source and
+ * must outlive the syncs of the prompt the picture goes into.  Describe:
+ * size its placeholder span with the preprocessor's plan (towers without a
+ * plan encode here, as above). */
+int ds4_vision_identify_memory(const uint8_t *encoded,
+                               size_t encoded_len,
+                               ds4_vision_embedding *out,
+                               char *error,
+                               size_t error_cap);
+/* Whether describing is the plan alone: otherwise it runs the tower, which
+ * is accelerator work like any inference call. */
+bool ds4_engine_vision_plans(ds4_engine *e);
+int ds4_engine_vision_describe(ds4_engine *e,
+                               ds4_vision_embedding *picture,
+                               char *error,
+                               size_t error_cap);
+/* How a picture is spelled wherever a history is text (a request's rendered
+ * prompt, a state's key): by its fingerprint, so equal texts hold the same
+ * pictures. */
+#define DS4_VISION_MARKER_BYTES 64
+void ds4_vision_marker(const uint8_t fingerprint[32], char out[DS4_VISION_MARKER_BYTES]);
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
 int ds4_prompt_append_vision(ds4_engine *e,
                              ds4_tokens *tokens,
@@ -455,9 +486,11 @@ typedef enum {
  * state is refilled from scratch. */
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+/* With pictures: a described one whose span the sync prefills is encoded
+ * here (its rows stay in the span for the caller to free). */
 int ds4_session_sync_multimodal(ds4_session *s,
                                 const ds4_tokens *prompt,
-                                const ds4_vision_span *images,
+                                ds4_vision_span *images,
                                 size_t image_count,
                                 char *err,
                                 size_t errlen);
@@ -489,12 +522,16 @@ const ds4_tokens *ds4_session_saved_state(const ds4_session *s, size_t i,
                                           const ds4_vision_identity **images,
                                           size_t *image_count);
 /* True while a session contains, or is actively syncing, image-conditioned
- * state. Such state must not be written to the text-keyed disk KV cache. */
+ * state. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+/* True inside a sync that carries pictures (a progress callback): the
+ * identities above are the previous sync's until this one returns, so the
+ * state must not be stored meanwhile. */
+bool ds4_session_vision_sync_active(const ds4_session *s);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt,
-        const ds4_vision_span *images, size_t image_count, int common,
+        ds4_vision_span *images, size_t image_count, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
@@ -683,9 +720,16 @@ uint64_t ds4_session_state_bytes(ds4_session *s, size_t i);
 int ds4_session_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_t errlen);
 /* Bring back a state read from a file: as the live state, or as a saved
  * one the live history (already restored) can fall back to.  The history
- * folded into it is tokens[0..position); its blocks are already read. */
+ * folded into it is tokens[0..position) and, of the file's pictures, those
+ * that begin inside it; its blocks are already read.  Only a session with
+ * blocks stores the pictures of its history. */
 int ds4_session_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position,
+                           const ds4_vision_identity *images, size_t image_count,
                            uint64_t bytes, bool live, char *err, size_t errlen);
+/* The tokens a picture occupies in a history, its placeholders and the
+ * delimiters around them: what its marker stands for where the history is
+ * text. */
+void ds4_engine_vision_block(ds4_engine *e, const ds4_vision_identity *image, int *start, int *end);
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);

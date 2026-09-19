@@ -15,6 +15,7 @@
  *   blocks: what every position of the history contributes, in runs of
  *           block_positions positions, written once and appended to
  *   tail:   "TAIL", the state index, the tokens, the rendered text, the
+ *           history's pictures (DS4_KVSTORE_EXT_PICTURES), the
  *           visible-transcript keys, the state blobs, the trailers
  *
  * A store that continues a file appends the blocks of the new positions and
@@ -467,6 +468,7 @@ bool ds4_kvstore_read_index(FILE *fp, ds4_kvstore_entry *e) {
     free(e->state);
     e->state = NULL;
     e->n_states = 0;
+    e->n_pictures = 0;
     if (!kv_read_header(fp, e)) return false;
     if (e->tail_offset > (uint64_t)INT64_MAX ||
         fseeko(fp, (off_t)e->tail_offset, SEEK_SET) != 0) return false;
@@ -500,7 +502,29 @@ bool ds4_kvstore_read_index(FILE *fp, ds4_kvstore_entry *e) {
         st->bytes = kv_le_get64(r + 36);
         st->key_offset = kv_le_get64(r + 44);
     }
+    if (e->ext_flags & DS4_KVSTORE_EXT_PICTURES) {
+        const uint64_t at = e->text_offset + e->text_bytes;
+        if (at > (uint64_t)INT64_MAX || fseeko(fp, (off_t)at, SEEK_SET) != 0 ||
+            !kv_read_u32(fp, &e->n_pictures) || e->n_pictures > 4096u) return false;
+    }
     return true;
+}
+
+/* The pictures of the file's history (to free), in order; n_pictures says
+ * how many.  NULL when there are none or the file is short. */
+static ds4_vision_identity *kv_read_pictures(FILE *fp, const ds4_kvstore_entry *e) {
+    const uint64_t at = e->text_offset + e->text_bytes + 4u;
+    if (e->n_pictures == 0 || at > (uint64_t)INT64_MAX || fseeko(fp, (off_t)at, SEEK_SET) != 0) return NULL;
+    ds4_vision_identity *v = kv_xmalloc((size_t)e->n_pictures * sizeof(v[0]));
+    memset(v, 0, (size_t)e->n_pictures * sizeof(v[0]));
+    for (uint32_t i = 0; i < e->n_pictures; i++) {
+        if (!kv_read_u32(fp, &v[i].token_start) || !kv_read_u32(fp, &v[i].token_count) ||
+            fread(v[i].fingerprint, 1, sizeof(v[i].fingerprint), fp) != sizeof(v[i].fingerprint)) {
+            free(v);
+            return NULL;
+        }
+    }
+    return v;
 }
 
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
@@ -710,30 +734,57 @@ void ds4_kvstore_close(ds4_kvstore *kc) {
  * Text helpers and store boundaries
  * ========================================================================= */
 
-/* The rendered text of tokens, and where the rendering of each of the
- * `n` prefixes tokens[0..positions[i]) ends. */
+/* The rendered text of a history, and where the rendering of each of the
+ * `n` prefixes tokens[0..positions[i]) ends.  A picture is spelled by its
+ * marker, as a request's prompt spells it: its placeholder tokens say only
+ * how large it is, so a key of them would stand for any picture of that
+ * size.  A prefix ending inside a picture's block has no text of its own
+ * (its length stays SIZE_MAX), nor has a history that stops inside one
+ * (NULL). */
 static char *kv_render_text(ds4_engine *engine, const ds4_tokens *tokens,
+                            const ds4_vision_identity *images, size_t n_images,
                             const uint32_t *positions, size_t n, size_t *lens,
                             size_t *out_len) {
     kv_buf b = {0};
+    size_t image = 0;
     for (size_t i = 0; i < n; i++) lens[i] = positions[i] == 0 ? 0 : SIZE_MAX;
-    for (int t = 0; t < tokens->len; t++) {
-        size_t len = 0;
-        char *piece = ds4_token_text(engine, tokens->v[t], &len);
-        kv_buf_append(&b, piece, len);
-        free(piece);
+    for (int t = 0; t < tokens->len;) {
+        int start = tokens->len, end = tokens->len;
+        if (image < n_images) ds4_engine_vision_block(engine, &images[image], &start, &end);
+        if (start < t || end > tokens->len) {   /* out of order, or the history stops inside it */
+            free(b.ptr);
+            return NULL;
+        }
+        if (t == start) {
+            char marker[DS4_VISION_MARKER_BYTES];
+            ds4_vision_marker(images[image++].fingerprint, marker);
+            kv_buf_append(&b, marker, strlen(marker));
+            t = end;
+        } else {
+            size_t len = 0;
+            char *piece = ds4_token_text(engine, tokens->v[t++], &len);
+            kv_buf_append(&b, piece, len);
+            free(piece);
+        }
         for (size_t i = 0; i < n; i++) {
-            if (positions[i] == (uint32_t)t + 1u) lens[i] = b.len;
+            if (positions[i] == (uint32_t)t) lens[i] = b.len;
         }
     }
     if (out_len) *out_len = b.len;
     return kv_buf_take(&b);
 }
 
+char *ds4_kvstore_render_history_text(ds4_engine *engine,
+                                      const ds4_tokens *tokens,
+                                      const ds4_vision_identity *images, size_t n_images,
+                                      size_t *out_len) {
+    return kv_render_text(engine, tokens, images, n_images, NULL, 0, NULL, out_len);
+}
+
 char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      const ds4_tokens *tokens,
                                      size_t *out_len) {
-    return kv_render_text(engine, tokens, NULL, 0, NULL, out_len);
+    return kv_render_text(engine, tokens, NULL, 0, NULL, 0, NULL, out_len);
 }
 
 bool ds4_kvstore_byte_prefix_match(const char *text, size_t text_len,
@@ -885,10 +936,15 @@ typedef struct {
     uint8_t *blob;          /* when copied */
 } kv_state_src;
 
-static uint64_t kv_tail_bytes(const ds4_tokens *tokens, size_t text_len,
+/* The pictures of a history, after its text: a count and the identities. */
+static uint64_t kv_pictures_bytes(size_t n_images) {
+    return n_images ? 4u + (uint64_t)n_images * (8u + sizeof(((ds4_vision_identity *)0)->fingerprint)) : 0u;
+}
+
+static uint64_t kv_tail_bytes(const ds4_tokens *tokens, size_t text_len, size_t n_images,
                               const kv_state_src *st, uint32_t n, uint64_t trailer_bytes) {
     uint64_t bytes = KV_TAIL_FIXED + (uint64_t)n * KV_TAIL_STATE +
-                     (uint64_t)tokens->len * 4u + text_len + trailer_bytes;
+                     (uint64_t)tokens->len * 4u + text_len + kv_pictures_bytes(n_images) + trailer_bytes;
     for (uint32_t i = 0; i < n; i++) {
         bytes += st[i].bytes;
         if (st[i].key) bytes += 4u + st[i].key_len;
@@ -901,10 +957,12 @@ static bool kv_copy_bytes(FILE *src, uint64_t at, uint64_t bytes, uint8_t *dst) 
            fread(dst, 1, bytes, src) == bytes;
 }
 
-/* The tail at the current position: index, tokens, text, keys, blobs,
- * trailer.  ext_flags gets the trailer's flag when one was written. */
+/* The tail at the current position: index, tokens, text, pictures, keys,
+ * blobs, trailer.  ext_flags gets the flags of the pictures and of the
+ * trailer when they were written. */
 static bool kv_write_tail(FILE *fp, ds4_engine *engine, ds4_session *session,
                           const ds4_tokens *tokens, const char *text, size_t text_len,
+                          const ds4_vision_identity *images, size_t n_images,
                           uint32_t blocks_end, uint32_t block_positions,
                           kv_state_src *st, uint32_t n,
                           const ds4_kvstore_trailer_hooks *hooks, uint8_t *ext_flags,
@@ -913,7 +971,7 @@ static bool kv_write_tail(FILE *fp, ds4_engine *engine, ds4_session *session,
     const off_t start = ftello(fp);
     if (start < 0) return false;
     uint64_t at = (uint64_t)start + KV_TAIL_FIXED + (uint64_t)n * KV_TAIL_STATE +
-                  (uint64_t)tokens->len * 4u + text_len;
+                  (uint64_t)tokens->len * 4u + text_len + kv_pictures_bytes(n_images);
     uint64_t *key_at = kv_xmalloc((size_t)n * sizeof(uint64_t));
     uint64_t *blob_at = kv_xmalloc((size_t)n * sizeof(uint64_t));
     for (uint32_t i = 0; i < n; i++) {
@@ -947,6 +1005,14 @@ static bool kv_write_tail(FILE *fp, ds4_engine *engine, ds4_session *session,
     }
     for (int i = 0; ok && i < tokens->len; i++) ok = kv_write_u32(fp, (uint32_t)tokens->v[i]);
     if (ok) ok = fwrite(text, 1, text_len, fp) == text_len;
+    if (ok && n_images) {
+        ok = kv_write_u32(fp, (uint32_t)n_images);
+        *ext_flags |= DS4_KVSTORE_EXT_PICTURES;
+    }
+    for (size_t i = 0; ok && i < n_images; i++) {
+        ok = kv_write_u32(fp, images[i].token_start) && kv_write_u32(fp, images[i].token_count) &&
+             fwrite(images[i].fingerprint, 1, sizeof(images[i].fingerprint), fp) == sizeof(images[i].fingerprint);
+    }
     for (uint32_t i = 0; ok && i < n; i++) {
         if (!st[i].key) continue;
         ok = kv_write_u32(fp, st[i].key_len) && fwrite(st[i].key, 1, st[i].key_len, fp) == st[i].key_len;
@@ -980,7 +1046,9 @@ static bool kv_write_tail(FILE *fp, ds4_engine *engine, ds4_session *session,
 typedef enum { KV_FILE_OTHER, KV_FILE_EXTENDS, KV_FILE_COVERS } kv_file_relation;
 
 static kv_file_relation kv_file_relates(ds4_session *session, const char *path,
-                                        const ds4_tokens *tokens, const char *live_sha,
+                                        const ds4_tokens *tokens,
+                                        const ds4_vision_identity *images, size_t n_images,
+                                        const char *live_sha,
                                         int model_id, int quant_bits,
                                         bool reject_quant, ds4_kvstore_entry *e) {
     const uint32_t block_positions = ds4_session_block_positions(session);
@@ -1003,6 +1071,17 @@ static kv_file_relation kv_file_relates(ds4_session *session, const char *path,
         for (uint32_t i = 0; ok && i < common; i++) {
             uint32_t tok = 0;
             ok = kv_read_u32(fp, &tok) && (int)tok == tokens->v[i];
+        }
+        /* the same tokens are the same history only with the same pictures:
+         * the blocks hold the rows of the file's own */
+        if (ok) {
+            ds4_vision_identity *held = kv_read_pictures(fp, e);
+            size_t n_held = held ? e->n_pictures : 0, n_live = n_images;
+            while (n_held && held[n_held - 1].token_start >= common) n_held--;
+            while (n_live && images[n_live - 1].token_start >= common) n_live--;
+            ok = (held || e->n_pictures == 0) && n_held == n_live &&
+                 (n_held == 0 || memcmp(held, images, n_held * sizeof(held[0])) == 0);
+            free(held);
         }
         if (fp) fclose(fp);
     }
@@ -1056,12 +1135,19 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
         return NULL;
     }
     for (size_t i = 0; i < n_engine; i++) positions[i] = ds4_session_state_position(session, i);
+    /* The history's pictures.  Only a file of blocks lists them (a state
+     * read back takes its own from the list), and the text must spell every
+     * one whole: a history that stops inside a picture has no key. */
+    size_t n_images = 0;
+    const ds4_vision_identity *images = ds4_session_vision_identities(session, &n_images);
     size_t text_len = 0;
-    char *text = kv_render_text(engine, &tokens, positions, n_engine, lens, &text_len);
-    if (text_len > UINT32_MAX) {
+    char *text = n_images && ds4_session_block_positions(session) == 0 ? NULL :
+                 kv_render_text(engine, &tokens, images, n_images, positions, n_engine, lens, &text_len);
+    if (!text || text_len > UINT32_MAX) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache skipped tokens=%d because rendered text is too large",
-                kv_log_name(kc), tokens.len);
+                "%s: kv cache skipped tokens=%d because %s",
+                kv_log_name(kc), tokens.len,
+                text ? "rendered text is too large" : "its pictures cannot be stored");
         free(text);
         ds4_tokens_free(&tokens);
         return NULL;
@@ -1070,6 +1156,7 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
     kv_state_src st[64];
     uint32_t n = 0;
     for (size_t i = 0; i < n_engine; i++) {
+        if (lens[i] == SIZE_MAX) continue;   /* a saved state inside a picture has no key */
         kv_state_src *s = &st[n++];
         memset(s, 0, sizeof(*s));
         s->position = positions[i];
@@ -1094,10 +1181,11 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
     kv_file_relation relation = KV_FILE_OTHER;
     if (req->path) {
         path = kv_xstrdup(req->path);
-        relation = kv_file_relates(session, path, &tokens, live_sha, model_id, quant_bits, reject_quant, &old);
+        relation = kv_file_relates(session, path, &tokens, images, n_images, live_sha, model_id, quant_bits,
+                                   reject_quant, &old);
     } else if (req->extend_path &&
-               (relation = kv_file_relates(session, req->extend_path, &tokens, live_sha, model_id, quant_bits,
-                                           reject_quant, &old)) != KV_FILE_OTHER) {
+               (relation = kv_file_relates(session, req->extend_path, &tokens, images, n_images, live_sha,
+                                           model_id, quant_bits, reject_quant, &old)) != KV_FILE_OTHER) {
         path = kv_xstrdup(req->extend_path);
     } else {
         char sha[41];
@@ -1106,7 +1194,8 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
         if (access(path, F_OK) == 0) {
             /* the same history so far is one file; another conversation's
              * file may happen to bear this text's name */
-            relation = kv_file_relates(session, path, &tokens, live_sha, model_id, quant_bits, reject_quant, &old);
+            relation = kv_file_relates(session, path, &tokens, images, n_images, live_sha, model_id, quant_bits,
+                                       reject_quant, &old);
             if (relation == KV_FILE_OTHER) {
                 const uint64_t now = (uint64_t)time(NULL);
                 kv_buf b = {0};
@@ -1170,7 +1259,7 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
         ds4_session_block_bytes(session, 0, (uint32_t)tokens.len) : 0;
     bool ok = kv_trailer_serialized_size(req->hooks, text, &trailer_est);
     const uint64_t new_size = DS4_KVSTORE_FIXED_HEADER + blocks_bytes +
-                              kv_tail_bytes(&tokens, text_len, st, n, trailer_est);
+                              kv_tail_bytes(&tokens, text_len, n_images, st, n, trailer_est);
     uint64_t required = 0;
     if (ok && !ds4_kvstore_file_size_fits(kc, new_size, &required)) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -1227,7 +1316,7 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
         hdr.last_used = (uint64_t)time(NULL);
         hdr.tail_offset = (uint64_t)tail;
     }
-    if (ok) ok = kv_write_tail(fp, engine, session, &tokens, text, text_len,
+    if (ok) ok = kv_write_tail(fp, engine, session, &tokens, text, text_len, images, n_images,
                                block_positions ? (uint32_t)tokens.len : 0, block_positions,
                                st, n, req->hooks, &hdr.ext_flags, err, err_len);
     if (ok) {
@@ -1332,7 +1421,7 @@ bool ds4_kvstore_write_text_only(const char *path, uint8_t model_id, uint8_t qua
     }
     uint8_t zero[DS4_KVSTORE_FIXED_HEADER] = {0};
     bool ok = fp && fwrite(zero, 1, sizeof(zero), fp) == sizeof(zero) &&
-              kv_write_tail(fp, NULL, NULL, &none, text ? text : "", text_len, 0, 0, &st, 1,
+              kv_write_tail(fp, NULL, NULL, &none, text ? text : "", text_len, NULL, 0, 0, 0, &st, 1,
                             hooks, &hdr.ext_flags, err, err_len) &&
               kv_write_header(fp, &hdr) && fflush(fp) == 0;
     if (fp && fclose(fp) != 0) ok = false;
@@ -1415,6 +1504,12 @@ int ds4_kvstore_load(ds4_engine *engine, ds4_session *session, FILE *fp,
         tokens[i] = (int)tok;
     }
     if (!ok) kv_set_err(err, err_len, "truncated KV checkpoint tokens");
+    /* each state is handed the history's pictures and keeps its own */
+    ds4_vision_identity *images = ok ? kv_read_pictures(fp, e) : NULL;
+    if (ok && e->n_pictures && !images) {
+        ok = false;
+        kv_set_err(err, err_len, "truncated KV checkpoint pictures");
+    }
     for (uint32_t from = 0; ok && block_positions && from < position; from += block_positions) {
         const uint32_t stored_to = from + block_positions < e->blocks_end ? from + block_positions : e->blocks_end;
         const uint32_t to = stored_to < position ? stored_to : position;
@@ -1424,14 +1519,16 @@ int ds4_kvstore_load(ds4_engine *engine, ds4_session *session, FILE *fp,
     }
     if (ok) {
         ok = st->offset <= (uint64_t)INT64_MAX && fseeko(fp, (off_t)st->offset, SEEK_SET) == 0 &&
-             ds4_session_read_state(session, fp, tokens, position, st->bytes, true, err, err_len) == 0;
+             ds4_session_read_state(session, fp, tokens, position, images, e->n_pictures,
+                                    st->bytes, true, err, err_len) == 0;
     }
     /* the earlier states of the same history come along as fallbacks */
     for (uint32_t s = 0; ok && block_positions && s < e->n_states; s++) {
         const ds4_kvstore_state *o = &e->state[s];
         if (s == state_index || o->position >= position || o->position == 0) continue;
         ok = o->offset <= (uint64_t)INT64_MAX && fseeko(fp, (off_t)o->offset, SEEK_SET) == 0 &&
-             ds4_session_read_state(session, fp, tokens, o->position, o->bytes, false, err, err_len) == 0;
+             ds4_session_read_state(session, fp, tokens, o->position, images, e->n_pictures,
+                                    o->bytes, false, err, err_len) == 0;
     }
     if (ok) {
         const ds4_tokens *live = ds4_session_tokens(session);
@@ -1443,6 +1540,7 @@ int ds4_kvstore_load(ds4_engine *engine, ds4_session *session, FILE *fp,
             hooks->load(hooks->ud, fp, hooks->load_wanted);
         }
     }
+    free(images);
     free(tokens);
     if (!ok) {
         ds4_session_invalidate(session);
