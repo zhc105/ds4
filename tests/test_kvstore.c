@@ -289,17 +289,19 @@ static void test_anchor_survives_extensions(ds4_kvstore *kc, const char *dir) {
 }
 
 /* The server's use of the store, driven at random: one slot whose history
- * grows, rewinds to an earlier point and diverges, or is replaced by another
- * conversation that shares a prefix with one seen before (after an eviction
- * the slot is still bound to the previous conversation's file).  Every store
- * passes the slot's file as the one to extend and binds the slot to the path
- * it returns, as kv_cache_store_live_prefix_text does.
+ * grows, rewinds to an earlier point and diverges (the same conversation,
+ * which keeps its one file), or is replaced by another conversation that
+ * shares a prefix with one seen before (the slot lets go of the old one's
+ * file).  Every store passes the slot's file as the session's own and binds
+ * the slot to the path it returns, as kv_cache_store_live_prefix_text does.
  *
  * What the store promises, checked after every step: the history just stored
  * resumes in full, and for every file a prompt that begins with the history
- * of its earliest state (its anchor) or of its latest store resumes at least
- * that far; whatever is resumed is a prefix of the prompt.  Intermediate
- * states may be dropped; those may not. */
+ * of its earliest state (its anchor) or with the history it held at its last
+ * store resumes at least that far; whatever is resumed is a prefix of the
+ * prompt.  The branch a rewind gave up is gone, and intermediate states may
+ * be dropped; those two may not.  The files stay as many as the
+ * conversations: a rewind past the anchor is the only one that adds a file. */
 typedef struct {
     char *path;
     char anchor[256];
@@ -349,6 +351,7 @@ static void test_random_slot_lifecycle(ds4_kvstore *kc, const char *dir) {
     char *slot_path = NULL;
     uint32_t turns[8];          /* the engine's saved prompt states of this history */
     size_t n_turns = 0;
+    int allowed_files = 1;      /* one per conversation */
     const int failed_before = g_failed;
 
     for (int step = 0; step < STEPS && g_failed == failed_before; step++) {
@@ -370,9 +373,21 @@ static void test_random_slot_lifecycle(ds4_kvstore *kc, const char *dir) {
             hist[keep] = '\0';
             append_random(hist, sizeof(hist));
             n_turns = 0;
+            /* no state of the slot begins it: the slot's file stays the old
+             * conversation's and this one gets its own */
+            free(slot_path);
+            slot_path = NULL;
+            allowed_files++;
         } else {
-            /* rewind to an earlier point and diverge */
-            hist[rnd((unsigned)strlen(hist)) + 1] = '\0';
+            /* rewind to an earlier point and diverge: the same conversation,
+             * whose file gives up the branch left behind (a rewind into the
+             * anchor's history leaves the file to the conversations that
+             * share the anchor, and is a new one) */
+            const size_t keep = rnd((unsigned)strlen(hist)) + 1;
+            const model_file *own = NULL;
+            for (int i = 0; slot_path && i < n_files; i++) if (!strcmp(files[i].path, slot_path)) own = &files[i];
+            if (!own || keep < strlen(own->anchor)) allowed_files++;
+            hist[keep] = '\0';
             append_random(hist, sizeof(hist));
             n_turns = 0;
         }
@@ -394,10 +409,17 @@ static void test_random_slot_lifecycle(ds4_kvstore *kc, const char *dir) {
             f->path = strdup(path);
             snprintf(f->anchor, sizeof(f->anchor), "%.*s", (int)first, hist);
         }
-        if (f && strlen(hist) > strlen(f->last)) snprintf(f->last, sizeof(f->last), "%s", hist);
+        /* a conversation's file holds its history as of the last store: a
+         * rewind overwrote what it held past the fork (a store the file
+         * already covered left it longer) */
+        if (f && strncmp(f->last, hist, strlen(hist)) != 0) snprintf(f->last, sizeof(f->last), "%s", hist);
         if (resume_checked(kc, hist) < (int)strlen(hist)) {
             fprintf(stderr, "  FAIL step %d: the history just stored '%s' is not resumable\n",
                     step, hist);
+            g_failed++;
+        }
+        if (count_files(dir) > allowed_files) {
+            fprintf(stderr, "  FAIL step %d: %d files for %d conversations\n", step, count_files(dir), allowed_files);
             g_failed++;
         }
 
@@ -461,6 +483,16 @@ static void test_pictures_key_the_state(ds4_kvstore *kc, const char *dir) {
     CHECK(grown != NULL && strcmp(grown, other) == 0 && count_files(dir) == 2);
     CHECK(resume(kc, "system{b2}questionanswer!") == 25);
     CHECK(resume(kc, "system{c3}question") == 6);
+
+    /* the agent strips the picture: the history parts from the file's where
+     * the picture began, past the file's first state, so the conversation's
+     * own file is rewound there and no second one appears */
+    session_set(&s, "systemstrippedquestionanswer");
+    char *stripped = store(kc, &s, grown, "continued");
+    CHECK(stripped != NULL && strcmp(stripped, grown) == 0 && count_files(dir) == 2);
+    CHECK(resume(kc, "systemstrippedquestionanswer!") == 28);
+    CHECK(resume(kc, "system{b2}questionanswer!") == 6);
+    free(stripped);
 
     /* a history that stops inside a picture has no key */
     session_set(&s, "system<##");

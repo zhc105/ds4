@@ -113,10 +113,13 @@ typedef struct {
 
 /* What to store: the session's first store_len tokens (they must be its
  * whole live history), under the store's reason.  A key override keys the
- * live state by a visible transcript instead of the rendered text.  The
- * store extends the file at extend_path when the session grew out of it,
- * writes to path when one is given (extending it when it can), and
- * otherwise writes a new file named by the text; created_at 0 means now. */
+ * live state by a visible transcript instead of the rendered text.
+ * extend_path is the session's own file, which no other session holds: the
+ * store writes the history into it from where the two part (appending when
+ * the session only grew, overwriting the branch it gave up when its history
+ * was edited) unless the history left it before its first state.  The store
+ * writes to path when one is given (appending when it can), and otherwise
+ * writes a new file named by the text; created_at 0 means now. */
 typedef struct {
     const ds4_tokens *tokens;
     int store_len;
@@ -132,6 +135,7 @@ typedef struct {
 
 typedef struct {
     int tokens;            /* the position resumed */
+    int history_tokens;    /* the file's whole history: more when an earlier state was resumed */
     uint32_t key_len;
     uint8_t quant_bits;
     uint8_t ext_flags;

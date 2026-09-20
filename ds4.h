@@ -651,6 +651,18 @@ void ds4_session_drop_kv(ds4_session *s);
  * piece past this. */
 int ds4_session_resume_pos(ds4_session *s, const ds4_tokens *prompt,
                            const ds4_vision_span *images, size_t image_count);
+/* Which states a session saves (Qwen sessions keep the last few to resume an
+ * edited history from, see ds4_session_saved_state).  By default one at the
+ * end of every synced prompt.  A caller that knows where its turns end turns
+ * those off and saves the live state there instead: an agent edits its
+ * history at turn boundaries (it drops an old picture from a user turn), so
+ * the state that ends the turn before is the one such a prompt resumes from
+ * with nothing to recompute, and one state a turn makes the few kept reach
+ * twice as far back as a prompt's and a turn's both.  The price is a prompt
+ * sent again as it was, which recomputes its last user turn. */
+void ds4_session_set_prompt_states(ds4_session *s, bool on);
+int ds4_session_save_state(ds4_session *s);   /* 0: saved, or a session that keeps none */
+
 /* A caller feeding a prompt in pieces names the whole prompt while syncing
  * all but the last piece (NULL otherwise): the engine then archives no
  * turn-boundary state at a piece's end (a piece is not a turn), so the

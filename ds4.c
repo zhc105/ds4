@@ -57327,7 +57327,6 @@ struct ds4_session {
     uint64_t qwen_mtp_cycles, qwen_mtp_committed;   /* speculative statistics */
     /* The recurrent state after the last prompts' prefills (qwen_session_state_save). */
     qwen_state_copy qwen_states[QWEN_STATE_COPIES];
-    uint32_t qwen_state_next;
     /* The history the K/V rows currently hold, row by row (-1: a rejected
      * draft); a copy is usable only while its history is still in the rows. */
     token_vec qwen_kv_tokens;
@@ -57394,6 +57393,7 @@ struct ds4_session {
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
     const ds4_tokens *sync_whole;   /* the prompt being synced is a piece of this, not a turn: archive no state at its end */
+    bool no_prompt_states;          /* the caller saves the states itself, at its turn ends */
     uint32_t ple_hinted;            /* live-history position up to which n-gram rows were read ahead */
 };
 
@@ -70076,10 +70076,11 @@ static void qwen_session_ple_prev(ds4_session *s) {
  * clearing the previous turn's reasoning) would otherwise start over,
  * 150 s for a 150K history.  So the session copies the recurrent state
  * (qwen_graph_state_walk, 112 MB for Flash-Next) at the end of every
- * prompt's prefill, keeping the last QWEN_STATE_COPIES prompts in a ring,
- * and a prompt that diverges resumes from the longest copy that is still
- * its prefix.  The generated answer is not worth a copy of its own: it is a
- * few hundred tokens, re-prefilled in well under a second.  A copy holds
+ * prompt's prefill, keeping the last QWEN_STATE_COPIES in a ring, and a
+ * prompt that diverges resumes from the longest copy that is still its
+ * prefix.  A caller that knows its turn ends saves those instead
+ * (ds4_session_save_state): the server does, because its agents edit at
+ * turn boundaries and one copy a turn reaches further back.  A copy holds
  * only the recurrent state; the K/V rows, block keys and drafter rows up to
  * its length are used in place, so it is valid only while those rows still
  * hold its history (qwen_kv_tokens): resuming another branch overwrites
@@ -70103,6 +70104,21 @@ static bool qwen_state_copy_resumes(const ds4_session *s, const qwen_state_copy 
            ds4_vision_identities_prefix(c->images, c->image_count, images, image_count);
 }
 
+/* The copy a new one replaces: one that is of no use any more (empty, or
+ * its rows overwritten by another branch), else the one furthest back.  A
+ * resume retires the copies past the fork, and those go first: a plain ring
+ * would overwrite the oldest state, the one the next edit may need, while
+ * the retired ones sat in their places. */
+static qwen_state_copy *qwen_state_copy_victim(ds4_session *s) {
+    qwen_state_copy *victim = NULL;
+    for (uint32_t i = 0; i < QWEN_STATE_COPIES; i++) {
+        qwen_state_copy *c = &s->qwen_states[i];
+        if (c->tokens.len <= 0 || !qwen_session_kv_holds(s, &c->tokens)) return c;
+        if (!victim || c->tokens.len < victim->tokens.len) victim = c;
+    }
+    return victim;
+}
+
 /* Copy the live state, whose pictures are `images` (the sync's, or the ones
  * a file restored: the session's own list follows the sync). */
 static bool qwen_session_state_save(ds4_session *s, const ds4_vision_identity *images, size_t image_count) {
@@ -70114,13 +70130,12 @@ static bool qwen_session_state_save(ds4_session *s, const ds4_vision_identity *i
             ds4_tokens_starts_with(&s->checkpoint, &c->tokens) && qwen_session_kv_holds(s, &c->tokens) &&
             (image_count == 0 || memcmp(c->images, images, image_count * sizeof(images[0])) == 0)) return true;
     }
-    qwen_state_copy *c = &s->qwen_states[s->qwen_state_next];
+    qwen_state_copy *c = qwen_state_copy_victim(s);
     if (!c->state) {
         c->state = ds4_gpu_tensor_alloc(qwen_graph_state_walk(g, NULL, 0));
         if (!c->state) return false;
         c->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     }
-    s->qwen_state_next = (s->qwen_state_next + 1u) % QWEN_STATE_COPIES;
     c->tokens.len = 0;   /* an empty copy is never a usable prefix */
     free(c->images);
     c->images = image_count ? xmalloc(image_count * sizeof(images[0])) : NULL;
@@ -70328,15 +70343,13 @@ static int qwen_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t
             s->qwen_states[k].tokens.len = 0;
             s->qwen_states[k].image_count = 0;
         }
-        s->qwen_state_next = 0;
     } else {
         if (!s->checkpoint_valid || position >= (uint32_t)s->checkpoint.len ||
             memcmp(tokens, s->checkpoint.v, (size_t)position * sizeof(int)) != 0) {
             payload_set_err(err, errlen, "a saved state must be a prefix of the restored live history");
             return 1;
         }
-        c = &s->qwen_states[s->qwen_state_next];
-        s->qwen_state_next = (s->qwen_state_next + 1u) % QWEN_STATE_COPIES;
+        c = qwen_state_copy_victim(s);
         c->tokens.len = 0;
         free(c->images);
         c->images = NULL;
@@ -70394,7 +70407,9 @@ static int qwen_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t
     s->checkpoint_images = image_count ? xmalloc(image_count * sizeof(images[0])) : NULL;
     s->checkpoint_image_count = image_count;
     if (image_count) memcpy(s->checkpoint_images, images, image_count * sizeof(images[0]));
-    if (!qwen_session_state_save(s, images, image_count)) {   /* the prompt's own copy, if the live state still is one */
+    /* the restored state's own copy, unless the caller saves its states itself
+     * (it knows whether this one is a turn of its conversation or a shared anchor) */
+    if (!s->no_prompt_states && !qwen_session_state_save(s, images, image_count)) {
         payload_set_err(err, errlen, "Qwen state save failed after the KV restore");
         return 1;
     }
@@ -70596,7 +70611,7 @@ static int qwen_session_sync_chunks(ds4_session *s, const ds4_tokens *prompt, ch
     s->greedy_splitkv_segment.len = 0;
     s->greedy_splitkv_anchor_valid = false;
     /* a piece of a prompt fed in pieces ends mid-turn: the archive keeps turns */
-    if (!s->sync_whole) {
+    if (!s->sync_whole && !s->no_prompt_states) {
         ds4_vision_identity *images = vision_identities_from_spans(s->sync_images, s->sync_image_count);
         const bool saved = (images || s->sync_image_count == 0) &&
                            qwen_session_state_save(s, images, s->sync_image_count);
@@ -72147,6 +72162,20 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     int i = 0;
     while (i < n && s->checkpoint.v[i] == prompt->v[i]) i++;
     return i;
+}
+
+void ds4_session_set_prompt_states(ds4_session *s, bool on) {
+    if (s) s->no_prompt_states = !on;
+}
+
+int ds4_session_save_state(ds4_session *s) {
+    if (!s) return 1;
+#ifdef DS4_QWEN_GPU
+    if (ds4_model_is_qwen() && !ds4_session_is_cpu(s)) {
+        return qwen_session_state_save(s, s->checkpoint_images, s->checkpoint_image_count) ? 0 : 1;
+    }
+#endif
+    return 0;
 }
 
 const ds4_tokens *ds4_session_saved_state(const ds4_session *s, size_t i,

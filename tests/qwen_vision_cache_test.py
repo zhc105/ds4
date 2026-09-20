@@ -85,7 +85,9 @@ check(c3 >= p2, "R3 did not continue from the live state")
 stripped = base + [a1, {"role": "user", "content": "What is the dominant color of this image? One word. [image removed]"},
                    a2, {"role": "user", "content": "Now say 'thanks' and nothing else."}]
 a4, p4, c4 = ask(stripped, "R4 image stripped")
-check(c4 > 0, "R4 prefilled from zero")
+# the stripped history is the same conversation rewound: it stays on its slot and
+# resumes from the state saved after R1's prompt, not from disk or from zero
+check(c4 >= p1, f"R4 resumed at {c4}: not from the state saved after R1's prompt ({p1})")
 stripped += [a4, {"role": "user", "content": [{"type": "text", "text": "And this one? One word."}, png((30, 60, 220))]}]
 a5, p5, c5 = ask(stripped, "R5 adds another image", expect="blue", encodes=1)
 check(c5 >= p4, "R5 did not continue from the live state")

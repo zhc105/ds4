@@ -10986,9 +10986,29 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
     };
 }
 
-/* Store the slot's live prefix.  The slot remembers the file its
- * conversation lives in (the one it was loaded from or last stored to), so
- * a store that continues that conversation appends to it. */
+/* A conversation has one file and a file one conversation.  The slot
+ * remembers its conversation's file, and a store rewrites that file from
+ * where the live history leaves it (ds4_kvstore_store): a history edited
+ * behind its frontier overwrites the branch it gave up instead of leaving it
+ * on disk beside a copy.  So no two slots may hold one file: a slot that
+ * would take a file another holds (a second request continuing the same
+ * history) goes without, and its next store names a file of its own.
+ * `path` is the slot's from here on (NULL: it has no file). */
+static void slot_set_kv_path(server *s, server_slot *slot, char *path) {
+    pthread_mutex_lock(&s->kv_mu);
+    for (int i = 0; path && i < s->slot_count; i++) {
+        const server_slot *other = &s->slots[i];
+        if (other != slot && other->kv_path && !strcmp(other->kv_path, path)) {
+            free(path);
+            path = NULL;
+        }
+    }
+    free(slot->kv_path);
+    slot->kv_path = path;
+    pthread_mutex_unlock(&s->kv_mu);
+}
+
+/* Store the slot's live prefix, to its conversation's file when it has one. */
 static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const ds4_tokens *tokens,
                                             int store_len, const char *reason,
@@ -11024,8 +11044,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->kv_mu);
     if (!inference_locked) pthread_mutex_unlock(&s->inference_mu);
     if (path) {
-        free(slot->kv_path);
-        slot->kv_path = path;
+        slot_set_kv_path(s, slot, path);
     } else if (err[0]) {
         server_log(DS4_LOG_WARNING, "ds4-server: kv cache store (%s) failed: %s", reason, err);
     }
@@ -11147,8 +11166,7 @@ static bool server_kv_reclaim(void *ud) {
         kv_cache_store_current(s, victim, "kv-pool", true);
     }
     ds4_session_drop_kv(victim->session);
-    free(victim->kv_path);
-    victim->kv_path = NULL;
+    slot_set_kv_path(s, victim, NULL);
     server_log(DS4_LOG_DEFAULT, "ds4-server: kv pool full: evicted slot %d (%d tokens, hit score %.2f) to disk",
                victim->id, tokens, victim_score);
     pthread_mutex_lock(&s->mu);
@@ -11216,8 +11234,7 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     }
     pthread_mutex_unlock(&s->kv_mu);
     slot->continued_last_store_tokens = 0;
-    free(slot->kv_path);
-    slot->kv_path = NULL;
+    slot_set_kv_path(s, slot, NULL);
     pthread_mutex_lock(&s->inference_mu);
     ds4_session_invalidate(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
@@ -11265,13 +11282,20 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
     pthread_mutex_unlock(&s->kv_mu);
+    /* a file's whole history is its conversation where a store left it: a
+     * state of the slot's own, like the turn ends it saves */
+    if (loaded > 0 && lr.tokens == lr.history_tokens) (void)ds4_session_save_state(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
         if (key_len_out) *key_len_out = lr.key_len;
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
-        free(slot->kv_path);
-        slot->kv_path = lr.path ? xstrdup(lr.path) : NULL;
+        /* The file is this conversation's only when its whole history was
+         * resumed (a restart, a slot brought back from disk).  An earlier
+         * state of it begins another conversation, or a branch its own
+         * slot can no longer resume from memory: that one reads the file
+         * and stores a new one. */
+        slot_set_kv_path(s, slot, lr.path && lr.tokens == lr.history_tokens ? xstrdup(lr.path) : NULL);
     }
     ds4_kvstore_load_result_free(&lr);
     return loaded;
@@ -11372,6 +11396,36 @@ static void qwen_visible_text(buf *out, const char *text, size_t len) {
     buf_append(out, p, (size_t)(end - p));
 }
 
+/* Whether a state (the live history or a saved one, its tokens and its
+ * pictures) begins a request, and how many bytes of the request's text it
+ * stands for; 0 when it does not.  This is what makes a request part of a
+ * slot's conversation: the slot that runs it and the state it continues
+ * from are both chosen by it. */
+static size_t state_text_begins_request(server *s, const request *req,
+                                        const ds4_tokens *tokens,
+                                        const ds4_vision_identity *ids, size_t n_ids) {
+    if (!s || !req || !req->prompt_text || !tokens || tokens->len <= 0) return 0;
+    if (!ds4_vision_identities_prefix(ids, n_ids, req->images, req->image_count)) return 0;
+
+    buf text = {0};
+    text.ptr = ds4_kvstore_render_history_text(s->engine, tokens, ids, n_ids, &text.len);
+    if (!text.ptr) return 0;   /* the state stops inside a picture */
+    const size_t prompt_len = strlen(req->prompt_text);
+    size_t offset = byte_prefix_match(req->prompt_text, prompt_len, text.ptr, text.len) ? text.len : 0;
+    if (offset == 0 && req->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        /* A replay carries no reasoning the client never received (Codex),
+         * and the template renders such turns with an empty think block:
+         * the state's text reads the same once its reasoning is dropped,
+         * and the state's tokens, reasoning included, then stand for it. */
+        buf visible = {0};
+        qwen_visible_text(&visible, text.ptr, text.len);
+        if (byte_prefix_match(req->prompt_text, prompt_len, visible.ptr, visible.len)) offset = visible.len;
+        buf_free(&visible);
+    }
+    buf_free(&text);
+    return offset;
+}
+
 /* Continue a state (the live history or a saved one) from its own text.
  * The state's tokenization is authoritative (sampled tokens need not be
  * what BPE makes of their text), so the request's text is compared
@@ -11384,30 +11438,10 @@ static int state_text_prefix_prompt(server *s, request *req,
                                     const ds4_tokens *tokens,
                                     const ds4_vision_identity *ids, size_t n_ids,
                                     ds4_tokens *effective_prompt) {
-    if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
-    if (!tokens || tokens->len <= 0) return 0;
-    if (!ds4_vision_identities_prefix(ids, n_ids, req->images, req->image_count)) return 0;
-
-    buf text = {0};
-    text.ptr = ds4_kvstore_render_history_text(s->engine, tokens, ids, n_ids, &text.len);
-    if (!text.ptr) return 0;   /* the state stops inside a picture */
-    const size_t prompt_len = strlen(req->prompt_text);
-    bool ok = byte_prefix_match(req->prompt_text, prompt_len, text.ptr, text.len);
-    size_t offset = text.len;
-    if (!ok && req->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
-        /* A replay carries no reasoning the client never received (Codex),
-         * and the template renders such turns with an empty think block:
-         * the state's text reads the same once its reasoning is dropped,
-         * and the state's tokens, reasoning included, then stand for it. */
-        buf visible = {0};
-        qwen_visible_text(&visible, text.ptr, text.len);
-        ok = byte_prefix_match(req->prompt_text, prompt_len, visible.ptr, visible.len);
-        offset = visible.len;
-        buf_free(&visible);
-    }
-    buf_free(&text);
-    if (!ok || !build_prompt_after_state(s, req, ids, n_ids, tokens, offset,
-                                         effective_prompt)) {
+    if (!effective_prompt) return 0;
+    const size_t offset = state_text_begins_request(s, req, tokens, ids, n_ids);
+    if (offset == 0 || !build_prompt_after_state(s, req, ids, n_ids, tokens, offset,
+                                                 effective_prompt)) {
         return 0;
     }
     return tokens->len;
@@ -11441,6 +11475,22 @@ static int saved_state_text_prefix_prompt(server *s, server_slot *slot,
         } else {
             ds4_tokens_free(&candidate);
         }
+    }
+    return best;
+}
+
+/* How far into a request a slot's conversation reaches: the longest of its
+ * states, live or saved, that begins the request, which is where the engine
+ * would resume it from.  0: the request is not of this conversation (the
+ * saved states are turn ends, so each holds a turn of its own conversation
+ * and none begins another that merely shares the system prompt). */
+static int slot_resume_len(server *s, const server_slot *slot, const request *req) {
+    size_t n_ids = 0;
+    const ds4_vision_identity *ids = ds4_session_vision_identities(slot->session, &n_ids);
+    const ds4_tokens *state = ds4_session_tokens(slot->session);
+    int best = state && state_text_begins_request(s, req, state, ids, n_ids) ? state->len : 0;
+    for (size_t i = 0; (state = ds4_session_saved_state(slot->session, i, &ids, &n_ids)); i++) {
+        if (state->len > best && state_text_begins_request(s, req, state, ids, n_ids)) best = state->len;
     }
     return best;
 }
@@ -13302,6 +13352,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         kv_cache_touch_prompt_file(s, j->req.prompt_text);
         kv_cache_store_current(s, slot, "evict", false);
     }
+    /* No state of the slot begins the request: it is another conversation
+     * (or a branch this one can no longer resume), and the slot's file stays
+     * the old one's.  This one gets a file of its own, unless it turns out
+     * to resume a file's whole history below. */
+    if (cached == 0) slot_set_kv_path(s, slot, NULL);
     if (disk && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
@@ -14244,6 +14299,15 @@ decode_again:
                                          parsed_reasoning, &parsed_calls);
         }
     }
+    /* The turn ends here, in the form the next request will replay: the
+     * state a history edited in a later turn resumes from. */
+    if (!job_cancelled(j) && strcmp(final_finish, "error")) {
+        pthread_mutex_lock(&s->inference_mu);
+        if (ds4_session_save_state(slot->session) != 0) {
+            server_log(DS4_LOG_WARNING, "ds4-server: the turn's state could not be saved");
+        }
+        pthread_mutex_unlock(&s->inference_mu);
+    }
 
     bool response_ok = !job_cancelled(j);
     if (response_ok && j->req.stream) {
@@ -14471,21 +14535,39 @@ static bool slot_continues_request(const server_slot *slot, const request *r) {
 }
 
 /* The slot a job should run on: its required one, else one holding its
- * live continuation, else the longest token prefix.  Tokens alone mislead:
+ * live continuation, else the one whose conversation it belongs to, else
+ * (a new conversation) the longest token prefix.  Tokens alone mislead:
  * the live tokens hold hidden reasoning the request does not replay, so
  * two conversations sharing a system prompt look alike by tokens and a
  * request could land on a slot holding another branch of its history. */
-static int job_slot_score(server *s, server_slot *slot, const job *j,
-                          int required_slot) {
-    if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
-    if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
-    if (required_slot == slot->id) return INT_MAX;
-    if (ds4_session_pos(slot->session) > 0 &&
-        !ds4_session_vision_prefix_matches(slot->session,
-                                           j->req.images, j->req.image_count)) {
-        return -1;
+static int64_t job_slot_score(server *s, server_slot *slot, const job *j,
+                              int required_slot, bool conversations) {
+    if (!s || !slot || !j || slot->busy || slot->assigned) return INT64_MIN;
+    if (required_slot >= 0 && slot->id != required_slot) return INT64_MIN;
+    if (required_slot == slot->id) return INT64_MAX;
+    if (slot_continues_request(slot, &j->req)) return INT64_MAX - 1;
+    /* A request stays with its conversation while one of the slot's states
+     * still begins it: a history edited behind the frontier (an agent
+     * dropping an old picture) resumes from the saved state before the
+     * edit, which only this slot has.  Of several such slots the one that
+     * resumes furthest wins, then the one that gives up the least of its
+     * live history.  Finding out renders the slot's histories as text, so
+     * it is asked only of a job no slot is bound to (`conversations`). */
+    const int resume = conversations ? slot_resume_len(s, slot, &j->req) : 0;
+    if (resume > 0) {
+        const int given_up = ds4_session_pos(slot->session) - resume;
+        return ((int64_t)1 << 62) + ((int64_t)resume << 31) + (INT32_MAX - (given_up > 0 ? given_up : 0));
     }
-    if (slot_continues_request(slot, &j->req)) return INT_MAX - 1;
+    /* A new conversation.  A session of blocks takes up a token prefix only
+     * from a state at it, which the above found none of, so sharing tokens
+     * with the slot's conversation is worth nothing and costs it its slot:
+     * an empty slot first, then the conversation least worth keeping (as
+     * server_kv_reclaim chooses). */
+    if (ds4_session_block_positions(slot->session) != 0) {
+        if (ds4_session_pos(slot->session) == 0) return INT32_MAX;
+        const double worth = slot_hit_score(slot, now_sec()) * 1000.0;
+        return INT32_MAX - 1 - (int64_t)(worth < 1e9 ? worth : 1e9);
+    }
     return ds4_session_common_prefix(slot->session, &j->req.prompt);
 }
 
@@ -14495,20 +14577,28 @@ static void dispatch_jobs_locked(server *s) {
         job *chosen = NULL;
         job *chosen_prev = NULL;
         server_slot *chosen_slot = NULL;
-        int chosen_score = INT_MIN;
+        int64_t chosen_score = INT64_MIN;
 
         pthread_mutex_lock(&s->tool_mu);
         job *prev = NULL;
         for (job *j = s->head; j; prev = j, j = j->next) {
             int required = job_required_slot_locked(s, j);
             server_slot *best = NULL;
-            int best_score = INT_MIN;
-            for (int i = 0; i < s->slot_count; i++) {
-                int score = job_slot_score(s, &s->slots[i], j, required);
-                if (score > best_score) {
-                    best_score = score;
-                    best = &s->slots[i];
+            int64_t best_score = INT64_MIN;
+            /* the bindings first, which cost nothing: the usual request
+             * continues its slot's live state and is settled by them */
+            const double t0 = now_sec();
+            for (int conversations = 0; conversations < 2 && best_score < INT64_MAX - 1; conversations++) {
+                for (int i = 0; i < s->slot_count; i++) {
+                    int64_t score = job_slot_score(s, &s->slots[i], j, required, conversations != 0);
+                    if (score > best_score) {
+                        best_score = score;
+                        best = &s->slots[i];
+                    }
                 }
+            }
+            if (now_sec() - t0 > 0.005) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: choosing a slot took %.1f ms", (now_sec() - t0) * 1000.0);
             }
             if (best) {
                 chosen = j;
@@ -15595,6 +15685,9 @@ int main(int argc, char **argv) {
             server_close_resources(&s);
             return 1;
         }
+        /* the states a slot resumes an edited history from are its turn
+         * ends, saved when a generation finishes (generate_job_inner) */
+        ds4_session_set_prompt_states(slot->session, false);
     }
 
     if (cfg.kv_disk_dir) {
