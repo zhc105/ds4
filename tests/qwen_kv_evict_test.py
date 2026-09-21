@@ -39,7 +39,7 @@ def ask(messages, tag, out=None):
 
 def log_since(mark):
     lines = open(LOG, errors="replace").read().splitlines()
-    return [l for l in lines[mark:] if "kv pool" in l or "kv cache" in l], len(lines)
+    return [l for l in lines[mark:] if "kv pool" in l or "kv chain" in l], len(lines)
 
 
 fails = 0

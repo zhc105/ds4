@@ -47,7 +47,7 @@ def ask(messages, tag):
     cached = u.get("prompt_tokens_details", {}).get("cached_tokens", 0)
     lines = log_lines(mark)
     towers = len([l for l in lines if "vision tower encoded" in l])
-    disk = len([l for l in lines if "kv cache hit" in l])
+    disk = len([l for l in lines if "kv chain hit" in l])
     print(f"{tag}: {time.time()-t:.1f}s prompt={u['prompt_tokens']} cached={cached} tower={towers} disk_hits={disk} -> {text[:50]!r}", flush=True)
     return text, u["prompt_tokens"], cached, towers, disk
 
