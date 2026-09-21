@@ -11325,9 +11325,10 @@ static int server_store_boundary(ds4_engine *e, const ds4_vision_span *images, s
                                  int target, size_t *stored_images);
 
 /* Called as a prompt is prefilled, where the live history is text its client
- * sent: the place for a checkpoint.  The chain store seals a segment once
- * the history has grown one past the last, wherever this prefill piece
- * happened to stop, unless that is inside a picture. */
+ * sent: the place for a checkpoint.  The chain store seals a segment at
+ * every multiple of its length the prefill stops at (server_session_sync
+ * ends its pieces there), and only there: the same history is sealed at the
+ * same places whoever brings it. */
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!s || !slot) return;
     kv_disk_cache *kc = &s->kv;
@@ -11335,7 +11336,7 @@ static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!tokens) return;
     if (s->chain.enabled) {
         if (tokens->len > slot->sent_len) return;   /* the prompt's last token is no boundary */
-        if (tokens->len - (int)slot->chain_sealed_end < s->chain.segment_tokens) return;
+        if (tokens->len % s->chain.segment_tokens != 0 || tokens->len <= (int)slot->chain_sealed_end) return;
         const job *j = slot->running;
         size_t n = 0;
         if (j && server_store_boundary(s->engine, j->req.images, j->req.image_count, tokens->len, &n) != tokens->len) return;
@@ -12371,7 +12372,7 @@ static int server_session_sync(server *s, server_slot *slot,
                                ds4_vision_span *images, size_t image_count,
                                char *err, size_t errlen) {
     if (!s || !slot || !prompt || (image_count != 0 && !images)) return 1;
-    if (!s->batched_mode) {
+    if (!s->batched_mode && !s->chain.enabled) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = image_count ?
             ds4_session_sync_multimodal(slot->session, prompt, images, image_count,
@@ -12388,9 +12389,19 @@ static int server_session_sync(server *s, server_slot *slot,
 
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
-        int target = done + server_prefill_quantum(s);
+        int target = s->batched_mode ? done + server_prefill_quantum(s) : prompt->len;
         if (target > prompt->len || target < done) target = prompt->len;
         if (target <= 0) target = prompt->len;
+        /* A piece ends where a segment of the chain store does: a segment is
+         * sealed from the state at its end, which exists only if the prefill
+         * stops there.  The same history is then cut at the same places
+         * whatever pieces it arrived in, and its segments are shared.  (A
+         * boundary inside a picture is passed over, below, as is one crossed
+         * while generating: that segment ends at the next.) */
+        if (s->chain.enabled) {
+            const int next = (done / s->chain.segment_tokens + 1) * s->chain.segment_tokens;
+            if (target > next) target = next;
+        }
         size_t piece_images = 0;
         target = server_piece_end(images, image_count, target, prompt->len,
                                   &piece_images);
@@ -12409,6 +12420,7 @@ static int server_session_sync(server *s, server_slot *slot,
         server_prefill_leave(s);
         called = true;
         if (rc != 0) return rc;
+        kv_cache_maybe_store_continued(s, slot);   /* a segment's end, when the piece stopped at one */
         if (done >= prompt->len) return 0;
         if (done < target) {
             if (err && errlen) snprintf(err, errlen, "prefill made no progress");

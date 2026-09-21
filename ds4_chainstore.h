@@ -4,9 +4,13 @@
 /* The server's disk KV store: conversations as chains of immutable segments.
  *
  * A conversation's history on disk is a chain of files.  Every file but the
- * last is a sealed segment: the blocks of a run of about SEGMENT_TOKENS
- * positions and the state at its end, written once and never again.  A
- * segment names its parent, and is named by what it stands for,
+ * last is a sealed segment: the blocks of a run of positions and the state
+ * at its end, written once and never again.  The server seals at every
+ * multiple of SEGMENT_TOKENS its prefill stops at, so a segment is that
+ * long, or a multiple of it where a boundary fell inside a picture or was
+ * crossed while generating (no state stood there to seal); the store itself
+ * takes whatever run it is given.  A segment names its parent, and is named
+ * by what it stands for,
  *
  *     id = sha1(root, the history's rendered text from its beginning to the
  *               segment's end)

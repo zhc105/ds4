@@ -3,10 +3,11 @@
  * One file, sealed segment or tail alike:
  *
  *     header (128 bytes, below)
- *     blocks   positions [start rounded down to a block, end): a segment
- *              begins wherever a prefill stopped, so its first block repeats
- *              the rows its parent's last, partial block already holds, and
- *              a restore simply reads them again
+ *     blocks   positions [start rounded down to a block, end): a file that
+ *              begins inside a block repeats the rows its parent's last,
+ *              partial block already holds, and a restore simply reads them
+ *              again (the server's segments begin on a block; a test's need
+ *              not)
  *     states   state_bytes each: the one at `end`, then a tail's second one
  *     meta     tokens [start, end), the pictures that begin among them, the
  *              history's whole text from its beginning (what the ids are the
