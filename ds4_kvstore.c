@@ -14,19 +14,20 @@
  *   fixed header (48 bytes)
  *   blocks: what every position of the history contributes, in runs of
  *           block_positions positions, written once and appended to
- *   tail:   "TAIL", the state index, the tokens, the rendered text, the
+ *   tail:   "TAL2", the state index, the tokens, the rendered text, the
  *           history's pictures (DS4_KVSTORE_EXT_PICTURES), the
- *           visible-transcript keys, the state blobs, the trailers
+ *           visible-transcript keys, the live state's blob, the trailers
+ *   and beside it FILE.ckpt, the blobs of its checkpoints (ds4_kvstore.h)
  *
  * A store that continues a file appends the blocks of the new positions and
  * writes a new tail.  A session's own file is also continued when its
  * history was edited behind the frontier: the blocks are rewritten from
- * where the two histories part and the branch given up is gone, so a
- * conversation keeps one file.  Anything else (a new conversation, a fork
- * on another slot) is a new file.  Each state in the index is a point the session
- * can resume from, keyed by the prompt bytes it stands for; the first one
- * of a file is kept across stores, so the anchor of a shared system prompt
- * stays available to other conversations. */
+ * where the two histories part and the branch given up is gone, its
+ * checkpoints with it, so a conversation keeps one file.  Anything else (a
+ * new conversation, a fork on another slot) is a new file.  Each state in
+ * the index is a point a session can resume from, keyed by the prompt bytes
+ * it stands for; the checkpoints are there for any conversation that begins
+ * with them, which reads them and writes a file of its own. */
 
 #include <ctype.h>
 #include <dirent.h>
@@ -59,8 +60,17 @@
 #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
 
-#define KV_TAIL_FIXED 32u      /* "TAIL", n_states, blocks_end, block_positions, text_len, tokens, trailer_offset */
+#define KV_TAIL_FIXED 32u      /* magic, n_states, blocks_end, block_positions, text_len, tokens, trailer_offset */
 #define KV_TAIL_STATE 52u      /* position, key_len, sha, offset, bytes, key_offset */
+/* "TAL2" index entries add where the blob lies (0: this file, 1: the
+ * checkpoint companion); files written before it have "TAIL" and all their
+ * states inside. */
+#define KV_TAIL_STATE2 56u
+/* A record of the checkpoint companion: "CKPT", position, blob bytes, blob.
+ * The index points at the blob; the header only proves the record is the
+ * one indexed (records past the last indexed one are leftovers of a store
+ * that did not finish, and the next append overwrites them). */
+#define KV_CKPT_HEADER 16u
 
 typedef struct {
     char *ptr;
@@ -373,6 +383,23 @@ char *ds4_kvstore_path_join(const char *dir, const char *name) {
     return kv_buf_take(&b);
 }
 
+/* FILE.kv's checkpoint companion, FILE.ckpt (to free). */
+static char *kv_ckpt_path(const char *path) {
+    const size_t n = strlen(path);
+    const size_t stem = n > 3 && !strcmp(path + n - 3, ".kv") ? n - 3 : n;
+    kv_buf b = {0};
+    kv_buf_append(&b, path, stem);
+    kv_buf_puts(&b, ".ckpt");
+    return kv_buf_take(&b);
+}
+
+bool ds4_kvstore_remove(const char *path) {
+    char *ckpt = kv_ckpt_path(path);
+    (void)unlink(ckpt);
+    free(ckpt);
+    return unlink(path) == 0;
+}
+
 char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]) {
     char name[44];
     memcpy(name, sha, 40);
@@ -477,7 +504,9 @@ bool ds4_kvstore_read_index(FILE *fp, ds4_kvstore_entry *e) {
         fseeko(fp, (off_t)e->tail_offset, SEEK_SET) != 0) return false;
     uint8_t t[KV_TAIL_FIXED];
     if (fread(t, 1, sizeof(t), fp) != sizeof(t)) return false;
-    if (memcmp(t, "TAIL", 4) != 0) return false;
+    const bool v2 = memcmp(t, "TAL2", 4) == 0;
+    if (!v2 && memcmp(t, "TAIL", 4) != 0) return false;
+    const uint32_t entry_bytes = v2 ? KV_TAIL_STATE2 : KV_TAIL_STATE;
     e->n_states = ds4_kvstore_le_get32(t + 4);
     e->blocks_end = ds4_kvstore_le_get32(t + 8);
     e->block_positions = ds4_kvstore_le_get32(t + 12);
@@ -485,13 +514,13 @@ bool ds4_kvstore_read_index(FILE *fp, ds4_kvstore_entry *e) {
     e->tail_tokens = ds4_kvstore_le_get32(t + 20);
     e->trailer_offset = kv_le_get64(t + 24);
     if (e->n_states > 4096u) return false;
-    e->tokens_offset = e->tail_offset + KV_TAIL_FIXED + (uint64_t)e->n_states * KV_TAIL_STATE;
+    e->tokens_offset = e->tail_offset + KV_TAIL_FIXED + (uint64_t)e->n_states * entry_bytes;
     e->text_offset = e->tokens_offset + (uint64_t)e->tail_tokens * 4u;
     if (e->n_states == 0) return true;
     e->state = kv_xmalloc((size_t)e->n_states * sizeof(e->state[0]));
     for (uint32_t i = 0; i < e->n_states; i++) {
-        uint8_t r[KV_TAIL_STATE];
-        if (fread(r, 1, sizeof(r), fp) != sizeof(r)) {
+        uint8_t r[KV_TAIL_STATE2] = {0};
+        if (fread(r, 1, entry_bytes, fp) != entry_bytes) {
             free(e->state);
             e->state = NULL;
             e->n_states = 0;
@@ -504,6 +533,7 @@ bool ds4_kvstore_read_index(FILE *fp, ds4_kvstore_entry *e) {
         st->offset = kv_le_get64(r + 28);
         st->bytes = kv_le_get64(r + 36);
         st->key_offset = kv_le_get64(r + 44);
+        st->in_ckpt = ds4_kvstore_le_get32(r + 52) == 1u;
     }
     if (e->ext_flags & DS4_KVSTORE_EXT_PICTURES) {
         const uint64_t at = e->text_offset + e->text_bytes;
@@ -548,6 +578,9 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
     memcpy(e.sha, sha, 41);
     e.path = kv_xstrdup(path);
     e.file_size = (uint64_t)st.st_size;
+    char *ckpt = kv_ckpt_path(path);   /* the companion is part of the entry */
+    if (stat(ckpt, &st) == 0) e.file_size += (uint64_t)st.st_size;
+    free(ckpt);
     *out = e;
     return true;
 }
@@ -607,14 +640,26 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         char sha[41];
-        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
         char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
-        ds4_kvstore_entry e = {0};
-        if (ds4_kvstore_read_entry_file(path, sha, &e)) {
-            kv_cache_push(kc, e);
-        } else if (kv_file_is_ours(path) && unlink(path) == 0) {
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache removed unreadable file %s", kv_log_name(kc), path);
+        const size_t n = strlen(path);
+        if (n > 5 && !strcmp(path + n - 5, ".ckpt")) {
+            /* a companion whose file is gone (removed by hand, or a store
+             * that never finished its first write) */
+            kv_buf kv = {0};
+            kv_buf_append(&kv, path, n - 5);
+            kv_buf_puts(&kv, ".kv");
+            if (access(kv.ptr, F_OK) != 0) (void)unlink(path);
+            free(kv.ptr);
+        } else if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) {
+            /* not ours */
+        } else {
+            ds4_kvstore_entry e = {0};
+            if (ds4_kvstore_read_entry_file(path, sha, &e)) {
+                kv_cache_push(kc, e);
+            } else if (kv_file_is_ours(path) && ds4_kvstore_remove(path)) {
+                kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                        "%s: kv cache removed unreadable file %s", kv_log_name(kc), path);
+            }
         }
         free(path);
     }
@@ -670,7 +715,7 @@ void ds4_kvstore_evict(ds4_kvstore *kc, uint64_t extra_bytes) {
             }
         }
         ds4_kvstore_entry e = kc->entry[victim];
-        if (unlink(e.path) == 0) {
+        if (ds4_kvstore_remove(e.path)) {
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                     "%s: kv cache evicted reason=disk-cache-full tokens=%u hits=%u size=%.2f MiB file=%s",
                     kv_log_name(kc),
@@ -864,12 +909,17 @@ static int kv_cache_continued_step(const ds4_kvstore *kc) {
     return step;
 }
 
+/* A history is checkpointed once in every interval it grows through: where
+ * it stands when it has entered an interval the last store was not in.  A
+ * decode gets there token by token and stores at the interval's start; a
+ * prefill piece may step over the start, and stores at its own end (asking
+ * for the exact multiple used to leave such a history without the
+ * checkpoint). */
 int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
     const int step = kv_cache_continued_step(kc);
     if (step <= 0) return 0;
     if (live_tokens < kc->opt.min_tokens) return 0;
-    if (live_tokens % step != 0) return 0;
-    if (live_tokens <= kc->continued_last_store_tokens) return 0;
+    if (live_tokens / step <= kc->continued_last_store_tokens / step) return 0;
     return live_tokens;
 }
 
@@ -937,6 +987,8 @@ typedef struct {
     uint64_t bytes;
     size_t engine_index;
     uint8_t *blob;          /* when copied */
+    bool in_ckpt;           /* a checkpoint: its blob belongs in the companion, */
+    uint64_t ckpt_at;       /* where it already lies when not 0 */
 } kv_state_src;
 
 /* The pictures of a history, after its text: a count and the identities. */
@@ -946,13 +998,61 @@ static uint64_t kv_pictures_bytes(size_t n_images) {
 
 static uint64_t kv_tail_bytes(const ds4_tokens *tokens, size_t text_len, size_t n_images,
                               const kv_state_src *st, uint32_t n, uint64_t trailer_bytes) {
-    uint64_t bytes = KV_TAIL_FIXED + (uint64_t)n * KV_TAIL_STATE +
+    uint64_t bytes = KV_TAIL_FIXED + (uint64_t)n * KV_TAIL_STATE2 +
                      (uint64_t)tokens->len * 4u + text_len + kv_pictures_bytes(n_images) + trailer_bytes;
     for (uint32_t i = 0; i < n; i++) {
-        bytes += st[i].bytes;
+        if (!st[i].in_ckpt) bytes += st[i].bytes;
         if (st[i].key) bytes += 4u + st[i].key_len;
     }
     return bytes;
+}
+
+/* One state's blob, from the copy in memory or from the session. */
+static bool kv_write_state_blob(FILE *fp, ds4_session *session, const kv_state_src *s,
+                                char *err, size_t err_len) {
+    if (s->blob) return fwrite(s->blob, 1, s->bytes, fp) == s->bytes;
+    return ds4_session_write_state(session, s->engine_index, fp, err, err_len) == 0;
+}
+
+/* Bring the checkpoint companion of `path` to hold the checkpoints among
+ * `st`: those it already has end at `keep_end` (what follows is the
+ * checkpoints of a branch the history gave up, or the leftover of a store
+ * that did not finish) and the new ones are appended there by position, so
+ * the records past any fork are always the companion's end.  `size_out` is
+ * its size afterwards. */
+static bool kv_write_checkpoints(const char *path, ds4_session *session, kv_state_src *st, uint32_t n,
+                                 uint64_t keep_end, uint64_t *size_out, char *err, size_t err_len) {
+    *size_out = keep_end;
+    bool any = keep_end != 0;
+    for (uint32_t i = 0; i < n; i++) any |= st[i].in_ckpt && st[i].ckpt_at == 0;
+    char *ckpt = kv_ckpt_path(path);
+    if (!any) {   /* none to keep either: no companion */
+        (void)unlink(ckpt);
+        free(ckpt);
+        return true;
+    }
+    FILE *fp = fopen(ckpt, keep_end ? "r+b" : "wb");
+    bool ok = fp && keep_end <= (uint64_t)INT64_MAX && ftruncate(fileno(fp), (off_t)keep_end) == 0 &&
+              fseeko(fp, (off_t)keep_end, SEEK_SET) == 0;
+    for (;;) {
+        kv_state_src *s = NULL;   /* the next new checkpoint by position */
+        for (uint32_t i = 0; i < n; i++) {
+            if (st[i].in_ckpt && st[i].ckpt_at == 0 && (!s || st[i].position < s->position)) s = &st[i];
+        }
+        if (!ok || !s) break;
+        uint8_t h[KV_CKPT_HEADER];
+        memcpy(h, "CKPT", 4);
+        ds4_kvstore_le_put32(h + 4, s->position);
+        kv_le_put64(h + 8, s->bytes);
+        ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h);
+        s->ckpt_at = *size_out + KV_CKPT_HEADER;
+        if (ok) ok = kv_write_state_blob(fp, session, s, err, err_len);
+        *size_out += KV_CKPT_HEADER + s->bytes;
+    }
+    if (fp && fclose(fp) != 0) ok = false;
+    if (!ok && err && err_len && !err[0]) kv_set_err(err, err_len, strerror(errno));
+    free(ckpt);
+    return ok;
 }
 
 static bool kv_copy_bytes(FILE *src, uint64_t at, uint64_t bytes, uint8_t *dst) {
@@ -961,8 +1061,9 @@ static bool kv_copy_bytes(FILE *src, uint64_t at, uint64_t bytes, uint8_t *dst) 
 }
 
 /* The tail at the current position: index, tokens, text, pictures, keys,
- * blobs, trailer.  ext_flags gets the flags of the pictures and of the
- * trailer when they were written. */
+ * blobs, trailer.  The checkpoints are only indexed: their blobs are in the
+ * companion already (kv_write_checkpoints).  ext_flags gets the flags of
+ * the pictures and of the trailer when they were written. */
 static bool kv_write_tail(FILE *fp, ds4_engine *engine, ds4_session *session,
                           const ds4_tokens *tokens, const char *text, size_t text_len,
                           const ds4_vision_identity *images, size_t n_images,
@@ -973,7 +1074,7 @@ static bool kv_write_tail(FILE *fp, ds4_engine *engine, ds4_session *session,
     (void)engine;
     const off_t start = ftello(fp);
     if (start < 0) return false;
-    uint64_t at = (uint64_t)start + KV_TAIL_FIXED + (uint64_t)n * KV_TAIL_STATE +
+    uint64_t at = (uint64_t)start + KV_TAIL_FIXED + (uint64_t)n * KV_TAIL_STATE2 +
                   (uint64_t)tokens->len * 4u + text_len + kv_pictures_bytes(n_images);
     uint64_t *key_at = kv_xmalloc((size_t)n * sizeof(uint64_t));
     uint64_t *blob_at = kv_xmalloc((size_t)n * sizeof(uint64_t));
@@ -982,13 +1083,13 @@ static bool kv_write_tail(FILE *fp, ds4_engine *engine, ds4_session *session,
         if (st[i].key) at += 4u + st[i].key_len;
     }
     for (uint32_t i = 0; i < n; i++) {
-        blob_at[i] = at;
-        at += st[i].bytes;
+        blob_at[i] = st[i].in_ckpt ? st[i].ckpt_at : at;
+        if (!st[i].in_ckpt) at += st[i].bytes;
     }
     const uint64_t trailer_at = at;
 
     uint8_t t[KV_TAIL_FIXED];
-    memcpy(t, "TAIL", 4);
+    memcpy(t, "TAL2", 4);
     ds4_kvstore_le_put32(t + 4, n);
     ds4_kvstore_le_put32(t + 8, blocks_end);
     ds4_kvstore_le_put32(t + 12, block_positions);
@@ -997,13 +1098,14 @@ static bool kv_write_tail(FILE *fp, ds4_engine *engine, ds4_session *session,
     kv_le_put64(t + 24, trailer_at);
     bool ok = fwrite(t, 1, sizeof(t), fp) == sizeof(t);
     for (uint32_t i = 0; ok && i < n; i++) {
-        uint8_t r[KV_TAIL_STATE];
+        uint8_t r[KV_TAIL_STATE2];
         ds4_kvstore_le_put32(r, st[i].position);
         ds4_kvstore_le_put32(r + 4, st[i].key_len);
         memcpy(r + 8, st[i].sha, 20);
         kv_le_put64(r + 28, blob_at[i]);
         kv_le_put64(r + 36, st[i].bytes);
         kv_le_put64(r + 44, key_at[i]);
+        ds4_kvstore_le_put32(r + 52, st[i].in_ckpt ? 1u : 0u);
         ok = fwrite(r, 1, sizeof(r), fp) == sizeof(r);
     }
     for (int i = 0; ok && i < tokens->len; i++) ok = kv_write_u32(fp, (uint32_t)tokens->v[i]);
@@ -1021,11 +1123,7 @@ static bool kv_write_tail(FILE *fp, ds4_engine *engine, ds4_session *session,
         ok = kv_write_u32(fp, st[i].key_len) && fwrite(st[i].key, 1, st[i].key_len, fp) == st[i].key_len;
     }
     for (uint32_t i = 0; ok && i < n; i++) {
-        if (st[i].blob) {
-            ok = fwrite(st[i].blob, 1, st[i].bytes, fp) == st[i].bytes;
-        } else {
-            ok = ds4_session_write_state(session, st[i].engine_index, fp, err, err_len) == 0;
-        }
+        if (!st[i].in_ckpt) ok = kv_write_state_blob(fp, session, &st[i], err, err_len);
     }
     uint64_t trailer_bytes = 0;
     if (ok) ok = kv_trailer_write(hooks, fp, text, &trailer_bytes);
@@ -1044,13 +1142,19 @@ static bool kv_write_tail(FILE *fp, ds4_engine *engine, ds4_session *session,
  * same key): the store has nothing to add.  It is continued when the store
  * can write the history into it from `kept` on: always when the file's
  * history is a prefix of the live one (the store appends), and for the
- * session's `own` file also when the live history left it behind its end (a
- * history edited behind its frontier: the branch it gave up is overwritten,
- * so a conversation keeps one file).  The file's first state must lie in
- * the part that stands: it is the anchor other conversations resume from,
- * and a history that leaves the file before it is another conversation's
- * (the one a slot held before, which shares the system prompt).  Anything
- * else is another history and the store names a new file. */
+ * session's `own` file also when the live history left it behind its end: a
+ * history edited behind its frontier (an agent dropping an old picture),
+ * which its slot resumed in memory, is the same conversation and keeps its
+ * one file.  The branch it gave up is overwritten, the checkpoints past the
+ * fork going with the blocks they stood on; those before it stand.  Nobody
+ * but its owner writes a file: any other conversation forks from a
+ * checkpoint by reading it and stores a file of its own, so what one
+ * conversation rewinds is never what another builds on.  The file's first
+ * checkpoint must stand, though: a history that leaves the file before it
+ * shares no state with it, which is what another conversation looks like
+ * (the one a slot held before, sharing the prompt's head), and if the
+ * caller's `own` were ever wrong this is where it would show.  That and
+ * anything else is another history, and the store names a new file. */
 typedef enum { KV_FILE_OTHER, KV_FILE_CONTINUED, KV_FILE_COVERS } kv_file_relation;
 
 static kv_file_relation kv_file_relates(ds4_session *session, const char *path, bool own,
@@ -1096,15 +1200,15 @@ static kv_file_relation kv_file_relates(ds4_session *session, const char *path, 
     }
     if (fp) fclose(fp);
 
-    uint32_t first_state = UINT32_MAX;
+    uint32_t first = UINT32_MAX;   /* the file's first checkpoint */
     bool resumes = false;
     for (uint32_t i = 0; ok && i < e->n_states; i++) {
-        if (e->state[i].position < first_state) first_state = e->state[i].position;
+        if (e->state[i].position < first) first = e->state[i].position;
         resumes |= e->state[i].position == (uint32_t)tokens->len && !strcmp(e->state[i].sha, live_sha);
     }
     *kept_out = kept;
     if (ok && kept == (uint32_t)tokens->len && resumes) return KV_FILE_COVERS;
-    if (ok && first_state <= kept && (own || (kept == e->tokens && kept < (uint32_t)tokens->len))) {
+    if (ok && first <= kept && (own || (kept == e->tokens && kept < (uint32_t)tokens->len))) {
         return KV_FILE_CONTINUED;
     }
     ds4_kvstore_entry_free(e);
@@ -1133,13 +1237,19 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
     ds4_tokens tokens = {0};
     ds4_kvstore_tokens_copy_prefix(&tokens, req->tokens, req->store_len);
 
-    /* the engine's states, the live one first */
-    const size_t n_engine = ds4_session_state_count(session);
+    /* The engine's states, the live one first.  A store's directory keeps
+     * the live one and the file's checkpoints (ds4_kvstore.h); the session's
+     * saved states stay in memory, where they serve the edits of the last
+     * few turns: on disk they were most of a file's state bytes, rewritten
+     * by every store, and hardly ever the state a prompt resumed from. */
+    const bool split = kc != NULL && ds4_session_block_positions(session) != 0;
+    size_t n_engine = ds4_session_state_count(session);
     if (n_engine == 0 || ds4_session_state_position(session, 0) != (uint32_t)tokens.len) {
         kv_set_err(err, err_len, "session has no state to store");
         ds4_tokens_free(&tokens);
         return NULL;
     }
+    if (split) n_engine = 1;
     uint32_t positions[64];
     size_t lens[64];
     if (n_engine > 63) {
@@ -1166,7 +1276,7 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
         return NULL;
     }
     const bool override = req->key_override && req->key_override[0];
-    kv_state_src st[64];
+    kv_state_src *st = kv_xmalloc(64 * sizeof(*st));   /* the engine's, then the file's kept ones */
     uint32_t n = 0;
     for (size_t i = 0; i < n_engine; i++) {
         if (lens[i] == SIZE_MAX) continue;   /* a saved state inside a picture has no key */
@@ -1227,54 +1337,77 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
                 "%s: kv cache covered tokens=%d reason=%s by tokens=%u file=%s",
                 kv_log_name(kc), tokens.len, reason, old.tokens, path);
         for (uint32_t i = 0; i < n; i++) free(st[i].key);
+        free(st);
         ds4_kvstore_entry_free(&old);
         free(text);
         ds4_tokens_free(&tokens);
         return path;
     }
     const bool extend = relation == KV_FILE_CONTINUED;
-    /* The file's earliest state stays: the anchor other conversations share
-     * (a system prompt and tools, stored early in the history), which lies
-     * in the part of a continued file that stands.  The tail lists the live
-     * state first, so the earliest is found by position. */
-    if (extend && old.n_states > 0) {
-        const ds4_kvstore_state *a = &old.state[0];
-        for (uint32_t i = 1; i < old.n_states; i++)
-            if (old.state[i].position < a->position) a = &old.state[i];
-        bool have = false;
-        for (uint32_t i = 0; i < n; i++) have |= st[i].position == a->position;
-        if (!have && n < 64) {
-            FILE *fp = fopen(path, "rb");
-            kv_state_src *s = &st[n];
-            memset(s, 0, sizeof(*s));
-            s->position = a->position;
-            s->key_len = a->key_len;
-            s->bytes = a->bytes;
-            s->blob = kv_xmalloc((size_t)a->bytes);
-            bool ok = fp && kv_copy_bytes(fp, a->offset, a->bytes, s->blob);
-            if (ok && a->key_offset) {
-                s->key = ds4_kvstore_read_state_key(fp, &old, a);
-                ok = s->key != NULL;
-            }
-            if (fp) fclose(fp);
-            if (ok) {
-                if (s->key) sha1_bytes(s->key, s->key_len, s->sha);
-                else sha1_bytes(text, s->key_len, s->sha);
-                n++;
-            } else {
-                free(s->blob);
-                free(s->key);
-            }
+    /* What a continued file keeps of its states.  In a store's directory,
+     * the checkpoints of the part that stands: they are in the companion
+     * already and are only indexed again (those past a fork went with their
+     * blocks, and the companion is cut after the ones kept).  A file from
+     * before the companions kept one state through its stores, its earliest,
+     * the one most conversations could share; it stays, and moves to a
+     * companion when the store has one.  Everything else was a live state of
+     * its time, which this store's replaces. */
+    uint64_t ckpt_end = 0;   /* where the companion's kept records end */
+    const uint32_t n_live = n;
+    uint32_t earliest = UINT32_MAX;
+    for (uint32_t i = 0; extend && i < old.n_states; i++)
+        if (old.state[i].position < earliest) earliest = old.state[i].position;
+    FILE *oldfp = extend && old.n_states > 0 ? fopen(path, "rb") : NULL;
+    st = kv_xrealloc(st, ((size_t)n + old.n_states) * sizeof(*st) + sizeof(*st));
+    for (uint32_t i = 0; oldfp && i < old.n_states; i++) {
+        const ds4_kvstore_state *o = &old.state[i];
+        if (o->position > kept || (o->in_ckpt ? !split : o->position != earliest)) continue;
+        bool have = false;   /* the live state is at that earliest state's position */
+        for (uint32_t k = 0; k < n; k++) have |= !o->in_ckpt && st[k].position == o->position;
+        if (have) continue;
+        kv_state_src *s = &st[n];
+        memset(s, 0, sizeof(*s));
+        s->position = o->position;
+        s->key_len = o->key_len;
+        s->bytes = o->bytes;
+        s->in_ckpt = split;
+        bool ok = true;
+        if (o->in_ckpt) {
+            s->ckpt_at = o->offset;
+            if (o->offset + o->bytes > ckpt_end) ckpt_end = o->offset + o->bytes;
+        } else {
+            s->blob = kv_xmalloc((size_t)o->bytes);
+            ok = kv_copy_bytes(oldfp, o->offset, o->bytes, s->blob);
+        }
+        if (ok && o->key_offset) {
+            s->key = ds4_kvstore_read_state_key(oldfp, &old, o);
+            ok = s->key != NULL;
+        }
+        if (ok) {
+            if (s->key) sha1_bytes(s->key, s->key_len, s->sha);
+            else sha1_bytes(text, s->key_len, s->sha);
+            n++;
+        } else {
+            free(s->blob);
+            free(s->key);
         }
     }
+    if (oldfp) fclose(oldfp);
+    /* The live state is a checkpoint when the store says so, and always in a
+     * new file: a file begins with a checkpoint.  One the file already has
+     * at this position is not written again. */
+    if (split) st[0].in_ckpt = req->checkpoint || n == n_live;
+    for (uint32_t k = n_live; k < n; k++) if (st[k].ckpt_at && st[k].position == st[0].position) st[0].in_ckpt = false;
 
     uint64_t trailer_est = 0;
     const uint32_t block_positions = ds4_session_block_positions(session);
     const uint64_t blocks_bytes = block_positions ?
         ds4_session_block_bytes(session, 0, (uint32_t)tokens.len) : 0;
     bool ok = kv_trailer_serialized_size(req->hooks, text, &trailer_est);
-    const uint64_t new_size = DS4_KVSTORE_FIXED_HEADER + blocks_bytes +
-                              kv_tail_bytes(&tokens, text_len, n_images, st, n, trailer_est);
+    uint64_t new_size = DS4_KVSTORE_FIXED_HEADER + blocks_bytes + ckpt_end +
+                        kv_tail_bytes(&tokens, text_len, n_images, st, n, trailer_est);
+    for (uint32_t i = 0; i < n; i++)
+        if (st[i].in_ckpt && st[i].ckpt_at == 0) new_size += KV_CKPT_HEADER + st[i].bytes;
     uint64_t required = 0;
     if (ok && !ds4_kvstore_file_size_fits(kc, new_size, &required)) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -1297,6 +1430,11 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
     char *tmp = NULL;
     FILE *fp = NULL;
     uint32_t from = 0;
+    /* The companion first: the tail indexes where its records landed, and
+     * a record the tail never gets to index is overwritten by the next. */
+    uint64_t ckpt_size = 0;
+    const bool writing = ok;   /* from here on the files are touched */
+    if (ok && split) ok = kv_write_checkpoints(path, session, st, n, ckpt_end, &ckpt_size, err, err_len);
     if (ok && extend) {
         fp = fopen(path, "r+b");
         /* the blocks of the positions that stand stay; the block the
@@ -1339,7 +1477,7 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
     if (ok) {
         const off_t end = ftello(fp);
         ok = end >= 0 && ftruncate(fileno(fp), end) == 0 && kv_write_header(fp, &hdr) && fflush(fp) == 0;
-        if (ok) hdr.file_size = (uint64_t)end;
+        if (ok) hdr.file_size = (uint64_t)end + ckpt_size;
     }
     if (fp && fclose(fp) != 0) ok = false;
     if (ok && tmp && rename(tmp, path) != 0) ok = false;
@@ -1350,6 +1488,10 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
                 "%s: kv cache store failed (%s): %s save=%.1f ms",
                 kv_log_name(kc), reason, err && err[0] ? err : "unknown error", save_ms);
         if (tmp) unlink(tmp);
+        /* A file written in place is left between two histories, and its
+         * companion was already cut to the new one: neither may be resumed
+         * from.  (A new file never got its name; only its companion did.) */
+        if (writing && split) (void)ds4_kvstore_remove(path);
     } else {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache %s tokens=%d trimmed=%d reason=%s key=%s states=%u size=%.2f MiB save=%.1f ms file=%s",
@@ -1363,6 +1505,7 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
         free(st[i].key);
         free(st[i].blob);
     }
+    free(st);
     ds4_kvstore_entry_free(&old);
     free(tmp);
     free(text);
@@ -1535,20 +1678,39 @@ int ds4_kvstore_load(ds4_engine *engine, ds4_session *session, FILE *fp,
              ds4_session_read_blocks(session, fp, from, to, stored_to, err, err_len) == 0;
     }
     if (ok) {
-        ok = st->offset <= (uint64_t)INT64_MAX && fseeko(fp, (off_t)st->offset, SEEK_SET) == 0 &&
-             ds4_session_read_state(session, fp, tokens, position, images, e->n_pictures,
-                                    st->bytes, true, err, err_len) == 0;
+        /* a checkpoint's blob is in the companion, behind a header that must
+         * name it: the index of a file outlives a companion lost or cut */
+        FILE *from = fp;
+        if (st->in_ckpt) {
+            char *ckpt = e->path ? kv_ckpt_path(e->path) : NULL;
+            from = ckpt ? fopen(ckpt, "rb") : NULL;
+            free(ckpt);
+            uint8_t h[KV_CKPT_HEADER];
+            ok = from && st->offset >= KV_CKPT_HEADER && st->offset <= (uint64_t)INT64_MAX &&
+                 fseeko(from, (off_t)(st->offset - KV_CKPT_HEADER), SEEK_SET) == 0 &&
+                 fread(h, 1, sizeof(h), from) == sizeof(h) && memcmp(h, "CKPT", 4) == 0 &&
+                 ds4_kvstore_le_get32(h + 4) == position && kv_le_get64(h + 8) == st->bytes;
+            if (!ok) kv_set_err(err, err_len, "the KV checkpoint companion does not hold the state");
+        } else {
+            ok = st->offset <= (uint64_t)INT64_MAX && fseeko(fp, (off_t)st->offset, SEEK_SET) == 0;
+        }
+        if (ok) ok = ds4_session_read_state(session, from, tokens, position, images, e->n_pictures,
+                                            st->bytes, true, err, err_len) == 0;
+        if (from && from != fp) fclose(from);
     }
     /* The earlier states of the same history come along as fallbacks, but
-     * for the file's first: that one is the anchor other conversations
-     * share (it stays on disk for all of them), while the states a session
-     * holds are its own conversation's, which is how a request is told to
-     * belong to it. */
-    uint32_t anchor = UINT32_MAX;
-    for (uint32_t s = 0; s < e->n_states; s++) if (e->state[s].position < anchor) anchor = e->state[s].position;
+     * not its checkpoints (nor the earliest state of a file from before the
+     * companions, which was its checkpoint): a checkpoint may lie inside a
+     * prefix other conversations share (the prompt's head, a long document),
+     * while the states a session holds are its own conversation's, which is
+     * how a request is told to belong to it.  Those stay on disk, for
+     * whoever resumes from them. */
+    uint32_t earliest = UINT32_MAX;
+    for (uint32_t s = 0; s < e->n_states; s++) if (e->state[s].position < earliest) earliest = e->state[s].position;
     for (uint32_t s = 0; ok && block_positions && s < e->n_states; s++) {
         const ds4_kvstore_state *o = &e->state[s];
-        if (s == state_index || o->position >= position || o->position == 0 || o->position == anchor) continue;
+        if (s == state_index || o->position >= position || o->position == 0 ||
+            o->position == earliest || o->in_ckpt) continue;
         ok = o->offset <= (uint64_t)INT64_MAX && fseeko(fp, (off_t)o->offset, SEEK_SET) == 0 &&
              ds4_session_read_state(session, fp, tokens, o->position, images, e->n_pictures,
                                     o->bytes, false, err, err_len) == 0;

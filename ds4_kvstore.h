@@ -42,6 +42,7 @@ typedef struct {
     char sha[41];          /* of the key bytes */
     uint64_t offset;       /* the state blob */
     uint64_t bytes;
+    bool in_ckpt;          /* the blob lies in the file's checkpoint companion, not in the file */
     uint64_t key_offset;   /* the state's own key when it is not the text's prefix:
                             * the u32 length that precedes the key bytes, which
                             * start four bytes further; 0 otherwise */
@@ -52,7 +53,18 @@ typedef struct {
  * tail with the tokens, the rendered text, the pictures of the history (a
  * state is its tokens and the pictures that begin inside them; the text
  * spells each by its marker, so the keys tell pictures apart), the states
- * the session can resume from, and the protocol trailers. */
+ * the session can resume from, and the protocol trailers.
+ *
+ * A state is large (the recurrent state of one position, 113 MiB for
+ * Flash-Next) and the tail is rewritten by every store, so a store's
+ * directory keeps only the live state in the tail.  The states kept for the
+ * file's life, its checkpoints (the first state it is written with and the
+ * state of every continued interval), go once each to a companion FILE.ckpt
+ * that is appended to, and cut with the blocks when the file's own session
+ * rewinds its history; the tail indexes them.  A checkpoint is where any
+ * conversation may fork from this history: it reads the file and stores one
+ * of its own, so only a file's owner ever writes it.  The two files are one
+ * entry: sized, evicted and removed together (ds4_kvstore_remove). */
 typedef struct {
     char sha[41];          /* the file name */
     char *path;
@@ -116,14 +128,15 @@ typedef struct {
  * live state by a visible transcript instead of the rendered text.
  * extend_path is the session's own file, which no other session holds: the
  * store writes the history into it from where the two part (appending when
- * the session only grew, overwriting the branch it gave up when its history
- * was edited) unless the history left it before its first state.  The store
+ * the session only grew, overwriting the branch it gave up, checkpoints
+ * included, when its history was edited).  The store
  * writes to path when one is given (appending when it can), and otherwise
  * writes a new file named by the text; created_at 0 means now. */
 typedef struct {
     const ds4_tokens *tokens;
     int store_len;
     const char *reason;
+    bool checkpoint;       /* a state to keep for the file's life, not only until the next store */
     const char *key_override;
     uint8_t key_ext;
     const char *key_kind;
@@ -244,6 +257,8 @@ char *ds4_kvstore_read_text(FILE *fp, const ds4_kvstore_entry *e);
 /* The key bytes of one state: the file text's prefix, or the state's own. */
 char *ds4_kvstore_read_state_key(FILE *fp, const ds4_kvstore_entry *e,
                                  const ds4_kvstore_state *st);
+/* Remove a file and its checkpoint companion. */
+bool ds4_kvstore_remove(const char *path);
 /* Record a use of the file: its hit count and when (0: now). */
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits, uint64_t used_at);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);

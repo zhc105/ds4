@@ -47,7 +47,8 @@ def png(rgb):
 fails = 0
 
 def ask(messages, tag, expect=None, encodes=0):
-    body = {"model": "qwen3.8-flash-next", "messages": messages, "max_tokens": 60, "temperature": 0}
+    # room for the reasoning before the answer: what it takes varies with what else the server batches
+    body = {"model": "qwen3.8-flash-next", "messages": messages, "max_tokens": 300, "temperature": 0}
     if NO_THINK:
         body["reasoning_effort"] = "none"
     mark, t = len(log_lines(0)), time.time()

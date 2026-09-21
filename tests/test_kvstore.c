@@ -165,6 +165,9 @@ static char *store(ds4_kvstore *kc, ds4_session *s, const char *extend_path, con
         .tokens = &s->tokens,
         .store_len = s->tokens.len,
         .reason = reason,
+        /* as the server stores: a cold or continued state is a checkpoint,
+         * an evicted slot's or a shutdown's only the live state */
+        .checkpoint = !strcmp(reason, "cold") || !strcmp(reason, "continued"),
         .extend_path = extend_path,
     };
     char *path = ds4_kvstore_store(kc, NULL, s, &req, err, sizeof(err));
@@ -192,6 +195,14 @@ static int count_files(const char *dir) {
     for (struct dirent *de; d && (de = readdir(d));) n += strstr(de->d_name, ".kv") != NULL;
     if (d) closedir(d);
     return n;
+}
+
+/* the size of FILE.kv's checkpoint companion, -1 when it has none */
+static long companion_bytes(const char *path) {
+    char ckpt[1100];
+    snprintf(ckpt, sizeof(ckpt), "%.*s.ckpt", (int)strlen(path) - 3, path);
+    struct stat st;
+    return stat(ckpt, &st) == 0 ? (long)st.st_size : -1;
 }
 
 static void clear_dir(const char *dir) {
@@ -289,23 +300,28 @@ static void test_anchor_survives_extensions(ds4_kvstore *kc, const char *dir) {
 }
 
 /* The server's use of the store, driven at random: one slot whose history
- * grows, rewinds to an earlier point and diverges (the same conversation,
- * which keeps its one file), or is replaced by another conversation that
- * shares a prefix with one seen before (the slot lets go of the old one's
- * file).  Every store passes the slot's file as the session's own and binds
- * the slot to the path it returns, as kv_cache_store_live_prefix_text does.
+ * grows, rewinds to an earlier point and diverges (the same conversation),
+ * or is replaced by another conversation that shares a prefix with one seen
+ * before (the slot lets go of the old one's file).  Every store passes the
+ * slot's file as the session's own and binds the slot to the path it
+ * returns, as kv_cache_store_live_prefix_text does; one in three is a
+ * checkpoint.
  *
  * What the store promises, checked after every step: the history just stored
- * resumes in full, and for every file a prompt that begins with the history
- * of its earliest state (its anchor) or with the history it held at its last
- * store resumes at least that far; whatever is resumed is a prefix of the
- * prompt.  The branch a rewind gave up is gone, and intermediate states may
- * be dropped; those two may not.  The files stay as many as the
- * conversations: a rewind past the anchor is the only one that adds a file. */
+ * resumes in full; for every file a prompt that begins with the history of
+ * one of its checkpoints, or with what the file held at its last store,
+ * resumes at least that far; whatever is resumed is a prefix of the prompt.
+ * A rewind rewrites the conversation's own file from the fork: the branch
+ * given up is gone, its checkpoints with it, those before the fork stand,
+ * and the companion holds exactly the checkpoints that do.  Only a new
+ * conversation adds a file, or a history that leaves its file before the
+ * file's first checkpoint, which to the store is one. */
+enum { MODEL_CKPTS = 128 };
 typedef struct {
     char *path;
-    char anchor[256];
-    char last[256];
+    char ckpt[MODEL_CKPTS][256];   /* the histories of its checkpoints, in order */
+    int n_ckpt;
+    char last[256];                /* what it held at its last store */
 } model_file;
 
 static unsigned g_rng = 12345;
@@ -349,30 +365,25 @@ static void test_random_slot_lifecycle(ds4_kvstore *kc, const char *dir) {
     ds4_session s = {0};
     char hist[256] = "";
     char *slot_path = NULL;
-    uint32_t turns[8];          /* the engine's saved prompt states of this history */
-    size_t n_turns = 0;
+    uint32_t turn = 0;          /* a turn end the session holds in memory: never the file's business */
     int allowed_files = 1;      /* one per conversation */
     const int failed_before = g_failed;
 
     for (int step = 0; step < STEPS && g_failed == failed_before; step++) {
         const unsigned op = strlen(hist) > 200 ? 1 : rnd(10);
         if (op >= 3 || hist[0] == '\0') {
-            /* the conversation goes on; the previous prompt end stays saved */
-            if (hist[0] && n_turns < 3) turns[n_turns++] = (uint32_t)strlen(hist);
-            else if (hist[0]) {
-                memmove(turns, turns + 1, 2 * sizeof(turns[0]));
-                turns[2] = (uint32_t)strlen(hist);
-            }
+            /* the conversation goes on */
+            turn = (uint32_t)strlen(hist);
             append_random(hist, sizeof(hist));
         } else if (op == 0 && n_files > 0) {
             /* another conversation: a prefix of one seen before, then its own */
             const model_file *f = &files[rnd((unsigned)n_files)];
-            const char *src = rnd(2) ? f->anchor : f->last;
+            const char *src = rnd(2) ? f->ckpt[0] : f->last;
             const size_t keep = rnd((unsigned)strlen(src) + 1);
             memmove(hist, src, keep);
             hist[keep] = '\0';
             append_random(hist, sizeof(hist));
-            n_turns = 0;
+            turn = 0;
             /* no state of the slot begins it: the slot's file stays the old
              * conversation's and this one gets its own */
             free(slot_path);
@@ -380,42 +391,57 @@ static void test_random_slot_lifecycle(ds4_kvstore *kc, const char *dir) {
             allowed_files++;
         } else {
             /* rewind to an earlier point and diverge: the same conversation,
-             * whose file gives up the branch left behind (a rewind into the
-             * anchor's history leaves the file to the conversations that
-             * share the anchor, and is a new one) */
+             * resumed in memory, whose file gives up the branch left behind
+             * wherever the fork lies past its first checkpoint (before it
+             * the two share no state, and the store begins a new file) */
             const size_t keep = rnd((unsigned)strlen(hist)) + 1;
             const model_file *own = NULL;
             for (int i = 0; slot_path && i < n_files; i++) if (!strcmp(files[i].path, slot_path)) own = &files[i];
-            if (!own || keep < strlen(own->anchor)) allowed_files++;
+            if (!own || keep < strlen(own->ckpt[0])) allowed_files++;
             hist[keep] = '\0';
             append_random(hist, sizeof(hist));
-            n_turns = 0;
+            turn = 0;
         }
         session_set(&s, hist);
-        for (size_t i = 0; i < n_turns; i++)
-            if (turns[i] < (uint32_t)s.tokens.len) s.saved[s.n_saved++] = turns[i];
+        if (turn != 0 && turn < (uint32_t)s.tokens.len) s.saved[s.n_saved++] = turn;
 
-        char *path = store(kc, &s, slot_path, "continued");
+        /* a checkpoint now and then, the live state alone otherwise */
+        const bool checkpoint = rnd(3) == 0;
+        char *path = store(kc, &s, slot_path, checkpoint ? "continued" : "evict");
         if (!path) { g_failed++; break; }
         free(slot_path);
         slot_path = path;
         model_file *f = NULL;
         for (int i = 0; i < n_files; i++) if (!strcmp(files[i].path, path)) f = &files[i];
         if (!f && n_files < MAX_FILES) {
-            /* a new file's anchor is the earliest state it was written with */
-            uint32_t first = (uint32_t)s.tokens.len;
-            for (size_t i = 0; i < s.n_saved; i++) if (s.saved[i] < first) first = s.saved[i];
             f = &files[n_files++];
             f->path = strdup(path);
-            snprintf(f->anchor, sizeof(f->anchor), "%.*s", (int)first, hist);
         }
-        /* a conversation's file holds its history as of the last store: a
-         * rewind overwrote what it held past the fork (a store the file
-         * already covered left it longer) */
-        if (f && strncmp(f->last, hist, strlen(hist)) != 0) snprintf(f->last, sizeof(f->last), "%s", hist);
+        if (!f) break;
+        /* The file already resumes at this history (a checkpoint of it, or
+         * where it stood): the store wrote nothing.  Otherwise the file now
+         * holds this history: the checkpoints past the fork are gone with
+         * the branch, and this state is one when the store said so or the
+         * file has none (a file begins with a checkpoint). */
+        bool covered = !strcmp(f->last, hist);
+        for (int i = 0; i < f->n_ckpt; i++) covered |= !strcmp(f->ckpt[i], hist);
+        if (!covered) {
+            while (f->n_ckpt > 0 && strncmp(f->ckpt[f->n_ckpt - 1], hist, strlen(f->ckpt[f->n_ckpt - 1])) != 0) f->n_ckpt--;
+            if ((checkpoint || f->n_ckpt == 0) && f->n_ckpt < MODEL_CKPTS) {
+                snprintf(f->ckpt[f->n_ckpt++], sizeof(f->ckpt[0]), "%s", hist);
+            }
+            snprintf(f->last, sizeof(f->last), "%s", hist);
+        }
         if (resume_checked(kc, hist) < (int)strlen(hist)) {
             fprintf(stderr, "  FAIL step %d: the history just stored '%s' is not resumable\n",
                     step, hist);
+            g_failed++;
+        }
+        /* the companion holds the file's checkpoints and nothing else */
+        const long companion = companion_bytes(path);
+        if (companion != (long)f->n_ckpt * (16 + FAKE_STATE_BYTES)) {
+            fprintf(stderr, "  FAIL step %d: a companion of %ld bytes for %d checkpoints\n",
+                    step, companion, f->n_ckpt);
             g_failed++;
         }
         if (count_files(dir) > allowed_files) {
@@ -425,9 +451,10 @@ static void test_random_slot_lifecycle(ds4_kvstore *kc, const char *dir) {
 
         for (int i = 0; i < n_files; i++) {
             const model_file *m = &files[i];
-            if (resume_checked(kc, m->anchor) < (int)strlen(m->anchor)) {
-                fprintf(stderr, "  FAIL step %d: anchor '%s' of %s not resumable\n",
-                        step, m->anchor, m->path);
+            for (int k = 0; k < m->n_ckpt; k++) {
+                if (resume_checked(kc, m->ckpt[k]) >= (int)strlen(m->ckpt[k])) continue;
+                fprintf(stderr, "  FAIL step %d: checkpoint '%s' of %s not resumable\n",
+                        step, m->ckpt[k], m->path);
                 g_failed++;
             }
             if (resume_checked(kc, m->last) < (int)strlen(m->last)) {
@@ -474,25 +501,48 @@ static void test_pictures_key_the_state(ds4_kvstore *kc, const char *dir) {
     CHECK(resume(kc, "system{b2}questionmore") == 19);
     CHECK(resume(kc, "system{a1}questionmore") == 19);
 
-    /* growing past the picture extends its own file, and the saved state
-     * before the picture resumes a prompt that carries a different one */
+    /* A conversation checkpointed before its picture: the checkpoint is in
+     * the companion, the live state in the tail, and the checkpoint resumes
+     * a prompt that carries a different picture. */
+    clear_dir(dir);
+    session_set(&s, "system");
+    char *file = store(kc, &s, NULL, "cold");
     session_set(&s, "system<###>questionanswer");
     session_add_image(&s, 7, 3, 0xb2);
-    s.saved[s.n_saved++] = 6;
-    char *grown = store(kc, &s, other, "continued");
-    CHECK(grown != NULL && strcmp(grown, other) == 0 && count_files(dir) == 2);
+    char *live = store(kc, &s, file, "evict");
+    CHECK(file && live && !strcmp(live, file) && count_files(dir) == 1);
     CHECK(resume(kc, "system{b2}questionanswer!") == 25);
     CHECK(resume(kc, "system{c3}question") == 6);
+    CHECK(companion_bytes(file) == 16 + FAKE_STATE_BYTES);
 
-    /* the agent strips the picture: the history parts from the file's where
-     * the picture began, past the file's first state, so the conversation's
-     * own file is rewound there and no second one appears */
+    /* the agent strips the picture, which its slot resumed in memory: the
+     * same conversation, whose own file is rewritten from where the picture
+     * began; no second file appears and the branch given up is gone */
     session_set(&s, "systemstrippedquestionanswer");
-    char *stripped = store(kc, &s, grown, "continued");
-    CHECK(stripped != NULL && strcmp(stripped, grown) == 0 && count_files(dir) == 2);
+    char *stripped = store(kc, &s, file, "continued");
+    CHECK(stripped != NULL && strcmp(stripped, file) == 0 && count_files(dir) == 1);
     CHECK(resume(kc, "systemstrippedquestionanswer!") == 28);
     CHECK(resume(kc, "system{b2}questionanswer!") == 6);
-    free(stripped);
+    CHECK(companion_bytes(file) == 2 * (16 + FAKE_STATE_BYTES));
+
+    /* an edit behind a checkpoint is the same conversation still: the file
+     * is rewritten from the fork, and the checkpoint past it goes with the
+     * blocks it stood on while the one before it stands */
+    session_set(&s, "systemotherquestion");
+    char *edited = store(kc, &s, file, "evict");
+    CHECK(edited != NULL && strcmp(edited, file) == 0 && count_files(dir) == 1);
+    CHECK(resume(kc, "systemotherquestion!") == 19);
+    CHECK(resume(kc, "systemstrippedquestionanswer!") == 6);
+    CHECK(companion_bytes(file) == 16 + FAKE_STATE_BYTES);
+
+    /* a history that leaves the file before its first checkpoint shares no
+     * state with it: that is another conversation's, whatever the caller
+     * says, and the file stays as it is */
+    session_set(&s, "sysadmin");
+    char *early = store(kc, &s, file, "evict");
+    CHECK(early != NULL && strcmp(early, file) != 0 && count_files(dir) == 2);
+    CHECK(resume(kc, "sysadmin!") == 8 && resume(kc, "systemotherquestion!") == 19);
+    CHECK(companion_bytes(file) == 16 + FAKE_STATE_BYTES);
 
     /* a history that stops inside a picture has no key */
     session_set(&s, "system<##");
@@ -501,7 +551,14 @@ static void test_pictures_key_the_state(ds4_kvstore *kc, const char *dir) {
     char err[160] = {0};
     CHECK(ds4_kvstore_store(kc, NULL, &s, &inside, err, sizeof(err)) == NULL && count_files(dir) == 2);
 
-    free(grown);
+    /* removing a file takes its companion along */
+    CHECK(ds4_kvstore_remove(file) && companion_bytes(file) < 0 && count_files(dir) == 1);
+
+    free(early);
+    free(edited);
+    free(stripped);
+    free(live);
+    free(file);
     free(other);
     free(path);
     ds4_tokens_free(&s.tokens);

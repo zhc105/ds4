@@ -11012,6 +11012,7 @@ static void slot_set_kv_path(server *s, server_slot *slot, char *path) {
 static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const ds4_tokens *tokens,
                                             int store_len, const char *reason,
+                                            bool checkpoint,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
                                             const char *cache_text_key,
@@ -11033,6 +11034,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
         .tokens = tokens,
         .store_len = store_len,
         .reason = reason,
+        .checkpoint = checkpoint,
         .key_override = cache_text_override,
         .key_ext = cache_text_ext,
         .key_kind = cache_text_key,
@@ -11051,10 +11053,12 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     return path != NULL;
 }
 
+/* The stores made along a history, a cold prompt's anchor and the state of
+ * every continued interval: the checkpoints a file keeps for its life. */
 static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
-    return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
+    return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason, true,
                                            NULL, 0, NULL, false);
 }
 
@@ -11107,7 +11111,9 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * key that payload by the visible protocol transcript, not by rendering the
      * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
      * tokenizes only the visible suffix that follows this key. */
-    kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
+    /* where the conversation stands as its slot is given up or the server
+     * stops: the live state, which the next store replaces */
+    kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason, false,
                                     visible_text, visible_ext, visible_key,
                                     inference_locked);
     free(visible_text);
@@ -11223,7 +11229,7 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
                                                 const char *path) {
     if (!s || !slot || !path) return;
     pthread_mutex_lock(&s->kv_mu);
-    if (unlink(path) == 0) {
+    if (ds4_kvstore_remove(path)) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: kv cache discarded reason=prefill-failed file=%s",
                    path);
@@ -11286,6 +11292,8 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
      * state of the slot's own, like the turn ends it saves */
     if (loaded > 0 && lr.tokens == lr.history_tokens) (void)ds4_session_save_state(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
+    /* the history is on disk up to here: its next checkpoint is due in the next interval */
+    if (loaded > 0) slot->continued_last_store_tokens = loaded;
     if (loaded > 0) {
         if (key_len_out) *key_len_out = lr.key_len;
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
@@ -13339,7 +13347,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=fingerprint-match",
                    j->req.image_count, cached, prompt_for_sync->len);
     }
-    if (cached == 0) slot->continued_last_store_tokens = 0;
+    /* the continued checkpoints are counted from where the history stands:
+     * one resumed behind its last store grows through those intervals again */
+    if (cached < slot->continued_last_store_tokens) slot->continued_last_store_tokens = cached;
     /* A history with pictures lives on disk only as a file of blocks, which
      * lists them (ds4_kvstore_store): the families whose sessions keep no
      * blocks hold such a history in memory alone, as before. */
@@ -20275,6 +20285,14 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
 
     kc.continued_last_store_tokens = 10240;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 20480);
+
+    /* a prefill piece that steps over an interval's start stores at its own
+     * end, once: the history is not left without that interval's checkpoint */
+    kc.continued_last_store_tokens = 8192;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 12288) == 12288);
+    kc.continued_last_store_tokens = 12288;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 16384) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 20480);
 
     kc.opt.boundary_align_tokens = 0;
