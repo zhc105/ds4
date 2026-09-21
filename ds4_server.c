@@ -13511,20 +13511,24 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync(s, slot, &prefix, j->req.images, cold_images, err, sizeof(err)) != 0) {
+        const int cold_sync_rc = server_session_sync(s, slot, &prefix, j->req.images,
+                                                     cold_images, err, sizeof(err));
+        if (cold_sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-            free(disk_cache_path);
-            if (job_cancelled(j)) {
+            if (cold_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                free(disk_cache_path);
                 request_live_state_clear(s, slot);
-                trace_event(s, trace_id, "cancelled during prefill");
+                trace_event(s, trace_id, "%s during prefill",
+                            job_cancelled(j) ? "cancelled" : "stopped");
                 return;
             }
+            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+            free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
@@ -13550,16 +13554,24 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-        free(disk_cache_path);
-        if (job_cancelled(j)) {
+        /* Only a prefill the restored state made fail condemns the file the
+         * state came from.  An interrupted one says nothing about it, and
+         * the two ways a prefill is interrupted — a client that gave up on a
+         * long one, a server stopping — are precisely when the file is at its
+         * largest: dropping it would cost that conversation its whole
+         * history, and the next turn would prefill all of it again. */
+        if (prompt_sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+            const char *how = job_cancelled(j) ? "cancelled" : "stopped";
+            free(disk_cache_path);
             request_live_state_clear(s, slot);
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: chat ctx=%s%s%s cancelled during prefill",
-                       ctx_span, req_flags[0] ? " " : "", req_flags);
-            trace_event(s, trace_id, "cancelled during prefill");
+                       "ds4-server: chat ctx=%s%s%s %s during prefill",
+                       ctx_span, req_flags[0] ? " " : "", req_flags, how);
+            trace_event(s, trace_id, "%s during prefill", how);
             return;
         }
+        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        free(disk_cache_path);
         server_log(DS4_LOG_WARNING,
                    "ds4-server: chat ctx=%s%s%s prefill failed: %s",
                    ctx_span, req_flags[0] ? " " : "", req_flags, err);
