@@ -274,7 +274,7 @@ tests/test_ngram_cache: tests/test_ngram_cache.o ds4_ngram_cache.o
 tests/test_kvstore.o: tests/test_kvstore.c ds4.h ds4_kvstore.h ds4_chainstore.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_kvstore.c
 
-tests/test_kvstore: tests/test_kvstore.o ds4_kvstore.o ds4_chainstore.o
+tests/test_kvstore: tests/test_kvstore.o ds4_kvstore.o ds4_chainstore.o rax.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
@@ -307,7 +307,7 @@ ds4_agent.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h d
 ds4_web.o: ds4_web.c ds4_web.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_web.c
 
-ds4_chainstore.o: ds4_chainstore.c ds4_chainstore.h ds4_kvstore.h ds4.h
+ds4_chainstore.o: ds4_chainstore.c ds4_chainstore.h ds4_kvstore.h ds4.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_chainstore.c
 
 ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h ds4_ssd.h

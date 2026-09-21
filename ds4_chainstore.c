@@ -20,6 +20,7 @@
  * and renamed, so a file that is there is complete. */
 
 #include "ds4_chainstore.h"
+#include "rax.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -159,8 +160,8 @@ static void node_remove(ds4_chainstore *cs, int i) {
  * with the files.  For every node, where its parent is (LINK_ROOT: it begins
  * a chain; LINK_GONE: the parent is not in the index), whether anything
  * hangs from it, and whether its chain reaches back to position 0 through
- * files that meet end to start.  One sort of the segments by id, then a
- * binary search per node. */
+ * files that meet end to start.  The segments go in a map by id, and every
+ * node looks its parent up there. */
 enum { LINK_ROOT = -1, LINK_GONE = -2 };
 
 typedef struct {
@@ -168,15 +169,6 @@ typedef struct {
     bool *has_child;
     bool *whole;
 } chain_links;
-
-typedef struct {
-    const uint8_t *id;
-    int node;
-} id_ref;
-
-static int id_ref_cmp(const void *a, const void *b) {
-    return memcmp(((const id_ref *)a)->id, ((const id_ref *)b)->id, ID_BYTES);
-}
 
 static void links_free(chain_links *l) {
     free(l->up);
@@ -188,18 +180,15 @@ static chain_links links_build(const ds4_chainstore *cs) {
     const int n = cs->len;
     chain_links l = { malloc((size_t)(n + 1) * sizeof(int)), calloc((size_t)n + 1, sizeof(bool)),
                       calloc((size_t)n + 1, sizeof(bool)) };
-    id_ref *seg = malloc((size_t)(n + 1) * sizeof(*seg));
-    int m = 0;
-    for (int i = 0; i < n; i++) if (!cs->node[i].tail) seg[m++] = (id_ref){ cs->node[i].id, i };
-    qsort(seg, (size_t)m, sizeof(*seg), id_ref_cmp);
+    rax *by_id = raxNew();
+    for (int i = 0; i < n; i++)
+        if (!cs->node[i].tail) raxInsert(by_id, cs->node[i].id, ID_BYTES, (void *)(intptr_t)i, NULL);
     for (int i = 0; i < n; i++) {
-        const id_ref key = { cs->node[i].parent, -1 };
-        const id_ref *p = id_is_none(cs->node[i].parent) ? NULL :
-                          bsearch(&key, seg, (size_t)m, sizeof(*seg), id_ref_cmp);
-        l.up[i] = id_is_none(cs->node[i].parent) ? LINK_ROOT : p ? p->node : LINK_GONE;
+        void *p = id_is_none(cs->node[i].parent) ? NULL : raxFind(by_id, cs->node[i].parent, ID_BYTES);
+        l.up[i] = id_is_none(cs->node[i].parent) ? LINK_ROOT : p == raxNotFound ? LINK_GONE : (int)(intptr_t)p;
         if (l.up[i] >= 0) l.has_child[l.up[i]] = true;
     }
-    free(seg);
+    raxFree(by_id);
     /* whole: 0 unknown, 1 yes, 2 no, 3 on the walk now (a cycle, which no
      * writer makes, counts as broken) */
     uint8_t *state = calloc((size_t)n + 1, 1);
