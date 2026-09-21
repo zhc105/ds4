@@ -246,12 +246,7 @@ static bool kv_read_u32(FILE *fp, uint32_t *v) {
     return true;
 }
 
-typedef struct {
-    uint32_t h[5];
-    uint64_t bytes;
-    uint8_t block[64];
-    size_t used;
-} sha1_ctx;
+typedef ds4_kvstore_sha1 sha1_ctx;
 
 static uint32_t rol32(uint32_t v, int n) {
     return (v << n) | (v >> (32 - n));
@@ -342,6 +337,10 @@ static void sha1_final(sha1_ctx *c, uint8_t out[20]) {
         out[i * 4 + 3] = (uint8_t)c->h[i];
     }
 }
+
+void ds4_kvstore_sha1_init(ds4_kvstore_sha1 *c) { sha1_init(c); }
+void ds4_kvstore_sha1_update(ds4_kvstore_sha1 *c, const void *ptr, size_t len) { sha1_update(c, ptr, len); }
+void ds4_kvstore_sha1_final(ds4_kvstore_sha1 *c, uint8_t out[20]) { sha1_final(c, out); }
 
 static void hex20(const uint8_t in[20], char out[41]) {
     static const char hex[] = "0123456789abcdef";

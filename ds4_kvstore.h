@@ -266,6 +266,17 @@ bool ds4_kvstore_remove(const char *path);
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits, uint64_t used_at);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);
 void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
+/* The same digest fed in pieces.  final consumes the context: a caller that
+ * wants the digest of a prefix and goes on finalizes a copy. */
+typedef struct {
+    uint32_t h[5];
+    uint64_t bytes;
+    uint8_t block[64];
+    size_t used;
+} ds4_kvstore_sha1;
+void ds4_kvstore_sha1_init(ds4_kvstore_sha1 *c);
+void ds4_kvstore_sha1_update(ds4_kvstore_sha1 *c, const void *ptr, size_t len);
+void ds4_kvstore_sha1_final(ds4_kvstore_sha1 *c, uint8_t out[20]);
 char *ds4_kvstore_path_join(const char *dir, const char *name);
 char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);

@@ -11,6 +11,7 @@
 
 #include "ds4.h"
 #include "ds4_kvstore.h"
+#include "ds4_chainstore.h"
 
 #include <dirent.h>
 #include <stdint.h>
@@ -85,7 +86,8 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
 }
 
 int ds4_engine_model_id(ds4_engine *e) { (void)e; return 1; }
-int ds4_engine_routed_quant_bits(ds4_engine *e) { (void)e; return 4; }
+static int g_fake_quant = 4;
+int ds4_engine_routed_quant_bits(ds4_engine *e) { (void)e; return g_fake_quant; }
 int ds4_session_ctx(ds4_session *s) { (void)s; return 4096; }
 void ds4_session_invalidate(ds4_session *s) { s->tokens.len = 0; s->n_saved = 0; }
 const ds4_tokens *ds4_session_tokens(ds4_session *s) { return &s->tokens; }
@@ -105,10 +107,15 @@ int ds4_session_read_blocks(ds4_session *s, FILE *fp, uint32_t from, uint32_t to
                             uint32_t stored_to, char *err, size_t errlen) {
     (void)err; (void)errlen;
     if (from == 0) ds4_session_invalidate(s);
+    /* a row lands at its position: a chain's segment repeats the rows of the
+     * block its parent ended in, and reading them again changes nothing */
+    if ((uint32_t)s->tokens.len < from) return 1;
     int row;
     for (uint32_t i = from; i < stored_to; i++) {
         if (fread(&row, sizeof(row), 1, fp) != 1) return 1;
-        if (i < to) ds4_tokens_push(&s->tokens, row);
+        if (i >= to) continue;
+        if (i < (uint32_t)s->tokens.len) s->tokens.v[i] = row;
+        else ds4_tokens_push(&s->tokens, row);
     }
     return 0;
 }
@@ -669,6 +676,278 @@ static void test_pictures_key_the_state(ds4_kvstore *kc, const char *dir) {
     ds4_tokens_free(&s.tokens);
 }
 
+/* ---- the chain store (ds4_chainstore.c) ----------------------------------
+ * The same fake session.  A test plays the server: it seals where a prefill
+ * would have stopped and writes a tail where a slot would be given up, and
+ * keeps, as a slot does, the segment its chain ends with. */
+
+typedef struct {
+    uint8_t parent[DS4_CHAINSTORE_ID_BYTES];
+    uint32_t sealed_end;
+    char *tail;
+} chain_slot;
+
+static int count_chain_files(const char *dir) {
+    DIR *d = opendir(dir);
+    int n = 0;
+    for (struct dirent *de; d && (de = readdir(d));) n += strstr(de->d_name, ".kv") != NULL;
+    if (d) closedir(d);
+    return n;
+}
+
+/* the history as it stands, sealed up to its end */
+static bool chain_seal(ds4_chainstore *cs, ds4_session *s, chain_slot *slot, const char *history) {
+    char err[160] = {0};
+    session_set(s, history);
+    uint8_t id[DS4_CHAINSTORE_ID_BYTES];
+    if (!ds4_chainstore_seal(cs, NULL, s, slot->parent, slot->sealed_end, NULL, id, err, sizeof(err))) {
+        fprintf(stderr, "  seal failed: %s\n", err);
+        return false;
+    }
+    memcpy(slot->parent, id, sizeof(id));
+    slot->sealed_end = (uint32_t)s->tokens.len;
+    return true;
+}
+
+/* the slot is given up at `history`, whose client's text ended at `sent` */
+static bool chain_give_up(ds4_chainstore *cs, ds4_session *s, chain_slot *slot, const char *history,
+                          const char *sent) {
+    char err[160] = {0};
+    session_set(s, history);
+    if (sent) s->saved[s->n_saved++] = (uint32_t)strlen(sent);
+    char *path = ds4_chainstore_store_tail(cs, NULL, s, slot->parent, slot->sealed_end,
+                                           sent ? (int)strlen(sent) : 0, slot->tail, "evict",
+                                           NULL, err, sizeof(err));
+    if (!path) {
+        fprintf(stderr, "  tail not stored: %s\n", err);
+        return false;
+    }
+    free(slot->tail);
+    slot->tail = path;
+    return true;
+}
+
+/* what a prompt resumes, into a fresh session whose history is checked */
+static int chain_resume(ds4_chainstore *cs, const char *prompt, const char *const *held,
+                        ds4_chainstore_load_result *lr) {
+    ds4_session fresh = {0};
+    ds4_chainstore_load_result local = {0};
+    if (!lr) lr = &local;
+    const int got = ds4_chainstore_load(cs, NULL, &fresh, prompt, held, NULL, lr);
+    if (got > 0) {
+        CHECK(fresh.tokens.len == got);
+        for (int i = 0; i < got && i < fresh.tokens.len; i++) {
+            if (fresh.tokens.v[i] == prompt[i] - 'a') continue;
+            fprintf(stderr, "  FAIL: the resumed history is not the prompt's at %d (line %d)\n", i, __LINE__);
+            g_failed++;
+            break;
+        }
+    }
+    if (lr == &local) ds4_chainstore_load_result_free(&local);
+    ds4_tokens_free(&fresh.tokens);
+    return got;
+}
+
+static void chain_open(ds4_chainstore *cs, const char *dir, uint64_t budget_mb) {
+    if (!ds4_chainstore_open(cs, dir, budget_mb, 1, 2, "test", NULL, NULL)) {
+        fprintf(stderr, "cannot open the chain store in %s\n", dir);
+        exit(1);
+    }
+}
+
+#define SEG1 "systempromp"            /* 11 tokens: segments begin wherever a prefill stopped, */
+#define SEG2 SEG1 "tturnonego"        /* 21: not on the block size (4) */
+#define SEG3 SEG2 "esonandon"         /* 30 */
+
+/* A chain is resumed at the longest state whose text begins the prompt: a
+ * segment's end, never inside one.  The history comes back whole across
+ * segments whose first block repeats rows of the one before. */
+static void test_chain_resumes_the_longest_segment(const char *dir) {
+    clear_dir(dir);
+    ds4_chainstore cs;
+    chain_open(&cs, dir, 64);
+    ds4_session s = {0};
+    chain_slot slot = {0};
+    CHECK(chain_seal(&cs, &s, &slot, SEG1));
+    CHECK(chain_seal(&cs, &s, &slot, SEG2));
+    CHECK(chain_seal(&cs, &s, &slot, SEG3));
+    CHECK(cs.len == 3);
+
+    ds4_chainstore_load_result lr = {0};
+    CHECK(chain_resume(&cs, SEG3 "more", NULL, &lr) == (int)strlen(SEG3));
+    CHECK(lr.segments == 3 && lr.key_len == strlen(SEG3) && !lr.own && lr.sealed_end == strlen(SEG3));
+    ds4_chainstore_load_result_free(&lr);
+    /* leaving the history inside the third segment, and inside the first */
+    CHECK(chain_resume(&cs, SEG2 "esonbutthen", NULL, &lr) == (int)strlen(SEG2));
+    CHECK(lr.segments == 2 && lr.sealed_end == strlen(SEG2));
+    ds4_chainstore_load_result_free(&lr);
+    CHECK(chain_resume(&cs, "systemother", NULL, NULL) == 0);
+
+    /* the index is the headers': a store opened again finds the same */
+    ds4_chainstore_close(&cs);
+    chain_open(&cs, dir, 64);
+    CHECK(cs.len == 3);
+    CHECK(chain_resume(&cs, SEG3 "more", NULL, NULL) == (int)strlen(SEG3));
+    CHECK(chain_resume(&cs, SEG1 "x", NULL, NULL) == (int)strlen(SEG1));
+
+    /* a slot that went back behind its last segment goes on from the one before */
+    uint8_t id[DS4_CHAINSTORE_ID_BYTES];
+    uint32_t end = 0;
+    ds4_chainstore_ancestor_at(&cs, slot.parent, (uint32_t)strlen(SEG2) + 3, id, &end);
+    CHECK(end == strlen(SEG2));
+    ds4_chainstore_ancestor_at(&cs, slot.parent, 5, id, &end);
+    CHECK(end == 0);
+
+    ds4_chainstore_close(&cs);
+    ds4_tokens_free(&s.tokens);
+}
+
+/* Segments are named by the text they stand for: a second conversation with
+ * the same history finds the file there, and the two part where their texts
+ * do.  Another picture is another text; another quantization another root. */
+static void test_chain_shares_what_is_the_same(const char *dir) {
+    clear_dir(dir);
+    ds4_chainstore cs;
+    chain_open(&cs, dir, 64);
+    ds4_session s = {0};
+    chain_slot a = {0}, b = {0};
+    CHECK(chain_seal(&cs, &s, &a, SEG1));
+    CHECK(chain_seal(&cs, &s, &a, SEG2));
+    CHECK(chain_seal(&cs, &s, &b, SEG1));
+    CHECK(cs.len == 2 && memcmp(a.parent, b.parent, sizeof(b.parent)) != 0);
+    CHECK(chain_seal(&cs, &s, &b, SEG1 "anotherway"));
+    CHECK(cs.len == 3);
+    CHECK(chain_resume(&cs, SEG2 "!", NULL, NULL) == (int)strlen(SEG2));
+    CHECK(chain_resume(&cs, SEG1 "anotherway!", NULL, NULL) == (int)strlen(SEG1 "anotherway"));
+
+    chain_slot p = {0}, q = {0};
+    session_set(&s, "system<###>question");
+    session_add_image(&s, 7, 3, 0xa1);
+    uint8_t id_a[DS4_CHAINSTORE_ID_BYTES], id_b[DS4_CHAINSTORE_ID_BYTES];
+    char err[160];
+    CHECK(ds4_chainstore_seal(&cs, NULL, &s, p.parent, 0, NULL, id_a, err, sizeof(err)));
+    s.images[0].fingerprint[0] = 0xb2;
+    CHECK(ds4_chainstore_seal(&cs, NULL, &s, q.parent, 0, NULL, id_b, err, sizeof(err)));
+    CHECK(memcmp(id_a, id_b, sizeof(id_a)) != 0 && cs.len == 5);
+    ds4_session fresh = {0};
+    CHECK(ds4_chainstore_load(&cs, NULL, &fresh, "system{b2}questionmore", NULL, NULL, NULL) == 19);
+    CHECK(fresh.n_images == 1 && fresh.images[0].fingerprint[0] == 0xb2);
+    ds4_tokens_free(&fresh.tokens);
+    CHECK(chain_resume(&cs, "system<###>questionmore", NULL, NULL) == 0);
+
+    g_fake_quant = 2;
+    CHECK(chain_resume(&cs, SEG2 "!", NULL, NULL) == 0);
+    g_fake_quant = 4;
+
+    ds4_chainstore_close(&cs);
+    ds4_tokens_free(&s.tokens);
+}
+
+/* A slot given up leaves a tail with two states: where it stood, generation
+ * included, and where its client's text ended.  The client that sends the
+ * generation back resumes whole, the one that does not resumes from its own
+ * text, and both get the tail to rewrite unless another slot holds it.  The
+ * next tail replaces it; a history sealed past it needs it no more. */
+static void test_chain_tail_keeps_both_states(const char *dir) {
+    clear_dir(dir);
+    ds4_chainstore cs;
+    chain_open(&cs, dir, 64);
+    ds4_session s = {0};
+    chain_slot slot = {0};
+    CHECK(chain_seal(&cs, &s, &slot, SEG1));
+    const char *sent = SEG1 "question";
+    const char *whole = SEG1 "questionthoughtsanswer";
+    CHECK(chain_give_up(&cs, &s, &slot, whole, sent));
+    CHECK(cs.len == 2);
+
+    ds4_chainstore_load_result lr = {0};
+    ds4_session fresh = {0};
+    CHECK(ds4_chainstore_load(&cs, NULL, &fresh, SEG1 "questionthoughtsanswernext", NULL, NULL, &lr) ==
+          (int)strlen(whole));
+    CHECK(lr.own && lr.tail_path && !strcmp(lr.tail_path, slot.tail) && lr.sealed_end == strlen(SEG1));
+    CHECK(fresh.n_saved == 1 && fresh.saved[0] == strlen(sent));   /* the state to fall back to came along */
+    ds4_chainstore_load_result_free(&lr);
+    ds4_tokens_free(&fresh.tokens);
+
+    CHECK(chain_resume(&cs, SEG1 "questionanswernext", NULL, &lr) == (int)strlen(sent));
+    CHECK(lr.own && lr.key_len == strlen(sent));
+    ds4_chainstore_load_result_free(&lr);
+
+    const char *held[] = { slot.tail, NULL };
+    CHECK(chain_resume(&cs, SEG1 "questionanswernext", held, &lr) == (int)strlen(sent));
+    CHECK(!lr.own && lr.tail_path == NULL);
+    ds4_chainstore_load_result_free(&lr);
+
+    /* the client without the reasoning goes on: the same file, and the
+     * generation it never sent back is gone */
+    char *before = strdup(slot.tail);
+    CHECK(chain_give_up(&cs, &s, &slot, SEG1 "questionanswernextreply", SEG1 "questionanswernext"));
+    CHECK(!strcmp(before, slot.tail) && cs.len == 2 && count_chain_files(dir) == 2);
+    CHECK(chain_resume(&cs, SEG1 "questionthoughtsanswernext", NULL, NULL) == (int)strlen(SEG1));
+    CHECK(chain_resume(&cs, SEG1 "questionanswernextreply!", NULL, NULL) ==
+          (int)strlen(SEG1 "questionanswernextreply"));
+    free(before);
+
+    /* a history that went back behind the segment hangs its tail elsewhere:
+     * the one left behind is a branch that may come back */
+    chain_slot back = { .tail = strdup(slot.tail) };
+    CHECK(chain_give_up(&cs, &s, &back, "sysadminsession", NULL));
+    CHECK(strcmp(back.tail, slot.tail) != 0 && cs.len == 3);
+    CHECK(chain_resume(&cs, SEG1 "questionanswernextreply!", NULL, NULL) ==
+          (int)strlen(SEG1 "questionanswernextreply"));
+
+    /* sealed past its tail, the slot drops it */
+    CHECK(chain_seal(&cs, &s, &slot, SEG1 "questionanswernextreplyandmore"));
+    ds4_chainstore_drop_tail(&cs, slot.tail);
+    CHECK(cs.len == 3 && count_chain_files(dir) == 3);
+    CHECK(chain_resume(&cs, SEG1 "questionanswernextreplyandmore!", NULL, NULL) ==
+          (int)strlen(SEG1 "questionanswernextreplyandmore"));
+
+    free(back.tail);
+    free(slot.tail);
+    ds4_chainstore_close(&cs);
+    ds4_tokens_free(&s.tokens);
+}
+
+/* Room is made leaves first, least recently used first: a segment never
+ * goes from under another, and the chain a slot lives on stays though its
+ * tail is not on disk. */
+static void test_chain_evicts_leaves_first(const char *dir) {
+    clear_dir(dir);
+    ds4_chainstore cs;
+    chain_open(&cs, dir, 64);
+    ds4_session s = {0};
+    chain_slot a = {0}, b = {0};
+    CHECK(chain_seal(&cs, &s, &a, SEG1));
+    CHECK(chain_seal(&cs, &s, &a, SEG2));
+    CHECK(chain_seal(&cs, &s, &a, SEG3));
+    CHECK(chain_seal(&cs, &s, &b, SEG1));
+    CHECK(chain_seal(&cs, &s, &b, SEG1 "anotherbranch"));
+    CHECK(cs.len == 4);
+    /* least recently used: the shared root, then a's segments in order */
+    for (int i = 0; i < cs.len; i++) cs.node[i].last_used = 100 + cs.node[i].end;
+    ds4_chainstore_pin(&cs, 0, b.parent);
+
+    cs.budget_bytes = ds4_chainstore_bytes(&cs);
+    ds4_chainstore_evict(&cs, 1);                 /* one file must go: a's leaf, b's is pinned */
+    CHECK(cs.len == 3);
+    CHECK(chain_resume(&cs, SEG3 "!", NULL, NULL) == (int)strlen(SEG2));
+    CHECK(chain_resume(&cs, SEG1 "anotherbranch!", NULL, NULL) == (int)strlen(SEG1 "anotherbranch"));
+    for (int i = 0; i < cs.len; i++) cs.node[i].last_used = 100 + cs.node[i].end;   /* the resumes touched them */
+    cs.budget_bytes = ds4_chainstore_bytes(&cs);
+    ds4_chainstore_evict(&cs, 1);                 /* then the segment it hung from, a leaf now */
+    CHECK(cs.len == 2);
+    CHECK(chain_resume(&cs, SEG3 "!", NULL, NULL) == (int)strlen(SEG1));
+    ds4_chainstore_evict(&cs, 1u << 30);          /* whatever is asked, the pinned chain stays whole */
+    CHECK(cs.len == 2);
+    ds4_chainstore_pin(&cs, 0, NULL);
+    ds4_chainstore_evict(&cs, 1u << 30);
+    CHECK(cs.len == 0 && count_chain_files(dir) == 0);
+
+    ds4_chainstore_close(&cs);
+    ds4_tokens_free(&s.tokens);
+}
+
 int main(int argc, char **argv) {
     char dir[512];
     snprintf(dir, sizeof(dir), "%s/ds4-kvstore-test-%ld", argc > 1 ? argv[1] : "/tmp",
@@ -693,6 +972,10 @@ int main(int argc, char **argv) {
     test_random_slot_lifecycle(&kc, dir);
     test_pictures_key_the_state(&kc, dir);
     ds4_kvstore_close(&kc);
+    test_chain_resumes_the_longest_segment(dir);
+    test_chain_shares_what_is_the_same(dir);
+    test_chain_tail_keeps_both_states(dir);
+    test_chain_evicts_leaves_first(dir);
     clear_dir(dir);
     rmdir(dir);
     if (g_failed) {

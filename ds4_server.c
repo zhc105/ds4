@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_chainstore.h"
 #include "ds4_tp.h"
 #include "rax.h"
 
@@ -9931,7 +9932,16 @@ struct server_slot {
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     int continued_last_store_tokens;
-    char *kv_path;   /* the file the live conversation was loaded from or last stored to */
+    char *kv_path;   /* the file the live conversation was loaded from or last stored to
+                      * (of a chain, its tail) */
+    /* Where the live conversation stands in the chain store: the segment
+     * its sealed history ends with and how far that reaches (none, 0). */
+    uint8_t chain_parent[DS4_CHAINSTORE_ID_BYTES];
+    uint32_t chain_sealed_end;
+    /* How far the live history is text a client sent: the position the last
+     * prompt's state was saved at (server_prompt_sync).  What lies past it
+     * was generated, or is the prompt's last token. */
+    int sent_len;
 
     job *assigned;
     job *running;
@@ -9989,7 +9999,11 @@ struct server {
     float steering_default_attn;
     float steering_default_ffn;
     bool steering_live_ok;
+    /* The disk KV store.  Sessions that keep their history in blocks (Qwen
+     * on a GPU) live in the chain store; the others, whose checkpoint is one
+     * payload, in a file each.  One of the two is enabled. */
     kv_disk_cache kv;
+    ds4_chainstore chain;
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
@@ -10858,11 +10872,22 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
     return loaded;
 }
 
+static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s, const stop_list *wanted);
+
 static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs) {
-    if (!s || s->disable_exact_dsml_tool_replay || !s->kv.enabled || !msgs) return;
+    if (!s || s->disable_exact_dsml_tool_replay || !msgs) return;
+    if (!s->kv.enabled && !s->chain.enabled) return;
     stop_list wanted = {0};
     collect_tool_call_ids(msgs, &wanted);
     if (wanted.len == 0) return;
+    if (s->chain.enabled) {
+        const ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, &wanted);
+        pthread_mutex_lock(&s->kv_mu);
+        ds4_chainstore_load_trailers(&s->chain, &hooks);
+        pthread_mutex_unlock(&s->kv_mu);
+        id_list_free(&wanted);
+        return;
+    }
     /* Tool replay payloads are stored next to KV checkpoints; keep them model
      * scoped too, since token positions and graph state are not portable across
      * Flash/Pro shapes even when the rendered chat text is identical. */
@@ -11012,6 +11037,26 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
  * would take a file another holds (a second request continuing the same
  * history) goes without, and its next store names a file of its own.
  * `path` is the slot's from here on (NULL: it has no file). */
+/* The least history worth a disk store; -1 with no disk store. */
+static int server_disk_kv_min_tokens(const server *s) {
+    return s->chain.enabled ? s->chain.min_tokens : s->kv.enabled ? s->kv.opt.min_tokens : -1;
+}
+
+/* A request resumed the slot's history at `resumed` positions.  Behind the
+ * segment its chain ended with (an edit resumed from a saved state, another
+ * conversation begun from nothing), the slot no longer stands on that
+ * segment: it goes on from the deepest one the resumed history still holds,
+ * and what it leaves is a branch that may come back. */
+static void slot_chain_resumed(server *s, server_slot *slot, int resumed) {
+    if (!s->chain.enabled || (uint32_t)resumed >= slot->chain_sealed_end) return;
+    pthread_mutex_lock(&s->kv_mu);
+    uint8_t id[DS4_CHAINSTORE_ID_BYTES];
+    ds4_chainstore_ancestor_at(&s->chain, slot->chain_parent, (uint32_t)resumed, id, &slot->chain_sealed_end);
+    memcpy(slot->chain_parent, id, sizeof(id));
+    ds4_chainstore_pin(&s->chain, slot->id, id);
+    pthread_mutex_unlock(&s->kv_mu);
+}
+
 static void slot_set_kv_path(server *s, server_slot *slot, char *path) {
     pthread_mutex_lock(&s->kv_mu);
     for (int i = 0; path && i < s->slot_count; i++) {
@@ -11047,6 +11092,37 @@ static bool kv_cache_store_live_prefix_at(server *s, server_slot *slot,
         if (!inference_locked) pthread_mutex_unlock(&s->inference_mu);
         return false;
     }
+    if (s->chain.enabled) {
+        /* A checkpoint is a segment sealed: the history past the last one,
+         * all of it rows its tail held, which the slot lets go of.  Any
+         * other store is the slot's tail. */
+        bool stored = false;
+        char *tail = NULL;
+        pthread_mutex_lock(&s->kv_mu);
+        if (ds4_session_pos(slot->session) != store_len) {
+            /* only the live history is stored */
+        } else if (checkpoint) {
+            uint8_t id[DS4_CHAINSTORE_ID_BYTES];
+            stored = ds4_chainstore_seal(&s->chain, s->engine, slot->session, slot->chain_parent,
+                                         slot->chain_sealed_end, &hooks, id, err, sizeof(err));
+            if (stored) {
+                memcpy(slot->chain_parent, id, sizeof(id));
+                slot->chain_sealed_end = (uint32_t)store_len;
+                ds4_chainstore_pin(&s->chain, slot->id, id);
+                ds4_chainstore_drop_tail(&s->chain, slot->kv_path);
+            }
+        } else {
+            tail = ds4_chainstore_store_tail(&s->chain, s->engine, slot->session, slot->chain_parent,
+                                             slot->chain_sealed_end, sent_len, slot->kv_path, reason,
+                                             &hooks, err, sizeof(err));
+            stored = tail != NULL;
+        }
+        pthread_mutex_unlock(&s->kv_mu);
+        if (!inference_locked) pthread_mutex_unlock(&s->inference_mu);
+        if (stored && (checkpoint || tail)) slot_set_kv_path(s, slot, tail);
+        if (!stored && err[0]) server_log(DS4_LOG_WARNING, "ds4-server: kv chain store (%s) failed: %s", reason, err);
+        return stored;
+    }
     const ds4_kvstore_store_request req = {
         .tokens = tokens,
         .store_len = store_len,
@@ -11080,6 +11156,12 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
  * that conversation's file as in use: the store's eviction goes by recency
  * and must not take the file the load right after it needs. */
 static void kv_cache_touch_prompt_file(server *s, const char *prompt_text) {
+    if (s && s->chain.enabled && prompt_text && s->engine) {
+        pthread_mutex_lock(&s->kv_mu);
+        ds4_chainstore_touch(&s->chain, s->engine, s->slots[0].session, prompt_text);
+        pthread_mutex_unlock(&s->kv_mu);
+        return;
+    }
     if (!s || !s->kv.enabled || !prompt_text || !s->engine) return;
     pthread_mutex_lock(&s->kv_mu);
     uint32_t state = 0;
@@ -11103,15 +11185,8 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * only if its client sends it back as it was; the state saved where the
      * client's own text ended (server_prompt_sync) goes along for the one
      * that does not. */
-    int sent_len = 0;
-    const ds4_tokens *saved;
-    const ds4_vision_identity *ids;
-    size_t n_ids;
-    for (size_t i = 0; (saved = ds4_session_saved_state(slot->session, i, &ids, &n_ids)); i++) {
-        if (saved->len > sent_len && saved->len < tokens->len &&
-            memcmp(saved->v, tokens->v, (size_t)saved->len * sizeof(int)) == 0) sent_len = saved->len;
-    }
-    kv_cache_store_live_prefix_at(s, slot, tokens, tokens->len, sent_len, reason, false,
+    kv_cache_store_live_prefix_at(s, slot, tokens, tokens->len,
+                                  slot->sent_len < tokens->len ? slot->sent_len : 0, reason, false,
                                   inference_locked);
 }
 
@@ -11164,11 +11239,12 @@ static bool server_kv_reclaim(void *ud) {
         return false;
     }
     const int tokens = ds4_session_pos(victim->session);
-    if (s->kv.enabled && tokens >= s->kv.opt.min_tokens) {
+    if (server_disk_kv_min_tokens(s) >= 0 && tokens >= server_disk_kv_min_tokens(s)) {
         kv_cache_store_current(s, victim, "kv-pool", true);
     }
     ds4_session_drop_kv(victim->session);
     slot_set_kv_path(s, victim, NULL);
+    slot_chain_resumed(s, victim, 0);
     server_log(DS4_LOG_DEFAULT, "ds4-server: kv pool full: evicted slot %d (%d tokens, hit score %.2f) to disk",
                victim->id, tokens, victim_score);
     pthread_mutex_lock(&s->mu);
@@ -11225,7 +11301,10 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
                                                 const char *path) {
     if (!s || !slot || !path) return;
     pthread_mutex_lock(&s->kv_mu);
-    if (ds4_kvstore_remove(path)) {
+    if (s->chain.enabled) {   /* the path is the tail the slot resumed and owns */
+        ds4_chainstore_drop_tail(&s->chain, path);
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv chain tail discarded reason=prefill-failed file=%s", path);
+    } else if (ds4_kvstore_remove(path)) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: kv cache discarded reason=prefill-failed file=%s",
                    path);
@@ -11242,11 +11321,27 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
 }
 
+static int server_store_boundary(ds4_engine *e, const ds4_vision_span *images, size_t image_count,
+                                 int target, size_t *stored_images);
+
+/* Called as a prompt is prefilled, where the live history is text its client
+ * sent: the place for a checkpoint.  The chain store seals a segment once
+ * the history has grown one past the last, wherever this prefill piece
+ * happened to stop, unless that is inside a picture. */
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!s || !slot) return;
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
+    if (s->chain.enabled) {
+        if (tokens->len > slot->sent_len) return;   /* the prompt's last token is no boundary */
+        if (tokens->len - (int)slot->chain_sealed_end < s->chain.segment_tokens) return;
+        const job *j = slot->running;
+        size_t n = 0;
+        if (j && server_store_boundary(s->engine, j->req.images, j->req.image_count, tokens->len, &n) != tokens->len) return;
+        (void)kv_cache_store_live_prefix(s, slot, tokens, tokens->len, "continued");
+        return;
+    }
     const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
     if (target == 0) return;
     if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued")) {
@@ -11274,8 +11369,43 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   bool responses_protocol) {
     if (!s || !slot) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
-    ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    if (s->chain.enabled) {
+        /* the tails other slots hold are read, not taken over */
+        const char **held = xmalloc(((size_t)s->slot_count + 1) * sizeof(*held));
+        ds4_chainstore_load_result cr = {0};
+        pthread_mutex_lock(&s->inference_mu);
+        pthread_mutex_lock(&s->kv_mu);
+        int n_held = 0;
+        for (int i = 0; i < s->slot_count; i++)
+            if (&s->slots[i] != slot && s->slots[i].kv_path) held[n_held++] = s->slots[i].kv_path;
+        held[n_held] = NULL;
+        const int got = ds4_chainstore_load(&s->chain, s->engine, slot->session, prompt_text, held, &hooks, &cr);
+        if (got > 0) {
+            memcpy(slot->chain_parent, cr.parent, sizeof(cr.parent));
+            slot->chain_sealed_end = cr.sealed_end;
+            ds4_chainstore_pin(&s->chain, slot->id, cr.parent);
+        }
+        pthread_mutex_unlock(&s->kv_mu);
+        /* the request's text begins with the state resumed: its client sent
+         * all of it, and the slot keeps it like the states it saves itself */
+        if (got > 0) (void)ds4_session_save_state(slot->session);
+        if (got > 0 && effective_prompt) {
+            ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+                s->engine, ds4_session_tokens(slot->session), prompt_text + cr.key_len, effective_prompt);
+        }
+        pthread_mutex_unlock(&s->inference_mu);
+        free(held);
+        if (got > 0) {
+            slot->sent_len = got;
+            if (key_len_out) *key_len_out = cr.key_len;
+            if (loaded_path_out && cr.tail_path) *loaded_path_out = xstrdup(cr.tail_path);
+            slot_set_kv_path(s, slot, cr.tail_path ? xstrdup(cr.tail_path) : NULL);
+        }
+        ds4_chainstore_load_result_free(&cr);
+        return got;
+    }
+    ds4_kvstore_load_result lr = {0};
     pthread_mutex_lock(&s->inference_mu);
     pthread_mutex_lock(&s->kv_mu);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
@@ -11290,6 +11420,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     /* the history is on disk up to here: its next checkpoint is due in the next interval */
     if (loaded > 0) slot->continued_last_store_tokens = loaded;
     if (loaded > 0) {
+        slot->sent_len = loaded;
         if (key_len_out) *key_len_out = lr.key_len;
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         /* The file is this conversation's when it was resumed where its
@@ -12307,6 +12438,7 @@ static int server_prompt_sync(server *s, server_slot *slot,
     ds4_tokens history = *prompt;
     size_t history_images = 0;
     history.len = server_store_boundary(s->engine, images, image_count, prompt->len - 1, &history_images);
+    slot->sent_len = history.len;
     if (resume <= history.len && history.len > 0) {
         const int rc = server_session_sync(s, slot, &history, images, history_images, err, errlen);
         if (rc != 0) return rc;
@@ -13121,8 +13253,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * lists them (ds4_kvstore_store): the families whose sessions keep no
      * blocks hold such a history in memory alone, as before. */
     const bool disk = !multimodal || ds4_session_block_positions(slot->session) != 0;
-    if (disk && s->kv.enabled && cached == 0 &&
-        old_pos >= s->kv.opt.min_tokens) {
+    if (disk && server_disk_kv_min_tokens(s) >= 0 && cached == 0 &&
+        old_pos >= server_disk_kv_min_tokens(s)) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
@@ -13158,6 +13290,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    "ds4-server: cache source %s claims %d tokens but the engine resumes at %d",
                    cache_source, cached, resumed);
     }
+    slot_chain_resumed(s, slot, resumed);
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by ds4_session_sync() is written into
      * the live KV cache and can be reused by the next request. */
@@ -14926,6 +15059,7 @@ static void server_close_resources(server *s) {
         s->trace = NULL;
     }
     kv_cache_close(&s->kv);
+    ds4_chainstore_close(&s->chain);
     tool_memory_free(&s->tool_mem);
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
@@ -15405,7 +15539,10 @@ int main(int argc, char **argv) {
         ds4_session_set_prompt_states(slot->session, false);
     }
 
-    if (cfg.kv_disk_dir) {
+    if (cfg.kv_disk_dir && ds4_session_block_positions(s.slots[0].session) != 0) {
+        ds4_chainstore_open(&s.chain, cfg.kv_disk_dir, cfg.kv_disk_space_mb, cfg.kv_cache.min_tokens,
+                            s.slot_count, "ds4-server", kv_cache_log_cb, NULL);
+    } else if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
     }
@@ -15548,10 +15685,10 @@ int main(int argc, char **argv) {
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
 
-    for (int i = 0; s.kv.enabled && i < s.slot_count; i++) {
+    for (int i = 0; server_disk_kv_min_tokens(&s) >= 0 && i < s.slot_count; i++) {
         server_slot *slot = &s.slots[i];
         const ds4_tokens *tokens = ds4_session_tokens(slot->session);
-        if (!tokens || tokens->len < s.kv.opt.min_tokens) continue;
+        if (!tokens || tokens->len < server_disk_kv_min_tokens(&s)) continue;
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting resident KV cache before shutdown slot=%d tokens=%d",
                    i, tokens->len);
