@@ -63,6 +63,8 @@ check(not any("kv chain tail stored" in l for l in lines), "a tail was written w
 b = [{"role": "system", "content": "You are terse."},
      {"role": "user", "content": "Read this instead:\n" + STORY[200000:300000] + "\n\nSay 'three'."}]
 r3, p3, c3 = ask(b, "B1 another conversation")
+lines, mark = log_lines(mark)
+for l in lines: print("   ", l[l.find("kv chain"):][:150])
 if not RESTART:
     print("no restart command: the disk round trip is not checked")
     print("FAILED" if fails else "PASS")
