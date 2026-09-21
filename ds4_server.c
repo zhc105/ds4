@@ -9942,6 +9942,9 @@ struct server_slot {
      * prompt's state was saved at (server_prompt_sync).  What lies past it
      * was generated, or is the prompt's last token. */
     int sent_len;
+    /* The last prompt's length: the one position no segment may end at
+     * (kv_cache_maybe_store_continued). */
+    int prompt_end;
 
     job *assigned;
     job *running;
@@ -11332,18 +11335,21 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
 static int server_store_boundary(ds4_engine *e, const ds4_vision_span *images, size_t image_count,
                                  int target, size_t *stored_images);
 
-/* Called as a prompt is prefilled, where the live history is text its client
- * sent: the place for a checkpoint.  The chain store seals a segment at
- * every multiple of its length the prefill stops at (server_session_sync
- * ends its pieces there), and only there: the same history is sealed at the
- * same places whoever brings it. */
+/* Called as the live history grows, by a prefill piece or a decode step: the
+ * place for a checkpoint.  The chain store seals a segment at every multiple
+ * of its length the history stops at (prefill pieces and decode steps both
+ * end there), and only there: the same history is sealed at the same places
+ * whoever brings it, prompt or generation.  Not at the prompt's last token,
+ * the newline after <think>: a request that replays the turn without its
+ * reasoning renders it merged with the next one, so the segment's text
+ * would begin that request while its tokens do not. */
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!s || !slot) return;
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
     if (s->chain.enabled) {
-        if (tokens->len > slot->sent_len) return;   /* the prompt's last token is no boundary */
+        if (tokens->len == slot->prompt_end) return;
         if (tokens->len % s->chain.segment_tokens != 0 || tokens->len <= (int)slot->chain_sealed_end) return;
         const job *j = slot->running;
         size_t n = 0;
@@ -12462,6 +12468,7 @@ static int server_prompt_sync(server *s, server_slot *slot,
     size_t history_images = 0;
     history.len = server_store_boundary(s->engine, images, image_count, prompt->len - 1, &history_images);
     slot->sent_len = history.len;
+    slot->prompt_end = prompt->len;
     if (resume <= history.len && history.len > 0) {
         const int rc = server_session_sync(s, slot, &history, images, history_images, err, errlen);
         if (rc != 0) return rc;
@@ -13617,9 +13624,6 @@ decode_again:
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
-        /* No checkpoint is stored from here on: what is being generated is
-         * the conversation's history only once its client sends it back,
-         * and the prefill of that request stores it (server_progress_cb). */
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
@@ -13659,6 +13663,14 @@ decode_again:
                                     getenv("DS4_MTP_SPEC_DISABLE") == NULL;
         slot->decode_spec.ignore_eos = j->req.ignore_eos;
         slot->decode_spec.max_tokens = max_tokens - completion;
+        /* A step with drafts ends at a segment boundary, not past it: the
+         * segment is sealed from the state there (below), which exists only
+         * if the decode stops on it, as a prefill piece does. */
+        if (s->chain.enabled && disk) {
+            const int pos = ds4_session_pos(slot->session);
+            const int to_boundary = (pos / s->chain.segment_tokens + 1) * s->chain.segment_tokens - pos;
+            if (slot->decode_spec.max_tokens > to_boundary) slot->decode_spec.max_tokens = to_boundary;
+        }
         slot->decode_spec.eos_token = eos_token;
         slot->decode_spec.think_mode = j->req.think_mode;
         slot->decode_spec.temperature = temperature;
@@ -13672,6 +13684,11 @@ decode_again:
             break;
         }
         const int *toks = slot->decode_toks;
+        /* What is generated is sealed like what is prefilled.  A segment is
+         * named by its text, so it is resumed only by a request that sends
+         * that text back; a client that does not (no reasoning, an edit)
+         * leaves it a leaf nobody extends, and the budget takes it. */
+        if (disk) kv_cache_maybe_store_continued(s, slot);
 
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {

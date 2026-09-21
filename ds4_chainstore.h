@@ -6,11 +6,11 @@
  * A conversation's history on disk is a chain of files.  Every file but the
  * last is a sealed segment: the blocks of a run of positions and the state
  * at its end, written once and never again.  The server seals at every
- * multiple of SEGMENT_TOKENS its prefill stops at, so a segment is that
- * long, or a multiple of it where a boundary fell inside a picture or was
- * crossed while generating (no state stood there to seal); the store itself
- * takes whatever run it is given.  A segment names its parent, and is named
- * by what it stands for,
+ * multiple of SEGMENT_TOKENS (its prefill pieces and decode steps end
+ * there), so a segment is that long, or a multiple of it where a boundary
+ * fell inside a picture or on a prompt's last token; the store itself takes
+ * whatever run it is given.  A segment names its parent, and is named by
+ * what it stands for,
  *
  *     id = sha1(root, the history's rendered text from its beginning to the
  *               segment's end)
@@ -18,10 +18,11 @@
  * (root: the model, its routed quantization, the block size, this format;
  * the text spells each picture by its marker, so it tells pictures apart).
  * Two conversations that share a history share its segments: the second one
- * finds the file already there.  Nothing a segment says can become wrong,
- * because only text a client sent is ever sealed (ds4_server.c,
- * server_prompt_sync): what a turn generates is history once it comes back
- * in a prompt, and is sealed by that prompt's prefill.
+ * finds the file already there.  Nothing a segment says can become wrong:
+ * it is resumed only by a request whose text begins with its own, whoever
+ * wrote that text.  What a turn generated is sealed as it is generated; a
+ * client that sends it back resumes it, one that does not (no reasoning, an
+ * edit) never matches it, and it is a leaf the budget takes.
  *
  * The last file is the tail: the blocks past the last sealed segment and up
  * to two states, the live one where the slot stood when it was given up
