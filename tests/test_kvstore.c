@@ -97,6 +97,11 @@ uint64_t ds4_session_block_bytes(ds4_session *s, uint32_t from, uint32_t to) {
     (void)s;
     return (uint64_t)(to - from) * sizeof(int);
 }
+/* Reading blocks takes K/V pages, and an engine whose pool has none calls
+ * back into the server, which stores another conversation away: a test sets
+ * this to do the same from inside a load. */
+static void (*g_on_read_blocks)(void);
+
 /* a position's block row is its token, so a restore can be checked */
 int ds4_session_write_blocks(ds4_session *s, FILE *fp, uint32_t from, uint32_t to,
                              char *err, size_t errlen) {
@@ -107,6 +112,7 @@ int ds4_session_read_blocks(ds4_session *s, FILE *fp, uint32_t from, uint32_t to
                             uint32_t stored_to, char *err, size_t errlen) {
     (void)err; (void)errlen;
     if (from == 0) ds4_session_invalidate(s);
+    if (g_on_read_blocks) g_on_read_blocks();
     /* a row lands at its position: a chain's segment repeats the rows of the
      * block its parent ended in, and reading them again changes nothing */
     if ((uint32_t)s->tokens.len < from) return 1;
@@ -840,6 +846,54 @@ static void test_chain_tail_keeps_both_states(const char *dir) {
     ds4_tokens_free(&s.tokens);
 }
 
+/* A load is entered again by a store: restoring blocks takes K/V pages, and
+ * when the pool has none the server gives up another slot from inside that
+ * read, on the same thread, which writes a tail and makes room for it.  The
+ * index moves under the load, which must go on reading the chain it chose. */
+static ds4_chainstore *g_reenter_cs;
+static int g_reentered;
+
+static void reenter_store(void) {
+    if (g_reentered++) return;
+    ds4_session other = {0};
+    chain_slot slot = {0};
+    CHECK(chain_give_up(g_reenter_cs, &other, &slot, "anotherslotsconversation", NULL));
+    g_reenter_cs->budget_bytes = ds4_chainstore_bytes(g_reenter_cs);
+    ds4_chainstore_evict(g_reenter_cs, 1);   /* the least recently used leaf goes */
+    free(slot.tail);
+    ds4_tokens_free(&other.tokens);
+}
+
+static void test_chain_load_is_entered_by_a_store(const char *dir) {
+    clear_dir(dir);
+    ds4_chainstore cs;
+    chain_open(&cs, dir, 64);
+    ds4_session s = {0};
+    chain_slot old = {0}, slot = {0};
+    CHECK(chain_seal(&cs, &s, &old, "abandonedbranch"));   /* first in the index, and the victim */
+    CHECK(chain_seal(&cs, &s, &slot, SEG1));
+    CHECK(chain_seal(&cs, &s, &slot, SEG2));
+    CHECK(chain_give_up(&cs, &s, &slot, SEG2 "questionanswer", SEG2 "question"));
+    for (int i = 0; i < cs.len; i++) cs.node[i].last_used = 100 + cs.node[i].end;
+    cs.node[0].last_used = 1;
+
+    g_reenter_cs = &cs;
+    g_reentered = 0;
+    g_on_read_blocks = reenter_store;
+    ds4_chainstore_load_result lr = {0};
+    CHECK(chain_resume(&cs, SEG2 "questionanswernext", NULL, &lr) == (int)strlen(SEG2 "questionanswer"));
+    g_on_read_blocks = NULL;
+    CHECK(g_reentered > 0 && lr.own && lr.segments == 3 && lr.sealed_end == strlen(SEG2));
+    CHECK(lr.tail_path && !strcmp(lr.tail_path, slot.tail));
+    ds4_chainstore_load_result_free(&lr);
+    CHECK(chain_resume(&cs, "abandonedbranch!", NULL, NULL) == 0);        /* it was the one evicted */
+    CHECK(chain_resume(&cs, "anotherslotsconversation!", NULL, NULL) == (int)strlen("anotherslotsconversation"));
+
+    free(slot.tail);
+    ds4_chainstore_close(&cs);
+    ds4_tokens_free(&s.tokens);
+}
+
 /* Room is made leaves first, least recently used first: a segment never
  * goes from under another, and the chain a slot lives on stays though its
  * tail is not on disk. */
@@ -905,6 +959,7 @@ int main(int argc, char **argv) {
     test_chain_resumes_the_longest_segment(dir);
     test_chain_shares_what_is_the_same(dir);
     test_chain_tail_keeps_both_states(dir);
+    test_chain_load_is_entered_by_a_store(dir);
     test_chain_evicts_leaves_first(dir);
     clear_dir(dir);
     rmdir(dir);

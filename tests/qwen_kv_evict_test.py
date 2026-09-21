@@ -11,9 +11,8 @@ cache, so it only shows the eviction, not the reload):
 usage: qwen_kv_evict_test.py http://HOST:8010 MODEL STORY.txt SERVER.log
 
 A (about 2300 tokens, two pages) and B (one page) run concurrently so both slots hold pages.
-C shares B's prompt as a prefix, so the dispatcher puts it on B's slot and
-extends it past the first page; the second page is not there, so A, idle and
-older, must be evicted.
+C is B's conversation going on, so it stays on B's slot and grows it past
+its first page; the second page is not there, so A, idle, must be evicted.
 """
 import json, sys, threading, time, urllib.request
 
@@ -55,14 +54,15 @@ def check(cond, what):
 mark = len(open(LOG, errors="replace").read().splitlines())
 a = [{"role": "user", "content": "Read this:\n" + STORY[:10500] + "\n\nSay 'one'."}]
 b = [{"role": "user", "content": "Read this instead:\n" + STORY[12000:13000] + "\n\nSay 'two'."}]
-c = [{"role": "user", "content": "Read this instead:\n" + STORY[12000:23000] + "\n\nSay 'three'."}]
 a_out = []
 ta = threading.Thread(target=ask, args=(a, "A1", a_out))
 ta.start()
 time.sleep(0.3)
-ask(b, "B1")
+b_text = ask(b, "B1")
 ta.join()
-ask(c, "C1 (on B's slot, needs a second page: evicts A)")
+c = b + [{"role": "assistant", "content": b_text},
+         {"role": "user", "content": "Now read this:\n" + STORY[13000:23000] + "\n\nSay 'three'."}]
+ask(c, "C1 (B goes on, needs a second page: evicts A)")
 lines, mark = log_since(mark)
 for l in lines: print("   ", l[l.find("ds4-server"):][:120])
 check(any("kv pool full: evicted" in l for l in lines), "no eviction was logged when the pool ran out")

@@ -1,16 +1,23 @@
 """Live server test of the chain store: a conversation that grows past a
-segment's length is sealed as its prompts are prefilled, giving its slot up
-for a second conversation writes its tail and nothing else, and switching
-back resumes the first from disk at its full length, segments and tail.
-Reads the server log to see what the store did.
+segment's length is sealed as its prompts are prefilled, a slot given up
+writes its tail and nothing else, and the conversation resumes from disk at
+its full length, segments and tail.  Reads the server log to see what the
+store did.
 
-usage: qwen_disk_extend_test.py http://HOST:8000 STORY.txt SERVER.log
+A server with several slots keeps both conversations in memory, so what puts
+them on disk here is a restart: RESTART is the command that restarts the
+server (its shutdown stores every slot's tail).  Without it only the sealing
+is checked.
+
+usage: qwen_disk_extend_test.py http://HOST:8000 STORY.txt SERVER.log [RESTART]
 """
-import json, os, re, sys, time, urllib.request
+import json, os, re, subprocess, sys, time, urllib.request
 
-URL = sys.argv[1].rstrip("/") + "/v1/chat/completions"
+BASE = sys.argv[1].rstrip("/")
+URL = BASE + "/v1/chat/completions"
 STORY = open(sys.argv[2]).read()
 LOG = sys.argv[3]
+RESTART = sys.argv[4] if len(sys.argv) > 4 else None
 
 def ask(messages, tag):
     body = {"model": "qwen3.8-flash-next", "messages": messages, "max_tokens": 40,
@@ -52,17 +59,30 @@ check(len(sealed) >= 2 or any("kv chain hit" in l for l in lines),
       "a history of two segments' length sealed none (or, on a rerun, resumed none)")
 check(not any("kv chain tail stored" in l for l in lines), "a tail was written while its slot held the conversation")
 
-# Conversation B: a different story.  Giving A's slot up writes A's tail,
-# the rows past its last segment, and no segment.
+# Conversation B: a different story, on a slot of its own or on A's.
 b = [{"role": "system", "content": "You are terse."},
      {"role": "user", "content": "Read this instead:\n" + STORY[200000:300000] + "\n\nSay 'three'."}]
 r3, p3, c3 = ask(b, "B1 another conversation")
+if not RESTART:
+    print("no restart command: the disk round trip is not checked")
+    print("FAILED" if fails else "PASS")
+    sys.exit(1 if fails else 0)
+
+# The server stops: every slot writes its tail, the rows past its last
+# segment and no segment, A's hanging from the segments sealed above.
+subprocess.run(RESTART, shell=True, check=True)
+for _ in range(120):
+    try:
+        urllib.request.urlopen(BASE + "/v1/models").read()
+        break
+    except OSError:
+        time.sleep(2)
 lines, mark = log_lines(mark)
 for l in lines: print("   ", l[l.find("kv chain"):][:150])
-tails = [l for l in lines if "kv chain tail stored" in l and "reason=evict" in l]
-check(len(tails) == 1, "giving conversation A's slot up did not write exactly one tail")
-check(tails and int(re.search(r"tokens=(\d+)\.\.", tails[0]).group(1)) > 0,
-      "A's tail does not hang from a segment")
+tails = [l for l in lines if "kv chain tail stored" in l and "reason=shutdown" in l]
+check(not any("kv chain sealed" in l for l in lines), "a segment was sealed where nothing was prefilled")
+check(any(int(re.search(r"tokens=(\d+)\.\.", l).group(1)) > 16000 for l in tails),
+      "no tail hangs from A's second segment")
 
 # Back to A: the chain and its tail hold the whole history.
 a += [r2, {"role": "user", "content": "Say 'four'."}]

@@ -1,9 +1,12 @@
 """Live test of the Responses API turns a Codex session takes with pictures:
 a long text turn, the model calling view_image, the tool answering with an
 input_image block, a text turn after it, a second picture, and an edited
-history.  The replay carries no reasoning state (Codex cannot return what
-it never got), so every turn continues through the visible transcript or a
-saved state: none may recompute the history, and the pictures must be seen.
+history.  The replay carries no reasoning (this client asks for none back),
+so a turn that thought is not continued from the live history, which holds
+reasoning the request does not: it resumes from the state saved before that
+generation, one token short of the previous prompt, and recomputes no more
+than the last turn's output.  None may recompute the history, and the
+pictures must be seen.
 Reads the server log when given: a prefill piece that reports no progress,
 an engine that resumes short of what the cache claimed, a rejected or
 failed request, all fail the test.
@@ -93,23 +96,23 @@ items = [user("Background reading:\n" + STORY + "\n\nSay 'ready' and nothing els
 out, p1, _, _ = ask(items, "R1 text")
 items += out + [user("Call view_image on /tmp/red.png, then tell me the picture's dominant color in one word.")]
 out, p2, c2, call = ask(items, "R2 asks for a picture", want_call=True)
-check(c2 >= p1, "R2 did not continue from the live state")
+check(c2 >= p1 - 1, "R2 recomputed more than R1's output")
 if call:
     items += out + [tool_output(call, "/tmp/red.png", png((220, 30, 30)))]
     out, p3, c3, _ = ask(items, "R3 view_image returns the picture", expect="red")
-    check(c3 >= p2, "R3 did not continue from the live state")
+    check(c3 >= p2 - 1, "R3 recomputed more than R2's output")
     r4 = [user("Now say 'thanks' and nothing else.")]
     items += out + r4
     out, p4, c4, _ = ask(items, "R4 text after the picture")
-    check(c4 >= p3, "R4 did not continue from the live state")
+    check(c4 >= p3 - 1, "R4 recomputed more than R3's output")
     r4 += out
     items += out + [user("Call view_image on /tmp/blue.png, then name its dominant color in one word.")]
     out, p5, c5, call2 = ask(items, "R5 asks for a second picture", want_call=True)
-    check(c5 >= p4, "R5 did not continue from the live state")
+    check(c5 >= p4 - 1, "R5 recomputed more than R4's output")
     if call2:
         items += out + [tool_output(call2, "/tmp/blue.png", png((30, 60, 220)))]
         out, p6, c6, _ = ask(items, "R6 view_image returns the second picture", expect="blue")
-        check(c6 >= p5, "R6 did not continue from the live state")
+        check(c6 >= p5 - 1, "R6 recomputed more than R5's output")
         # Drop R4's exchange: the history diverges after R3's picture and must
         # resume from the state saved there, pictures and all, not start over.
         dropped = {id(i) for i in r4}

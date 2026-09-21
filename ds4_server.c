@@ -11371,16 +11371,19 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     if (loaded_path_out) *loaded_path_out = NULL;
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     if (s->chain.enabled) {
-        /* the tails other slots hold are read, not taken over */
-        const char **held = xmalloc(((size_t)s->slot_count + 1) * sizeof(*held));
+        /* The tails other slots hold are read, not taken over.  Copies: the
+         * load may store one of those slots away (server_kv_reclaim, when
+         * the restore runs the page pool dry), which lets go of its path. */
+        char **held = xmalloc(((size_t)s->slot_count + 1) * sizeof(*held));
         ds4_chainstore_load_result cr = {0};
         pthread_mutex_lock(&s->inference_mu);
         pthread_mutex_lock(&s->kv_mu);
         int n_held = 0;
         for (int i = 0; i < s->slot_count; i++)
-            if (&s->slots[i] != slot && s->slots[i].kv_path) held[n_held++] = s->slots[i].kv_path;
+            if (&s->slots[i] != slot && s->slots[i].kv_path) held[n_held++] = xstrdup(s->slots[i].kv_path);
         held[n_held] = NULL;
-        const int got = ds4_chainstore_load(&s->chain, s->engine, slot->session, prompt_text, held, &hooks, &cr);
+        const int got = ds4_chainstore_load(&s->chain, s->engine, slot->session, prompt_text,
+                                            (const char *const *)held, &hooks, &cr);
         if (got > 0) {
             memcpy(slot->chain_parent, cr.parent, sizeof(cr.parent));
             slot->chain_sealed_end = cr.sealed_end;
@@ -11395,6 +11398,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                 s->engine, ds4_session_tokens(slot->session), prompt_text + cr.key_len, effective_prompt);
         }
         pthread_mutex_unlock(&s->inference_mu);
+        for (int i = 0; i < n_held; i++) free(held[i]);
         free(held);
         if (got > 0) {
             slot->sent_len = got;
@@ -15512,12 +15516,17 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.cv, NULL);
     pthread_cond_init(&s.clients_cv, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
-    pthread_mutex_init(&s.kv_mu, NULL);
-    pthread_mutexattr_t inference_attr;
-    pthread_mutexattr_init(&inference_attr);
-    pthread_mutexattr_settype(&inference_attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(&s.inference_mu, &inference_attr);
-    pthread_mutexattr_destroy(&inference_attr);
+    /* Both are taken again by the thread that holds them: restoring a
+     * conversation from disk takes K/V pages, and a pool that has none calls
+     * server_kv_reclaim from inside that read, which stores another slot's
+     * conversation away (the store is written to be entered that way,
+     * ds4_chainstore_load). */
+    pthread_mutexattr_t recursive;
+    pthread_mutexattr_init(&recursive);
+    pthread_mutexattr_settype(&recursive, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&s.kv_mu, &recursive);
+    pthread_mutex_init(&s.inference_mu, &recursive);
+    pthread_mutexattr_destroy(&recursive);
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);

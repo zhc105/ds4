@@ -689,11 +689,19 @@ int ds4_chainstore_load(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
     chain_key key;
     if (!chain_find(cs, root, prompt_text, strlen(prompt_text), &key)) return 0;
 
-    /* the chain, from its beginning to the node resumed */
-    int *chain = malloc((size_t)(cs->len + 1) * sizeof(*chain));
+    /* The chain, from the node resumed back to its beginning: copies, marked
+     * as in use before anything is read.  Reading blocks takes K/V pages,
+     * and a server whose pool has none stores another conversation away
+     * from inside that read, on this thread: a store, which may make room
+     * and moves the index.  Nothing below looks at the index again. */
+    ds4_chainstore_node *chain = malloc((size_t)(cs->len + 1) * sizeof(*chain));
     int depth = 0;
-    for (int i = key.node; i >= 0; i = node_find(cs, cs->node[i].parent)) chain[depth++] = i;
-    const ds4_chainstore_node *last = &cs->node[key.node];
+    for (int i = key.node; i >= 0; i = node_find(cs, cs->node[i].parent)) {
+        node_touch(&cs->node[i]);
+        chain[depth] = cs->node[i];
+        chain[depth++].path = strdup(cs->node[i].path);
+    }
+    const ds4_chainstore_node *last = &chain[0];
     const uint32_t position = key.sent ? last->sent_end : last->end;
 
     const double t0 = now_sec();
@@ -701,7 +709,7 @@ int ds4_chainstore_load(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
     chain_history h = {0};
     bool ok = true;
     for (int d = depth - 1; ok && d >= 0; d--) {
-        ds4_chainstore_node *n = &cs->node[chain[d]];
+        const ds4_chainstore_node *n = &chain[d];
         FILE *fp = fopen(n->path, "rb");
         uint64_t states_at = 0, trailer_at = 0;
         ok = fp && chain_read_file(session, fp, n, position, &h, &states_at, &trailer_at, err, sizeof(err));
@@ -723,7 +731,6 @@ int ds4_chainstore_load(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
             }
         }
         if (fp) fclose(fp);
-        if (ok) node_touch(n);
     }
     const ds4_tokens *live = ds4_session_tokens(session);
     ok = ok && live && (uint32_t)live->len == position;
@@ -733,7 +740,7 @@ int ds4_chainstore_load(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
         for (int i = 0; held_tails && held_tails[i]; i++) held |= !strcmp(held_tails[i], last->path);
         /* the sealed segment the resumed history ends with: the last of the
          * chain, or the tail's parent */
-        const ds4_chainstore_node *sealed = last->tail ? (depth > 1 ? &cs->node[chain[1]] : NULL) : last;
+        const ds4_chainstore_node *sealed = last->tail ? (depth > 1 ? &chain[1] : NULL) : last;
         chain_logf(cs, DS4_KVSTORE_LOG_KVCACHE,
                    "%s: kv chain hit tokens=%u text=%u files=%d state=%s load=%.1f ms file=%s",
                    cs->log_name, position, key.text_len, depth,
@@ -757,6 +764,7 @@ int ds4_chainstore_load(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
     }
     ds4_tokens_free(&h.tokens);
     free(h.images);
+    for (int d = 0; d < depth; d++) free(chain[d].path);
     free(chain);
     return ok ? (int)position : 0;
 }
