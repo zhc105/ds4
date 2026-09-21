@@ -917,6 +917,14 @@ typedef struct {
      * client opted in via reasoning.summary. Other APIs leave this false; the
      * field is ignored on those code paths. */
     bool reasoning_summary_emit;
+    /* include: ["reasoning.encrypted_content"].  The client asks for the
+     * reasoning back in a form it can replay without reading it.  The field
+     * is opaque to the client, and DS4 is the server that produced it: a
+     * local model's chain of thought has nothing to hide from the machine it
+     * runs on, so the payload is the reasoning itself.  Replaying it makes
+     * the request render to exactly the token history the session holds,
+     * which is the contract every other API here already keeps. */
+    bool responses_encrypted_reasoning;
     /* Responses continuation contract:
      *
      * A live Responses tool loop is not a normal "new prompt with a long
@@ -4692,6 +4700,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
         char *output = NULL;
         char *input_str = NULL;
         char *summary = NULL;
+        char *encrypted = NULL;
         char *action = NULL;
         char *result = NULL;
         char *tools_json = NULL;
@@ -4789,6 +4798,15 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                     free(key);
                     goto item_fail;
                 }
+            } else if (!strcmp(key, "encrypted_content")) {
+                /* A string is the reasoning DS4 handed out for this turn; the
+                 * field is also legally null, which is not a parse error. */
+                json_ws(p);
+                if (!(**p == '"' ? json_string_replace(p, &encrypted)
+                                 : json_skip_value(p))) {
+                    free(key);
+                    goto item_fail;
+                }
             } else if (!strcmp(key, "action")) {
                 if (!json_raw_value_replace(p, &action)) {
                     free(key);
@@ -4840,6 +4858,7 @@ item_fail:
             free(output);
             free(input_str);
             free(summary);
+            free(encrypted);
             free(action);
             free(result);
             free(tools_json);
@@ -4860,6 +4879,7 @@ item_fail:
             free(output);
             free(input_str);
             free(summary);
+            free(encrypted);
             free(action);
             free(result);
             free(tools_json);
@@ -4888,6 +4908,7 @@ item_fail:
             free(output);
             free(input_str);
             free(summary);
+            free(encrypted);
             free(action);
             free(result);
             free(tools_json);
@@ -4913,6 +4934,7 @@ item_fail:
             free(output);
             free(input_str);
             free(summary);
+            free(encrypted);
             free(action);
             free(result);
             free(tools_json);
@@ -5006,15 +5028,25 @@ item_fail:
             }
             chat_msgs_push(msgs, msg);
         } else if (!strcmp(t, "reasoning")) {
-            /* Stash so it merges into the next assistant message. summary is the
-             * short-form list, content is the verbose chain. Either can be empty. */
-            if (summary && summary[0]) {
+            /* Stash so it merges into the next assistant message.
+             * encrypted_content is what DS4 itself emitted for this turn when
+             * the client asked to be given the reasoning back: the exact text
+             * its own renderer will reproduce, so the replay renders to the
+             * token history the session already holds.  summary is the
+             * short-form list and content the verbose chain; either can be
+             * empty, and neither is joined to the payload above. */
+            if (encrypted && encrypted[0]) {
                 if (pending_reasoning.len) buf_putc(&pending_reasoning, '\n');
-                buf_puts(&pending_reasoning, summary);
-            }
-            if (content && content[0]) {
-                if (pending_reasoning.len) buf_putc(&pending_reasoning, '\n');
-                buf_puts(&pending_reasoning, content);
+                buf_puts(&pending_reasoning, encrypted);
+            } else {
+                if (summary && summary[0]) {
+                    if (pending_reasoning.len) buf_putc(&pending_reasoning, '\n');
+                    buf_puts(&pending_reasoning, summary);
+                }
+                if (content && content[0]) {
+                    if (pending_reasoning.len) buf_putc(&pending_reasoning, '\n');
+                    buf_puts(&pending_reasoning, content);
+                }
             }
         } else if (!strcmp(t, "local_shell_call") || !strcmp(t, "web_search_call") ||
                    !strcmp(t, "tool_search_call") || !strcmp(t, "image_generation_call"))
@@ -5075,6 +5107,7 @@ item_fail:
                     free(output);
                     free(input_str);
                     free(summary);
+                    free(encrypted);
                     free(action);
                     free(result);
                     free(tools_json);
@@ -5116,6 +5149,7 @@ item_fail:
             free(output);
             free(input_str);
             free(summary);
+            free(encrypted);
             free(action);
             free(result);
             free(tools_json);
@@ -5136,6 +5170,7 @@ item_fail:
         free(output);
         free(input_str);
         free(summary);
+        free(encrypted);
         free(action);
         free(result);
         free(tools_json);
@@ -5163,6 +5198,35 @@ item_fail:
 fail:
     buf_free(&pending_reasoning);
     return false;
+}
+
+/* Responses API `include: [...]`.  Only one entry concerns DS4:
+ * "reasoning.encrypted_content" asks for the turn's reasoning back as a
+ * payload the client stores and replays without reading it.  A client that
+ * asks for it replays it, so its next request renders to the same text as
+ * the session's own history and needs no visible-transcript shortcut. */
+static bool parse_responses_include(const char **p, bool *encrypted_reasoning) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    if (**p != '[') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p == '"') {
+            char *s = NULL;
+            if (!json_string(p, &s)) return false;
+            if (!strcmp(s, "reasoning.encrypted_content")) *encrypted_reasoning = true;
+            free(s);
+        } else if (!json_skip_value(p)) {
+            return false;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    return true;
 }
 
 /* Responses API has `reasoning: {"effort": "...", "summary": "..."}`. effort
@@ -5376,6 +5440,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             r->top_p_set = true;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "include")) {
+            if (!parse_responses_include(&p, &r->responses_encrypted_reasoning)) {
                 free(key);
                 goto bad;
             }
@@ -8112,6 +8181,8 @@ typedef struct {
     int message_index;     /* output_index of the assistant message item */
     int next_output_index; /* monotonic counter for upcoming output items */
     int sequence;          /* monotonic per-event sequence_number Codex consumes */
+    bool summary_emit;     /* the client opted into reasoning summaries */
+    bool encrypted_emit;   /* include: ["reasoning.encrypted_content"] */
 } responses_stream;
 
 static void responses_stream_init(const request *r, responses_stream *st) {
@@ -8122,6 +8193,8 @@ static void responses_stream_init(const request *r, responses_stream *st) {
     responses_random_id(st->message_id, sizeof(st->message_id), "msg_");
     st->reasoning_index = -1;
     st->message_index = -1;
+    st->summary_emit = r->reasoning_summary_emit;
+    st->encrypted_emit = r->responses_encrypted_reasoning;
 }
 
 static void responses_stream_free(responses_stream *st) {
@@ -8239,17 +8312,23 @@ static bool responses_sse_reasoning_done(int fd, responses_stream *st,
      * summary_part.done before the output_item.done so clients that key off
      * part lifecycle don't see a dangling open summary part. */
     buf b = {0};
-    buf_printf(&b,
-        "{\"type\":\"response.reasoning_summary_text.done\","
-        "\"item_id\":\"%s\",\"output_index\":%d,\"summary_index\":0,\"text\":",
-        st->reasoning_id, st->reasoning_index);
-    json_escape_n(&b, st->reasoning_text.ptr ? st->reasoning_text.ptr : "",
-                  st->reasoning_text.len);
-    buf_putc(&b, '}');
-    bool ok = responses_sse_emit_event(fd, st, b.ptr);
-    if (!ok) {
-        buf_free(&b);
-        return false;
+    bool ok = true;
+    /* A client that only asked for the reasoning back (encrypted_content) saw
+     * no summary deltas and must see no summary lifecycle either: its item
+     * opens and closes carrying the payload alone. */
+    if (st->summary_emit) {
+        buf_printf(&b,
+            "{\"type\":\"response.reasoning_summary_text.done\","
+            "\"item_id\":\"%s\",\"output_index\":%d,\"summary_index\":0,\"text\":",
+            st->reasoning_id, st->reasoning_index);
+        json_escape_n(&b, st->reasoning_text.ptr ? st->reasoning_text.ptr : "",
+                      st->reasoning_text.len);
+        buf_putc(&b, '}');
+        ok = responses_sse_emit_event(fd, st, b.ptr);
+        if (!ok) {
+            buf_free(&b);
+            return false;
+        }
     }
 
     if (st->reasoning_summary_started) {
@@ -8274,12 +8353,18 @@ static bool responses_sse_reasoning_done(int fd, responses_stream *st,
         "{\"type\":\"response.output_item.done\",\"output_index\":%d,"
         "\"item\":{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"%s\",\"summary\":[",
         st->reasoning_index, st->reasoning_id, item_status);
-    if (st->reasoning_text.len) {
+    if (st->summary_emit && st->reasoning_text.len) {
         buf_puts(&b, "{\"type\":\"summary_text\",\"text\":");
         json_escape_n(&b, st->reasoning_text.ptr, st->reasoning_text.len);
         buf_putc(&b, '}');
     }
-    buf_puts(&b, "]}}");
+    buf_putc(&b, ']');
+    if (st->encrypted_emit) {
+        buf_puts(&b, ",\"encrypted_content\":");
+        json_escape_n(&b, st->reasoning_text.ptr ? st->reasoning_text.ptr : "",
+                      st->reasoning_text.len);
+    }
+    buf_puts(&b, "}}");
     ok = responses_sse_emit_event(fd, st, b.ptr);
     buf_free(&b);
     return ok;
@@ -8579,12 +8664,18 @@ static bool responses_sse_completed(int fd, const request *r,
         buf_printf(&b,
             "{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"%s\",\"summary\":[",
             st->reasoning_id, reasoning_status);
-        if (st->reasoning_text.len) {
+        if (st->summary_emit && st->reasoning_text.len) {
             buf_puts(&b, "{\"type\":\"summary_text\",\"text\":");
             json_escape_n(&b, st->reasoning_text.ptr, st->reasoning_text.len);
             buf_putc(&b, '}');
         }
-        buf_puts(&b, "]}");
+        buf_putc(&b, ']');
+        if (st->encrypted_emit) {
+            buf_puts(&b, ",\"encrypted_content\":");
+            json_escape_n(&b, st->reasoning_text.ptr ? st->reasoning_text.ptr : "",
+                          st->reasoning_text.len);
+        }
+        buf_putc(&b, '}');
         wrote = true;
     }
     if (st->message_emitted_any) {
@@ -8628,8 +8719,12 @@ static bool responses_sse_stream_update(int fd, const request *r,
 
     /* The client only sees reasoning if it explicitly opted in via
      * reasoning.summary. Otherwise we still need to walk past <think>...</think>
-     * to find the user-visible text, but we suppress the per-chunk emission. */
-    const bool emit_reasoning = r->reasoning_summary_emit;
+     * to find the user-visible text, but we suppress the per-chunk emission.
+     * A client that asked for encrypted_content instead gets no summary event
+     * at all, yet the item must still be opened and the text kept: the payload
+     * it replays is built from it when the item closes. */
+    const bool emit_reasoning = r->reasoning_summary_emit ||
+                                r->responses_encrypted_reasoning;
 
     if (st->mode == RESP_STREAM_THINKING) {
         if (!st->checked_think_prefix) {
@@ -8681,13 +8776,15 @@ static bool responses_sse_stream_update(int fd, const request *r,
                     if (!responses_sse_reasoning_added(fd, st)) return false;
                     st->reasoning_item_opened = true;
                 }
-                if (!st->reasoning_summary_started) {
-                    if (!responses_sse_reasoning_summary_part_added(fd, st)) return false;
-                    st->reasoning_summary_started = true;
+                if (st->summary_emit) {
+                    if (!st->reasoning_summary_started) {
+                        if (!responses_sse_reasoning_summary_part_added(fd, st)) return false;
+                        st->reasoning_summary_started = true;
+                    }
+                    if (!responses_sse_reasoning_delta(fd, st,
+                                                       raw + st->emit_pos,
+                                                       limit - st->emit_pos)) return false;
                 }
-                if (!responses_sse_reasoning_delta(fd, st,
-                                                   raw + st->emit_pos,
-                                                   limit - st->emit_pos)) return false;
                 buf_append(&st->reasoning_text, raw + st->emit_pos, limit - st->emit_pos);
                 st->reasoning_emitted_any = true;
             }
@@ -8845,18 +8942,27 @@ static bool responses_final_response(int fd, bool enable_cors,
     }
     buf_puts(&b, ",\"output\":[");
     bool wrote = false;
-    if (reasoning && reasoning[0] && r->reasoning_summary_emit) {
+    if (reasoning && reasoning[0] &&
+        (r->reasoning_summary_emit || r->responses_encrypted_reasoning)) {
         /* Non-streaming path runs after the worker has post-processed the
          * generation, so any reasoning here came from a parsed assistant turn
          * where </think> was observed (otherwise the reasoning text would be
          * empty). Tag it with the response-level item_status which still flips
          * to incomplete/failed when finish is length/error. */
         buf_printf(&b,
-            "{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"%s\","
-            "\"summary\":[{\"type\":\"summary_text\",\"text\":",
+            "{\"id\":\"%s\",\"type\":\"reasoning\",\"status\":\"%s\",\"summary\":[",
             reasoning_id, item_status);
-        json_escape(&b, reasoning);
-        buf_puts(&b, "}]}");
+        if (r->reasoning_summary_emit) {
+            buf_puts(&b, "{\"type\":\"summary_text\",\"text\":");
+            json_escape(&b, reasoning);
+            buf_putc(&b, '}');
+        }
+        buf_putc(&b, ']');
+        if (r->responses_encrypted_reasoning) {
+            buf_puts(&b, ",\"encrypted_content\":");
+            json_escape(&b, reasoning);
+        }
+        buf_putc(&b, '}');
         wrote = true;
     }
     if (text && text[0]) {
@@ -12662,7 +12768,11 @@ static char *build_responses_visible_assistant_suffix(const request *r,
      * in tool calls.  A client that does replay final-answer reasoning will not
      * match this visible shortcut and can still use exact token-prefix replay. */
     if (r && ds4_think_mode_enabled(r->think_mode)) {
-        const bool replayed = r->reasoning_summary_emit && calls && calls->len > 0;
+        /* A client given the reasoning back through encrypted_content replays
+         * it on every turn, tool call or final answer alike, so the visible
+         * prefix it will send is the rendered turn in full. */
+        const bool replayed = (r->reasoning_summary_emit && calls && calls->len > 0) ||
+                              r->responses_encrypted_reasoning;
         append_reasoning_close_for_syntax(&suffix, syntax,
                                           replayed ? reasoning : NULL);
     }
@@ -16132,6 +16242,63 @@ static void test_responses_input_tool_search_output_loads_tools(void) {
     TEST_ASSERT(msgs.v[0].calls.len == 1);
     TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].name, "tool_search"));
     TEST_ASSERT(strstr(msgs.v[1].content, "mcp__perplexity__") != NULL);
+
+    buf_free(&loaded);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+}
+
+/* The reasoning DS4 hands back through encrypted_content comes home in the
+ * replay and renders where it was sampled, so the request reads as the token
+ * history the session already holds and continues from it instead of
+ * prefilling a transcript with the thinking hollowed out. */
+static void test_responses_encrypted_reasoning_round_trips(void) {
+    bool want = false;
+    const char *inc = "[\"reasoning.encrypted_content\"]";
+    TEST_ASSERT(parse_responses_include(&inc, &want) && want);
+    want = false;
+    inc = "[\"message.output_text.logprobs\"]";
+    TEST_ASSERT(parse_responses_include(&inc, &want) && !want);
+    want = false;
+    inc = "null";
+    TEST_ASSERT(parse_responses_include(&inc, &want) && !want);
+
+    const char *json =
+        "["
+        "{\"type\":\"message\",\"role\":\"user\","
+        "\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]},"
+        "{\"type\":\"reasoning\",\"summary\":[],"
+        "\"encrypted_content\":\"greet back\"},"
+        "{\"type\":\"message\",\"role\":\"assistant\","
+        "\"content\":[{\"type\":\"output_text\",\"text\":\"Hello!\"}]},"
+        "{\"type\":\"message\",\"role\":\"user\","
+        "\"content\":[{\"type\":\"input_text\",\"text\":\"2+2?\"}]}"
+        "]";
+    const char *p = json;
+    chat_msgs msgs = {0};
+    buf loaded = {0};
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_responses_input(&p, &msgs, &loaded, &orders));
+    TEST_ASSERT(msgs.len == 3);
+    TEST_ASSERT(!strcmp(msgs.v[1].role, "assistant"));
+    TEST_ASSERT(msgs.v[1].reasoning && !strcmp(msgs.v[1].reasoning, "greet back"));
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, &orders, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt && strstr(prompt, "<think>\ngreet back\n</think>\n\nHello!"));
+    free(prompt);
+
+    /* A null payload is not a parse error and leaves the turn without it. */
+    const char *none =
+        "[{\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":null},"
+        "{\"type\":\"message\",\"role\":\"assistant\","
+        "\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}]";
+    p = none;
+    chat_msgs plain = {0};
+    TEST_ASSERT(parse_responses_input(&p, &plain, &loaded, &orders));
+    TEST_ASSERT(plain.len == 1);
+    TEST_ASSERT(!plain.v[0].reasoning || !plain.v[0].reasoning[0]);
+    chat_msgs_free(&plain);
 
     buf_free(&loaded);
     tool_schema_orders_free(&orders);
@@ -21489,6 +21656,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_function_named_tool_search_stays_function_call();
     test_responses_namespace_tool_schemas_restore_wire_namespace();
     test_responses_input_tool_search_output_loads_tools();
+    test_responses_encrypted_reasoning_round_trips();
     test_responses_input_tool_search_output_rejects_bad_tools();
     test_responses_input_function_call_namespace_round_trips_to_dsml();
     test_responses_output_sends_tool_search_call_item();
