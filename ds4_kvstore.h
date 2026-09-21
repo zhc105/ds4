@@ -135,6 +135,8 @@ typedef struct {
 typedef struct {
     const ds4_tokens *tokens;
     int store_len;
+    int sent_len;          /* where the client's text ended when the history goes on with what was
+                            * generated after it: the saved state there is stored beside the live one (0: none) */
     const char *reason;
     bool checkpoint;       /* a state to keep for the file's life, not only until the next store */
     const char *key_override;
@@ -149,6 +151,7 @@ typedef struct {
 typedef struct {
     int tokens;            /* the position resumed */
     int history_tokens;    /* the file's whole history: more when an earlier state was resumed */
+    bool own;              /* resumed where the file's conversation stood: the file is its to extend */
     uint32_t key_len;
     uint8_t quant_bits;
     uint8_t ext_flags;

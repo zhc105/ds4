@@ -937,11 +937,8 @@ typedef struct {
      * A tool-output-only request has no stateless prefix to match.  If the live
      * call_id binding is gone by the time the worker executes it, DS4 must ask
      * for a full replay rather than cold-prefilling a prompt that starts with a
-     * naked tool result.  Similarly, if live state is gone, a reasoning-mode
-     * tool replay must contain the prior reasoning item (or an equivalent
-     * opaque reasoning state from a future implementation). */
+     * naked tool result. */
     bool responses_requires_live_tool_state;
-    bool responses_requires_live_reasoning;
     stop_list responses_live_call_ids;
     char *responses_live_suffix_text;
     bool anthropic_requires_live_tool_state;
@@ -3855,23 +3852,14 @@ static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
  *   2. the same request replays the prior assistant call item.
  *
  * Case 1 is the fast, protocol-native continuation path: keep the live KV and
- * append only the tool result.  Case 2 is stateless replay after restart or
- * branching.  In thinking mode, case 2 is less faithful if the replay omits
- * reasoning state for the assistant call.  Official Responses clients can
- * carry that state with reasoning items / encrypted reasoning content; when
- * they do not, the request is still renderable as visible history.  Mark that
- * condition so generate_job() can prefer live / visible checkpoints and emit a
- * warning if it must fall back to visible replay instead of aborting the
- * session. */
+ * append only the tool result.  Case 2 is stateless replay, which is
+ * rendered as the client sent it: with the reasoning it carries (reasoning
+ * items, encrypted reasoning content) or with none. */
 static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
-                                            ds4_think_mode think_mode,
                                             bool *requires_live_tool_state,
-                                            bool *requires_live_reasoning,
                                             char *err, size_t errlen) {
     if (!msgs) return true;
     if (requires_live_tool_state) *requires_live_tool_state = false;
-    if (requires_live_reasoning) *requires_live_reasoning = false;
-    const bool needs_reasoning = ds4_think_mode_enabled(think_mode);
 
     /* Map call_id -> the nearest preceding assistant message that declares it,
      * built as we scan forward. This replaces a per-id backward rescan
@@ -3908,15 +3896,7 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
                 ok = false;
                 break;
             }
-            if (!prior) {
-                if (requires_live_tool_state) *requires_live_tool_state = true;
-                continue;
-            }
-            if (needs_reasoning &&
-                (!prior->reasoning || !prior->reasoning[0]))
-            {
-                if (requires_live_reasoning) *requires_live_reasoning = true;
-            }
+            if (!prior && requires_live_tool_state) *requires_live_tool_state = true;
         }
         id_list_free(&ids);
     }
@@ -3940,20 +3920,15 @@ static void responses_prepare_live_continuation(request *r,
         if (strcmp(m->role, "tool") && strcmp(m->role, "function")) break;
         tail_start--;
     }
-    if (tail_start == msgs->len) return;
+    /* Only a request of tool outputs alone: its call ids are all it says of
+     * the turn it answers, and they name the live generation.  One that
+     * replays the turn says what it holds of it, reasoning or none, and is
+     * told from by that text like any other request. */
+    if (tail_start == msgs->len || tail_start > 0) return;
 
     stop_list_clear(&r->responses_live_call_ids);
-    if (tail_start > 0) {
-        const int anchor = tail_start - 1;
-        const chat_msg *assistant = &msgs->v[anchor];
-        if (strcmp(assistant->role, "assistant") || assistant->calls.len == 0) return;
-        for (int i = 0; i < assistant->calls.len; i++) {
-            id_list_push_unique(&r->responses_live_call_ids, assistant->calls.v[i].id);
-        }
-    } else {
-        for (int i = tail_start; i < msgs->len; i++) {
-            chat_msg_collect_tool_call_ids(&msgs->v[i], &r->responses_live_call_ids);
-        }
+    for (int i = tail_start; i < msgs->len; i++) {
+        chat_msg_collect_tool_call_ids(&msgs->v[i], &r->responses_live_call_ids);
     }
     if (r->responses_live_call_ids.len == 0) return;
 
@@ -4045,6 +4020,8 @@ static void anthropic_prepare_live_continuation(request *r,
         tail_start--;
     }
     if (tail_start == tail_end) return;
+    /* only a request of tool results alone (responses_prepare_live_continuation) */
+    for (int i = 0; i < tail_start; i++) if (!role_is_system(msgs->v[i].role)) return;
 
     stop_list_clear(&r->anthropic_live_call_ids);
     for (int i = tail_start; i < msgs->len; i++) {
@@ -5541,9 +5518,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
+    if (!responses_validate_tool_outputs(s, &msgs,
                                          &r->responses_requires_live_tool_state,
-                                         &r->responses_requires_live_reasoning,
                                          err, errlen)) {
         chat_msgs_free(&msgs);
         buf_free(&combined_tool_schemas);
@@ -9940,31 +9916,13 @@ typedef struct {
 
 typedef struct {
     bool valid;
-    /* Token frontier of a live assistant tool-call turn. Continuing from this
-     * point preserves hidden thinking and sampled DSML bytes that are not
-     * necessarily present in the client-visible replay. */
+    /* Token frontier of a live assistant tool-call turn. */
     int live_tokens;
-    /* Optional rendered conversation text that the client is expected to replay.
-     * Responses uses this because visible replay can omit hidden reasoning.
-     * Anthropic currently uses only the call-id side of the state. */
-    char *visible_text;
-    size_t visible_len;
-    /* Tool-call ids generated at the same live frontier. A following tool
-     * result for these ids is a direct protocol continuation and should not
-     * trigger prompt-prefix matching or checkpoint canonicalization. */
+    /* Tool-call ids generated at that frontier.  A following tool result for
+     * these ids names the generation it continues: a direct protocol
+     * continuation, which needs no prompt-prefix matching. */
     stop_list call_ids;
 } live_tool_state;
-
-typedef struct {
-    bool valid;
-    /* Token frontier of the live sampled session.  The visible text below is
-     * what clients will replay, but the payload at this frontier may also
-     * contain hidden thinking tokens that are intentionally absent from that
-     * visible replay. */
-    int live_tokens;
-    char *visible_text;
-    size_t visible_len;
-} visible_live_state;
 
 struct server_slot {
     server *srv;
@@ -9972,7 +9930,6 @@ struct server_slot {
     ds4_session *session;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
-    visible_live_state thinking_live;
     int continued_last_store_tokens;
     char *kv_path;   /* the file the live conversation was loaded from or last stored to */
 
@@ -10321,9 +10278,6 @@ static void tool_memory_free(tool_memory *m) {
 static void live_tool_state_clear_locked(live_tool_state *st) {
     if (!st) return;
     stop_list_clear(&st->call_ids);
-    free(st->visible_text);
-    st->visible_text = NULL;
-    st->visible_len = 0;
     st->valid = false;
     st->live_tokens = 0;
 }
@@ -10335,69 +10289,26 @@ static void live_tool_state_free(live_tool_state *st) {
     memset(st, 0, sizeof(*st));
 }
 
-static void visible_live_clear_locked(visible_live_state *st) {
-    if (!st) return;
-    free(st->visible_text);
-    st->visible_text = NULL;
-    st->visible_len = 0;
-    st->live_tokens = 0;
-    st->valid = false;
-}
-
-static void visible_live_free(visible_live_state *st) {
-    if (!st) return;
-    visible_live_clear_locked(st);
-    memset(st, 0, sizeof(*st));
-}
-
-static void thinking_live_clear(server *s, server_slot *slot) {
-    if (!s || !slot) return;
-    pthread_mutex_lock(&s->tool_mu);
-    visible_live_clear_locked(&slot->thinking_live);
-    pthread_mutex_unlock(&s->tool_mu);
-}
-
-static void thinking_live_remember(server *s, server_slot *slot,
-                                   const char *visible_text) {
-    if (!s || !slot || !visible_text || !visible_text[0]) return;
-    pthread_mutex_lock(&s->tool_mu);
-    visible_live_clear_locked(&slot->thinking_live);
-    slot->thinking_live.visible_text = xstrdup(visible_text);
-    slot->thinking_live.visible_len = strlen(visible_text);
-    slot->thinking_live.live_tokens = ds4_session_pos(slot->session);
-    slot->thinking_live.valid = true;
-    pthread_mutex_unlock(&s->tool_mu);
-}
-
-static void responses_live_remember(server *s, server_slot *slot,
-                                    const char *visible_text,
-                                    const tool_calls *calls) {
-    if (!s || !slot || !visible_text || !visible_text[0]) return;
-    pthread_mutex_lock(&s->tool_mu);
-    live_tool_state_clear_locked(&slot->responses_live);
-    slot->responses_live.visible_text = xstrdup(visible_text);
-    slot->responses_live.visible_len = strlen(visible_text);
-    if (calls) {
-        for (int i = 0; i < calls->len; i++) {
-            id_list_push_unique(&slot->responses_live.call_ids, calls->v[i].id);
-        }
-    }
-    slot->responses_live.live_tokens = ds4_session_pos(slot->session);
-    slot->responses_live.valid = true;
-    pthread_mutex_unlock(&s->tool_mu);
-}
-
-static void anthropic_live_remember(server *s, server_slot *slot,
-                                    const tool_calls *calls) {
+/* Remember the tool calls a turn ended with, at the frontier it left. */
+static void live_tool_state_remember(server *s, server_slot *slot, live_tool_state *st,
+                                     const tool_calls *calls) {
     if (!s || !slot || !calls || calls->len == 0) return;
     pthread_mutex_lock(&s->tool_mu);
-    live_tool_state_clear_locked(&slot->anthropic_live);
+    live_tool_state_clear_locked(st);
     for (int i = 0; i < calls->len; i++) {
-        id_list_push_unique(&slot->anthropic_live.call_ids, calls->v[i].id);
+        id_list_push_unique(&st->call_ids, calls->v[i].id);
     }
-    slot->anthropic_live.live_tokens = ds4_session_pos(slot->session);
-    slot->anthropic_live.valid = slot->anthropic_live.call_ids.len > 0;
+    st->live_tokens = ds4_session_pos(slot->session);
+    st->valid = st->call_ids.len > 0;
     pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void responses_live_remember(server *s, server_slot *slot, const tool_calls *calls) {
+    if (slot) live_tool_state_remember(s, slot, &slot->responses_live, calls);
+}
+
+static void anthropic_live_remember(server *s, server_slot *slot, const tool_calls *calls) {
+    if (slot) live_tool_state_remember(s, slot, &slot->anthropic_live, calls);
 }
 
 static void responses_live_clear(server *s, server_slot *slot) {
@@ -10417,7 +10328,6 @@ static void anthropic_live_clear(server *s, server_slot *slot) {
 static void request_live_state_clear(server *s, server_slot *slot) {
     responses_live_clear(s, slot);
     anthropic_live_clear(s, slot);
-    thinking_live_clear(s, slot);
 }
 
 static bool responses_live_has_call_id(server *s, const char *id) {
@@ -10663,8 +10573,6 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 
 #define KV_CACHE_FIXED_HEADER DS4_KVSTORE_FIXED_HEADER
 #define KV_EXT_TOOL_MAP DS4_KVSTORE_EXT_TOOL_MAP
-#define KV_EXT_RESPONSES_VISIBLE DS4_KVSTORE_EXT_RESPONSES_VISIBLE
-#define KV_EXT_THINKING_VISIBLE DS4_KVSTORE_EXT_THINKING_VISIBLE
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
 #define KV_TOOL_MAP_MAGIC2 'M'
@@ -11118,15 +11026,14 @@ static void slot_set_kv_path(server *s, server_slot *slot, char *path) {
     pthread_mutex_unlock(&s->kv_mu);
 }
 
-/* Store the slot's live prefix, to its conversation's file when it has one. */
-static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
-                                            const ds4_tokens *tokens,
-                                            int store_len, const char *reason,
-                                            bool checkpoint,
-                                            const char *cache_text_override,
-                                            uint8_t cache_text_ext,
-                                            const char *cache_text_key,
-                                            bool inference_locked) {
+/* Store the slot's live prefix, to its conversation's file when it has one.
+ * sent_len: where the client's text ended when the prefix goes on with what
+ * was generated after it (ds4_kvstore_store_request). */
+static bool kv_cache_store_live_prefix_at(server *s, server_slot *slot,
+                                          const ds4_tokens *tokens,
+                                          int store_len, int sent_len, const char *reason,
+                                          bool checkpoint,
+                                          bool inference_locked) {
     if (!s || !slot) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
@@ -11143,11 +11050,9 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     const ds4_kvstore_store_request req = {
         .tokens = tokens,
         .store_len = store_len,
+        .sent_len = sent_len,
         .reason = reason,
         .checkpoint = checkpoint,
-        .key_override = cache_text_override,
-        .key_ext = cache_text_ext,
-        .key_kind = cache_text_key,
         .hooks = &hooks,
         .extend_path = slot->kv_path,
     };
@@ -11168,8 +11073,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
 static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
-    return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason, true,
-                                           NULL, 0, NULL, false);
+    return kv_cache_store_live_prefix_at(s, slot, tokens, store_len, 0, reason, true, false);
 }
 
 /* Before the live session is stored away for another conversation, mark
@@ -11193,40 +11097,22 @@ static void kv_cache_store_current(server *s, server_slot *slot,
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
 
-    char *visible_text = NULL;
-    uint8_t visible_ext = 0;
-    const char *visible_key = NULL;
-    pthread_mutex_lock(&s->tool_mu);
-    if (slot->responses_live.valid &&
-        slot->responses_live.live_tokens == tokens->len &&
-        slot->responses_live.visible_text &&
-        slot->responses_live.visible_text[0])
-    {
-        visible_text = xstrdup(slot->responses_live.visible_text);
-        visible_ext = KV_EXT_RESPONSES_VISIBLE;
-        visible_key = "responses-visible";
-    } else if (slot->thinking_live.valid &&
-               slot->thinking_live.live_tokens == tokens->len &&
-               slot->thinking_live.visible_text &&
-               slot->thinking_live.visible_text[0])
-    {
-        visible_text = xstrdup(slot->thinking_live.visible_text);
-        visible_ext = KV_EXT_THINKING_VISIBLE;
-        visible_key = "thinking-visible";
+    /* Where the conversation stands as its slot is given up or the server
+     * stops: the live state, which the next store replaces.  It ends with
+     * what the last turn generated, which is the conversation's history
+     * only if its client sends it back as it was; the state saved where the
+     * client's own text ended (server_prompt_sync) goes along for the one
+     * that does not. */
+    int sent_len = 0;
+    const ds4_tokens *saved;
+    const ds4_vision_identity *ids;
+    size_t n_ids;
+    for (size_t i = 0; (saved = ds4_session_saved_state(slot->session, i, &ids, &n_ids)); i++) {
+        if (saved->len > sent_len && saved->len < tokens->len &&
+            memcmp(saved->v, tokens->v, (size_t)saved->len * sizeof(int)) == 0) sent_len = saved->len;
     }
-    pthread_mutex_unlock(&s->tool_mu);
-
-    /* A visible live checkpoint can contain hidden reasoning that the client
-     * intentionally does not replay.  For disk recovery after a session switch,
-     * key that payload by the visible protocol transcript, not by rendering the
-     * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
-     * tokenizes only the visible suffix that follows this key. */
-    /* where the conversation stands as its slot is given up or the server
-     * stops: the live state, which the next store replaces */
-    kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason, false,
-                                    visible_text, visible_ext, visible_key,
-                                    inference_locked);
-    free(visible_text);
+    kv_cache_store_live_prefix_at(s, slot, tokens, tokens->len, sent_len, reason, false,
+                                  inference_locked);
 }
 
 /* The engine's K/V page pool ran dry on the inference thread, which holds
@@ -11385,11 +11271,9 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   ds4_tokens *effective_prompt,
                                   size_t *key_len_out,
                                   char **loaded_path_out,
-                                  uint8_t *loaded_ext_flags_out,
                                   bool responses_protocol) {
     if (!s || !slot) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
-    if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
@@ -11398,22 +11282,22 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
     pthread_mutex_unlock(&s->kv_mu);
-    /* a file's whole history is its conversation where a store left it: a
-     * state of the slot's own, like the turn ends it saves */
-    if (loaded > 0 && lr.tokens == lr.history_tokens) (void)ds4_session_save_state(slot->session);
+    /* where a store left its conversation is a state of the slot's own,
+     * like the ones it saves before a generation: the request's text begins
+     * with it, so its client sent all of it */
+    if (loaded > 0 && lr.own) (void)ds4_session_save_state(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
     /* the history is on disk up to here: its next checkpoint is due in the next interval */
     if (loaded > 0) slot->continued_last_store_tokens = loaded;
     if (loaded > 0) {
         if (key_len_out) *key_len_out = lr.key_len;
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
-        if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
-        /* The file is this conversation's only when its whole history was
-         * resumed (a restart, a slot brought back from disk).  An earlier
-         * state of it begins another conversation, or a branch its own
-         * slot can no longer resume from memory: that one reads the file
-         * and stores a new one. */
-        slot_set_kv_path(s, slot, lr.path && lr.tokens == lr.history_tokens ? xstrdup(lr.path) : NULL);
+        /* The file is this conversation's when it was resumed where its
+         * conversation stood (ds4_kvstore_load_result.own: a restart, a
+         * slot brought back from disk).  An earlier state of it begins
+         * another conversation, or a branch its own slot can no longer
+         * resume from memory: that one reads the file and stores a new one. */
+        slot_set_kv_path(s, slot, lr.path && lr.own ? xstrdup(lr.path) : NULL);
     }
     ds4_kvstore_load_result_free(&lr);
     return loaded;
@@ -11472,12 +11356,10 @@ static bool build_prompt_after_state(server *s, request *req,
  * on from the state's tokens like any other continuation. */
 static int kv_cache_try_load(server *s, server_slot *slot, request *req,
                              ds4_tokens *effective_prompt,
-                             char **loaded_path_out,
-                             uint8_t *loaded_ext_flags_out) {
+                             char **loaded_path_out) {
     size_t key_len = 0;
     const int loaded = kv_cache_try_load_text(s, slot, req->prompt_text, NULL, &key_len,
-                                              loaded_path_out, loaded_ext_flags_out,
-                                              req->api == API_RESPONSES);
+                                              loaded_path_out, req->api == API_RESPONSES);
     if (loaded <= 0) return 0;
     pthread_mutex_lock(&s->inference_mu);
     size_t n_ids = 0;
@@ -11496,24 +11378,6 @@ static int kv_cache_try_load(server *s, server_slot *slot, request *req,
     return 0;
 }
 
-/* `text` as a client that never saw the reasoning replays it: every closed
- * <think> block emptied, the way append_qwen_turns renders a turn whose
- * reasoning is absent.  An open block at the end (the assistant prefix
- * the state stops at) is kept. */
-static void qwen_visible_text(buf *out, const char *text, size_t len) {
-    static const char open[] = "<think>\n", close[] = "\n</think>";
-    const char *p = text, *end = text + len;
-    while (p < end) {
-        const char *think = memmem(p, (size_t)(end - p), open, sizeof(open) - 1);
-        const char *after = think ? think + sizeof(open) - 1 : NULL;
-        const char *shut = after ? memmem(after, (size_t)(end - after), close, sizeof(close) - 1) : NULL;
-        if (!shut) break;
-        buf_append(out, p, (size_t)(after - p));
-        p = shut;
-    }
-    buf_append(out, p, (size_t)(end - p));
-}
-
 /* Whether a state (the live history or a saved one, its tokens and its
  * pictures) begins a request, and how many bytes of the request's text it
  * stands for; 0 when it does not.  This is what makes a request part of a
@@ -11529,17 +11393,10 @@ static size_t state_text_begins_request(server *s, const request *req,
     text.ptr = ds4_kvstore_render_history_text(s->engine, tokens, ids, n_ids, &text.len);
     if (!text.ptr) return 0;   /* the state stops inside a picture */
     const size_t prompt_len = strlen(req->prompt_text);
-    size_t offset = byte_prefix_match(req->prompt_text, prompt_len, text.ptr, text.len) ? text.len : 0;
-    if (offset == 0 && req->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
-        /* A replay carries no reasoning the client never received (Codex),
-         * and the template renders such turns with an empty think block:
-         * the state's text reads the same once its reasoning is dropped,
-         * and the state's tokens, reasoning included, then stand for it. */
-        buf visible = {0};
-        qwen_visible_text(&visible, text.ptr, text.len);
-        if (byte_prefix_match(req->prompt_text, prompt_len, visible.ptr, visible.len)) offset = visible.len;
-        buf_free(&visible);
-    }
+    /* The state's text itself, nothing read into it: a state that holds
+     * reasoning its client does not send back is not that request's, and the
+     * one saved before the reasoning was generated is. */
+    const size_t offset = byte_prefix_match(req->prompt_text, prompt_len, text.ptr, text.len) ? text.len : 0;
     buf_free(&text);
     return offset;
 }
@@ -11675,108 +11532,6 @@ static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
         s->engine, live_tokens, req->anthropic_live_suffix_text,
         effective_prompt);
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
-    return live_tokens->len;
-}
-
-/* Visible-replay Responses continuation.
- *
- * Other clients send the full visible transcript on every turn even though the
- * API semantics still make the request a continuation.  For Responses, exact
- * token-prefix matching is the wrong first question: hidden reasoning may be
- * live in KV but absent from the replay by design.  Instead, verify that the
- * request's rendered text begins with the visible transcript remembered at the
- * live frontier.  If it does, continue from the live token prefix and tokenize
- * only the bytes after that visible boundary.
- *
- * If this check fails, DS4 has no special Responses state to trust.  The caller
- * then uses normal token/text/disk matching, which is the correct fallback for
- * cold starts, edits, restarts, or cross-client replays. */
-static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
-                                                request *req,
-                                                int live_pos,
-                                                ds4_tokens *effective_prompt) {
-    if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
-    if (req->api != API_RESPONSES) return 0;
-
-    const size_t prompt_len = strlen(req->prompt_text);
-    size_t visible_len = 0;
-    pthread_mutex_lock(&s->tool_mu);
-    bool ok = slot->responses_live.valid &&
-              slot->responses_live.live_tokens == live_pos &&
-              slot->responses_live.visible_text &&
-              slot->responses_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
-                                slot->responses_live.visible_text,
-                                slot->responses_live.visible_len);
-    if (ok) visible_len = slot->responses_live.visible_len;
-    if (!ok && slot->responses_live.valid) {
-        /* why the remembered transcript does not begin this request */
-        const char *vt = slot->responses_live.visible_text ? slot->responses_live.visible_text : "";
-        size_t d = 0;
-        while (d < slot->responses_live.visible_len && d < prompt_len && vt[d] == req->prompt_text[d]) d++;
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: responses visible key unmatched: live=%d remembered=%d visible=%zu prompt=%zu diverge=%zu key=%.64s | request=%.64s",
-                   live_pos, slot->responses_live.live_tokens, slot->responses_live.visible_len, prompt_len, d,
-                   vt + (d > 24 ? d - 24 : 0), req->prompt_text + (d > 24 ? d - 24 : 0));
-    }
-    pthread_mutex_unlock(&s->tool_mu);
-    if (!ok) return 0;
-
-    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
-    if (!live_tokens || live_tokens->len != live_pos) return 0;
-    size_t n_ids = 0;
-    const ds4_vision_identity *ids = ds4_session_vision_identities(slot->session, &n_ids);
-    if (!build_prompt_after_state(s, req, ids, n_ids, live_tokens, visible_len,
-                                  effective_prompt)) {
-        return 0;
-    }
-    return live_tokens->len;
-}
-
-/* Tool-less thinking continuation.
- *
- * Chat/completions and Anthropic do not have a previous_response_id object that
- * binds a later request to the last sampled turn.  Still, after a normal
- * tool-less thinking answer, the next prompt renderer intentionally omits that
- * hidden reasoning.  The live KV state is richer than the visible transcript.
- *
- * Remembering the visible transcript as a key lets us keep the sampled hidden
- * KV when the next request clearly extends that same visible history.  This is
- * the same byte-prefix idea used by the disk cache: the client-visible text
- * selects the checkpoint, while the payload stays the exact sampled token
- * frontier.  If the visible key does not match, callers fall back to ordinary
- * token/text/disk matching. */
-static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
-                                               request *req,
-                                               int live_pos,
-                                               ds4_tokens *effective_prompt) {
-    if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
-    if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
-    if (!ds4_session_vision_prefix_matches(slot->session, req->images,
-                                           req->image_count)) return 0;
-
-    const size_t prompt_len = strlen(req->prompt_text);
-    size_t visible_len = 0;
-    pthread_mutex_lock(&s->tool_mu);
-    bool ok = slot->thinking_live.valid &&
-              slot->thinking_live.live_tokens == live_pos &&
-              slot->thinking_live.visible_text &&
-              slot->thinking_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
-                                slot->thinking_live.visible_text,
-                                slot->thinking_live.visible_len);
-    if (ok) visible_len = slot->thinking_live.visible_len;
-    pthread_mutex_unlock(&s->tool_mu);
-    if (!ok) return 0;
-
-    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
-    if (!live_tokens || live_tokens->len != live_pos) return 0;
-    size_t n_ids = 0;
-    const ds4_vision_identity *ids = ds4_session_vision_identities(slot->session, &n_ids);
-    if (!build_prompt_after_state(s, req, ids, n_ids, live_tokens, visible_len,
-                                  effective_prompt)) {
-        return 0;
-    }
     return live_tokens->len;
 }
 
@@ -12530,6 +12285,40 @@ static int server_session_sync(server *s, server_slot *slot,
            DS4_SESSION_SYNC_INTERRUPTED : 0;
 }
 
+/* Synchronize a request's prompt and save the state a later request resumes
+ * from.  Only what a client sent is its conversation's history: what is
+ * generated after the prompt becomes history when the client sends it back,
+ * which it may do verbatim, without the reasoning, or edited.  So the state
+ * is saved before the generation and never after it, and a request whose
+ * text the live history does not begin resumes from here at the cost of the
+ * last turn's output.
+ *
+ * The state stands one token short of the prompt.  A chat prompt ends with
+ * the newline after <think>, and a turn replayed without reasoning renders
+ * an empty block whose two newlines are one token: the prompt's last token
+ * is not one every continuation shares, the one before it is. */
+static int server_prompt_sync(server *s, server_slot *slot,
+                              const ds4_tokens *prompt,
+                              ds4_vision_span *images, size_t image_count,
+                              char *err, size_t errlen) {
+    pthread_mutex_lock(&s->inference_mu);
+    const int resume = ds4_session_resume_pos(slot->session, prompt, images, image_count);
+    pthread_mutex_unlock(&s->inference_mu);
+    ds4_tokens history = *prompt;
+    size_t history_images = 0;
+    history.len = server_store_boundary(s->engine, images, image_count, prompt->len - 1, &history_images);
+    if (resume <= history.len && history.len > 0) {
+        const int rc = server_session_sync(s, slot, &history, images, history_images, err, errlen);
+        if (rc != 0) return rc;
+        pthread_mutex_lock(&s->inference_mu);
+        if (ds4_session_save_state(slot->session) != 0) {
+            server_log(DS4_LOG_WARNING, "ds4-server: the prompt's state could not be saved");
+        }
+        pthread_mutex_unlock(&s->inference_mu);
+    }
+    return server_session_sync(s, slot, prompt, images, image_count, err, errlen);
+}
+
 static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
                                                    const char *suffix,
                                                    int *tokens_appended,
@@ -12566,17 +12355,6 @@ static bool continue_after_invalid_dsml(server *s, server_slot *slot,
                                                      err, errlen);
     free(suffix);
     return ok;
-}
-
-static bool should_remember_thinking_checkpoint(const request *r,
-                                                const thinking_state *thinking,
-                                                const char *finish) {
-    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
-    if (r->prompt_preserves_reasoning) return false;
-    if (!ds4_think_mode_enabled(r->think_mode)) return false;
-    if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
-    if (thinking && thinking->inside) return false;
-    return true;
 }
 
 static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
@@ -12752,107 +12530,13 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     return buf_take(&suffix);
 }
 
-static char *build_responses_visible_assistant_suffix(const request *r,
-                                                      const char *content,
-                                                      const char *reasoning,
-                                                      const tool_calls *calls) {
-    const server_model_syntax syntax =
-        r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
-    buf suffix = {0};
-    /* This suffix mirrors what a Responses client can replay, not necessarily
-     * every token in KV.  Hidden reasoning stays live in the session unless the
-     * next client replay is expected to include it.  In practice, pi replays
-     * reasoning summaries for tool-call turns, but not for final assistant
-     * answers; Codex currently requests no summaries at all.  So only include
-     * reasoning in the remembered visible prefix when this assistant turn ended
-     * in tool calls.  A client that does replay final-answer reasoning will not
-     * match this visible shortcut and can still use exact token-prefix replay. */
-    if (r && ds4_think_mode_enabled(r->think_mode)) {
-        /* A client given the reasoning back through encrypted_content replays
-         * it on every turn, tool call or final answer alike, so the visible
-         * prefix it will send is the rendered turn in full. */
-        const bool replayed = (r->reasoning_summary_emit && calls && calls->len > 0) ||
-                              r->responses_encrypted_reasoning;
-        append_reasoning_close_for_syntax(&suffix, syntax,
-                                          replayed ? reasoning : NULL);
-    }
-    append_assistant_content_for_syntax(&suffix, syntax, content);
-    append_tool_calls_text_for_syntax(&suffix, syntax, calls,
-                                      r ? &r->tool_orders : NULL, content);
-    /* No turn end: generation stops at the end-of-turn token without
-     * folding it into the session, so the next request's text from the end
-     * of this key on, which starts with that token, is what the live tokens
-     * still lack (render_qwen_live_tool_tail supplies it the same way). */
-    return buf_take(&suffix);
-}
-
-/* In thinking mode without tools, old assistant reasoning is intentionally not
- * rendered back into later prompts.  The sampled live graph still contains the
- * reasoning bytes, so the next request would miss the session cache even though
- * the visible conversation prefix is logically the same.
- *
- *   prompt-without-final-<think> + </think> + visible-content
- *
- * is exactly the visible prefix that render_chat_prompt_text() will produce on
- * the next turn, up to the end-of-turn token the live tokens stop before.  Do not rebuild the KV cache to erase hidden reasoning here:
- * that caused long post-answer pauses and threw away useful sampled state.
- * Instead, remember the visible bytes as a key for the current sampled frontier.
- * The next request can then continue from live KV while tokenizing only the new
- * visible suffix. */
-static char *build_toolless_thinking_visible_text(const request *r,
-                                                  const char *content) {
-    if (!r || !r->prompt_text) return NULL;
-    if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
-
-    const bool qwen = r->model_syntax == SERVER_MODEL_SYNTAX_QWEN;
-    size_t pt_len = strlen(r->prompt_text);
-    const char *think_tag = qwen ? "<think>\n" : "<think>";
-    size_t tag_len = strlen(think_tag);
-    if (pt_len < tag_len ||
-        memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
-        return NULL;
-    }
-
-    buf visible = {0};
-    buf_append(&visible, r->prompt_text, pt_len - tag_len);
-    if (qwen) {
-        /* The next render drops the reasoning but keeps the empty block. */
-        buf_puts(&visible, "<think>\n");
-        append_reasoning_close_for_syntax(&visible, SERVER_MODEL_SYNTAX_QWEN, NULL);
-    } else {
-        buf_puts(&visible, "</think>");
-    }
-    append_assistant_content_for_syntax(&visible, r->model_syntax, content);
-    /* no turn end: the live tokens stop before it (see
-     * build_responses_visible_assistant_suffix) */
-    return buf_take(&visible);
-}
-
-static void remember_thinking_checkpoint(server *s, server_slot *slot,
-                                         const job *j, const char *ctx,
-                                         uint64_t trace_id, const char *content) {
-    char *visible = build_toolless_thinking_visible_text(&j->req, content);
-    if (!visible) return;
-
-    thinking_live_remember(s, slot, visible);
-    server_log(DS4_LOG_KVCACHE,
-               "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
-               ctx, ds4_session_pos(slot->session), strlen(visible));
-    trace_event(s, trace_id,
-                "thinking live checkpoint remembered: live=%d visible=%zu",
-                ds4_session_pos(slot->session), strlen(visible));
-    free(visible);
-}
-
 /* After a successful finish, make the live checkpoint match what the next
  * request will render.  For a tool call that is usually the exact DSML
  * remembered by tool id; if a client sends a tool call without an id we
  * know, the fallback renderer still builds valid DSML from JSON, and this
  * function either rewrites the short suffix in place or reloads an older
- * disk checkpoint before replay.  A Qwen answer is canonicalized too: the
- * client replays its trimmed content, so a sampled trailing newline would
- * otherwise put the live text and its disk key one token past every future
- * prompt. */
+ * disk checkpoint before replay.  Not for a Qwen session, which goes back
+ * to the state saved before the generation instead (server_prompt_sync). */
 static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                                          job *j, int prompt_tokens, const char *ctx,
                                          uint64_t trace_id, const char *content,
@@ -12936,7 +12620,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, slot,
                                             rendered.ptr ? rendered.ptr : "",
-                                            &effective, NULL, &path, NULL, false);
+                                            &effective, NULL, &path, false);
         if (loaded == 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_invalidate(slot->session);
@@ -13321,36 +13005,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const bool responses_protocol = j->req.api == API_RESPONSES;
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
-    bool thinking_live_continuation = false;
-    const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
-    /* Responses gets the first chance to continue from live state.  This is
-     * the whole point of the API shape: a request that is bound to prior live
-     * output by visible transcript or tool call ids does not need to prove an
-     * exact token-prefix match.  Exact token/text/disk matching remains the
-     * fallback when the live state is absent or no longer describes the
-     * request. */
+    /* A request of tool outputs alone continues the live generation its
+     * call ids name.  Every other request is told from by its text: the
+     * live history when it begins the request, else the longest saved state
+     * that does, else the disk. */
     int cached = live_vision_prefix ?
-        responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
-                                              &effective_prompt) : 0;
-    const char *cache_source = cached > 0 ? "responses-visible" : "none";
-    if (cached > 0) {
-        responses_live_match = "visible-prefix";
-        if (responses_live_matches_request(s, slot,
-                                           &j->req.responses_live_call_ids,
-                                           old_pos))
-        {
-            responses_live_match_ids = j->req.responses_live_call_ids.len;
-        }
-    }
-    if (cached == 0 && live_vision_prefix) {
-        cached = responses_live_continuation_prompt(s, slot, &j->req, old_pos,
-                                                    &effective_prompt,
-                                                    &responses_live_match_ids);
-        cache_source = cached > 0 ? "responses-tool-output" : "none";
-        if (cached > 0) responses_live_match = "tool-output-ids";
-    }
+        responses_live_continuation_prompt(s, slot, &j->req, old_pos,
+                                           &effective_prompt,
+                                           &responses_live_match_ids) : 0;
+    const char *cache_source = cached > 0 ? "responses-tool-output" : "none";
     if (cached > 0) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
@@ -13414,20 +13079,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cache_source = cached > 0 ? "memory-token" : "none";
         }
     }
-    if (cached == 0) {
-        int thinking_cached =
-            thinking_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
-                                                &effective_prompt);
-        if (thinking_cached > 0) {
-            cached = thinking_cached;
-            cache_source = "thinking-visible";
-            thinking_live_continuation = true;
-            prompt_for_sync = &effective_prompt;
-        }
-    }
     int disk_cached = 0;
     char *disk_cache_path = NULL;
-    uint8_t disk_cache_ext_flags = 0;
     if (cached == 0) {
         int text_cached = live_text_prefix_prompt(s, slot, &j->req,
                                                   &effective_prompt);
@@ -13483,24 +13136,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (cached == 0) slot_set_kv_path(s, slot, NULL);
     if (disk && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
-                                        &disk_cache_path,
-                                        &disk_cache_ext_flags);
+                                        &disk_cache_path);
         if (disk_cached > 0) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
         }
     }
-    const bool responses_reasoning_state_preserved =
-        cached > 0 &&
-        ((!strcmp(cache_source, "responses-visible") ||
-          !strcmp(cache_source, "responses-tool-output")) ||
-         (!strcmp(cache_source, "disk-text") &&
-          (disk_cache_ext_flags & KV_EXT_RESPONSES_VISIBLE)));
-    const bool responses_visible_replay_without_reasoning =
-        responses_protocol &&
-        j->req.responses_requires_live_reasoning &&
-        !responses_reasoning_state_preserved;
     const int prompt_tokens = prompt_for_sync->len;
     /* The usage a client sees reports what the engine reuses, not what the
      * matching above claims: the two agree when the effective prompt and
@@ -13547,8 +13189,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
               j->req.has_tools, false, false, false);
     if (responses_live_continuation) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
-                   responses_live_match ? responses_live_match : "unknown",
+                   "ds4-server: responses live continuation RESPPROTO match=tool-output-ids ids=%d cached=%d prompt=%d",
                    responses_live_match_ids,
                    cached,
                    prompt_tokens);
@@ -13558,28 +13199,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    anthropic_live_match_ids,
                    cached,
                    prompt_tokens);
-    } else if (thinking_live_continuation) {
-        server_log(DS4_LOG_PREFILL,
-                   "ds4-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
-                   cached,
-                   prompt_tokens);
-    }
-    if (responses_visible_replay_without_reasoning) {
-        /* The request replays a prior tool-call turn but omits the hidden
-         * reasoning that originally led to it.  A live Responses checkpoint, or
-         * a responses-visible disk checkpoint, would preserve that hidden KV.
-         * If neither is available, continue from the visible transcript instead
-         * of surfacing a hard error to the user.  This is lower fidelity, but it
-         * lets old / restarted agent sessions recover and is exactly what the
-         * client asked us to prefill. */
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: responses replay RESPPROTO missing reasoning state; continuing from visible history source=%s cached=%d prompt=%d",
-                   cache_source,
-                   cached,
-                   prompt_tokens);
-        trace_event(s, trace_id,
-                    "responses replay missing reasoning state; continuing from visible history source=%s cached=%d",
-                    cache_source, cached);
     }
     slot_note_request(slot, cached > 0);
     server_log(DS4_LOG_PREFILL,
@@ -13659,7 +13278,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    int prompt_sync_rc = server_session_sync(s, slot, prompt_for_sync,
+    int prompt_sync_rc = server_prompt_sync(s, slot, prompt_for_sync,
                                              j->req.images, j->req.image_count,
                                              err, sizeof(err));
     if (prompt_sync_rc != 0) {
@@ -13706,7 +13325,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s, slot);
     if (!anthropic_live_continuation) anthropic_live_clear(s, slot);
-    if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
     if (disk) kv_cache_maybe_store_continued(s, slot);
@@ -13843,9 +13461,9 @@ decode_again:
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
-        if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            if (disk) kv_cache_maybe_store_continued(s, slot);
-        }
+        /* No checkpoint is stored from here on: what is being generated is
+         * the conversation's history only once its client sends it back,
+         * and the prefill of that request stores it (server_progress_cb). */
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
@@ -14372,24 +13990,16 @@ decode_again:
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
+    /* A request that answers this turn's tool calls by their ids names the
+     * generation it continues: that is the one way a client sends back what
+     * was generated without its text.  Everything else the next request is
+     * told from by its text alone (live_text_prefix_prompt and the saved
+     * states): nothing here guesses what the client will replay. */
     if (j->req.api == API_RESPONSES) {
-        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
-            /* Store the post-turn visible transcript plus the live token
-             * frontier.  The next Responses request may replay only this
-             * visible surface, while the real session also contains hidden
-             * reasoning and exact sampled tool-call bytes. */
-            char *visible_suffix =
-                build_responses_visible_assistant_suffix(&j->req,
-                    parsed_content ? parsed_content : "",
-                    parsed_reasoning,
-                    &parsed_calls);
-            buf visible = {0};
-            buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
-            buf_puts(&visible, visible_suffix ? visible_suffix : "");
-            responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
-                                    parsed_calls.len ? &parsed_calls : NULL);
-            buf_free(&visible);
-            free(visible_suffix);
+        if (parsed_calls.len && strcmp(final_finish, "error") &&
+            strcmp(final_finish, "length"))
+        {
+            responses_live_remember(s, slot, &parsed_calls);
         } else {
             responses_live_clear(s, slot);
         }
@@ -14404,8 +14014,13 @@ decode_again:
         }
     }
 
+    /* A Qwen session has the state saved before the generation to go back
+     * to when the next request does not begin with the live history, at the
+     * cost of this turn's output; the others have no such state and make
+     * the live history read like the prompt to come instead. */
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
+        j->req.model_syntax != SERVER_MODEL_SYNTAX_QWEN &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls))
     {
         /* Chat/completions has no protocol object that binds the next request
@@ -14417,32 +14032,6 @@ decode_again:
         canonicalize_tool_checkpoint(s, slot, j, prompt_tokens, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s, slot);
-    } else if (parsed_calls.len) {
-        thinking_live_clear(s, slot);
-    } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
-        remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "");
-    } else if (!parsed_calls.len) {
-        thinking_live_clear(s, slot);
-        if (j->req.model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
-            j->req.kind == REQ_CHAT && j->req.api != API_RESPONSES &&
-            !strcmp(final_finish, "stop"))
-        {
-            canonicalize_tool_checkpoint(s, slot, j, prompt_tokens, ctx_span, trace_id,
-                                         parsed_content ? parsed_content : "",
-                                         parsed_reasoning, &parsed_calls);
-        }
-    }
-    /* The turn ends here, in the form the next request will replay: the
-     * state a history edited in a later turn resumes from. */
-    if (!job_cancelled(j) && strcmp(final_finish, "error")) {
-        pthread_mutex_lock(&s->inference_mu);
-        if (ds4_session_save_state(slot->session) != 0) {
-            server_log(DS4_LOG_WARNING, "ds4-server: the turn's state could not be saved");
-        }
-        pthread_mutex_unlock(&s->inference_mu);
     }
 
     bool response_ok = !job_cancelled(j);
@@ -14650,24 +14239,15 @@ static int job_required_slot_locked(server *s, const job *j) {
 }
 
 /* Whether the slot holds this request's live continuation: it remembers
- * the tool calls the request answers, or a visible transcript (a Responses
- * turn, or a tool-less thinking answer) that begins the request's text at
- * its current frontier.  Called under tool_mu. */
+ * the tool calls the request answers, at its current frontier.  Called
+ * under tool_mu. */
 static bool slot_continues_request(const server_slot *slot, const request *r) {
-    const size_t len = r->prompt_text ? strlen(r->prompt_text) : 0;
-    const int live = ds4_session_pos(slot->session);
     const live_tool_state *rl = &slot->responses_live;
-    const visible_live_state *tl = &slot->thinking_live;
-    if (r->api == API_RESPONSES && rl->valid && rl->live_tokens == live) {
-        if (r->responses_live_call_ids.len &&
-            live_state_contains_all(rl, &r->responses_live_call_ids)) return true;
-        if (rl->visible_text && rl->visible_len < len &&
-            byte_prefix_match(r->prompt_text, len, rl->visible_text, rl->visible_len)) return true;
-    }
-    if (r->api == API_ANTHROPIC && r->anthropic_live_call_ids.len &&
-        live_state_contains_all(&slot->anthropic_live, &r->anthropic_live_call_ids)) return true;
-    return tl->valid && tl->live_tokens == live && tl->visible_text && tl->visible_len < len &&
-           byte_prefix_match(r->prompt_text, len, tl->visible_text, tl->visible_len);
+    if (r->api == API_RESPONSES && rl->valid && rl->live_tokens == ds4_session_pos(slot->session) &&
+        r->responses_live_call_ids.len &&
+        live_state_contains_all(rl, &r->responses_live_call_ids)) return true;
+    return r->api == API_ANTHROPIC && r->anthropic_live_call_ids.len &&
+           live_state_contains_all(&slot->anthropic_live, &r->anthropic_live_call_ids);
 }
 
 /* The slot a job should run on: its required one, else one holding its
@@ -15351,7 +14931,6 @@ static void server_close_resources(server *s) {
         server_slot *slot = &s->slots[i];
         live_tool_state_free(&slot->responses_live);
         live_tool_state_free(&slot->anthropic_live);
-        visible_live_free(&slot->thinking_live);
         if (slot->session) ds4_session_free(slot->session);
         free(slot->kv_path);
     }
@@ -15821,8 +15400,8 @@ int main(int argc, char **argv) {
             server_close_resources(&s);
             return 1;
         }
-        /* the states a slot resumes an edited history from are its turn
-         * ends, saved when a generation finishes (generate_job_inner) */
+        /* the states a slot resumes from are saved by the server itself,
+         * one token short of each prompt (server_prompt_sync) */
         ds4_session_set_prompt_states(slot->session, false);
     }
 
@@ -18023,6 +17602,79 @@ static void test_parse_qwen_tool_call_message(void) {
     tool_schema_orders_free(&orders);
 }
 
+/* A client that sends a turn back whole continues the live history, which
+ * is told from by text alone: the prompt rendered from its replay must begin
+ * with the prompt the turn was generated from followed by the very bytes that
+ * were sampled.  That holds for every generation in the template's own form,
+ * with the sampled tool block remembered by id and rebuilt from JSON alike,
+ * and whatever follows the turn.  A generation that strays from that form
+ * (a newline before the turn end, blank lines around the reasoning) is
+ * replayed trimmed and does not match: that request resumes from the state
+ * saved before the generation instead (server_prompt_sync). */
+static void test_qwen_replay_begins_with_the_live_text(void) {
+    const char *tool_schemas =
+        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\"}}}}";
+    static const struct { const char *generated; bool matches; } cases[] = {
+        { "the user greets\n</think>\n\nHello!", true },
+        { "two\nlines of thought\n</think>\n\nAn answer\n\nin two paragraphs.", true },
+        { "need bash\n</think>\n\n<tool_call>\n<function=bash>\n"
+          "<parameter=command>\nls -la\n</parameter>\n</function>\n</tool_call>", true },
+        { "need bash\n</think>\n\nLet me look.\n\n<tool_call>\n<function=bash>\n"
+          "<parameter=command>\nls -la\n</parameter>\n"
+          "<parameter=timeout>\n10\n</parameter>\n</function>\n</tool_call>", true },
+        { "two calls\n</think>\n\n<tool_call>\n<function=bash>\n"
+          "<parameter=command>\npwd\n</parameter>\n</function>\n</tool_call>\n"
+          "<tool_call>\n<function=bash>\n"
+          "<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>", true },
+        { "plan\n</think>\n\ndone.\n", false },
+        { "\nplan\n</think>\n\ndone.", false },
+        { "plan\n\n</think>\n\ndone.", false },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        for (int remembered = 1; remembered >= 0; remembered--) {
+            tool_schema_orders orders = {0};
+            tool_schema_orders_add_json(&orders, tool_schemas);
+            chat_msgs msgs = {0};
+            chat_msgs_push_text(&msgs, "user", "inspect");
+            char *prompt_text = render_chat_prompt_text_for_syntax(
+                SERVER_MODEL_SYNTAX_QWEN, &msgs, tool_schemas, &orders, DS4_THINK_HIGH);
+            buf live = {0};
+            buf_puts(&live, prompt_text);
+            buf_puts(&live, cases[c].generated);
+
+            chat_msg assistant = {0};
+            assistant.role = xstrdup("assistant");
+            TEST_ASSERT(parse_generated_message_ex_for_syntax(
+                SERVER_MODEL_SYNTAX_QWEN, cases[c].generated, true, &orders,
+                &assistant.content, &assistant.reasoning, &assistant.calls));
+            if (!remembered) {
+                free(assistant.calls.raw_tool_text);
+                assistant.calls.raw_tool_text = NULL;
+            }
+            const bool called = assistant.calls.len > 0;
+            chat_msgs_push(&msgs, assistant);
+            chat_msgs_push_text(&msgs, called ? "tool" : "user", "next");
+            char *replay = render_chat_prompt_text_for_syntax(
+                SERVER_MODEL_SYNTAX_QWEN, &msgs, tool_schemas, &orders, DS4_THINK_HIGH);
+            const bool begins = strlen(replay) > live.len && !memcmp(replay, live.ptr, live.len);
+            if (begins != cases[c].matches) {
+                fprintf(stderr, "case %zu (%s): the replay %s the live text\n", c,
+                        remembered ? "remembered" : "rebuilt", begins ? "begins with" : "leaves");
+            }
+            TEST_ASSERT(begins == cases[c].matches);
+            /* the live history stops before the turn end, which the replay goes on with */
+            if (begins) TEST_ASSERT(!strncmp(replay + live.len, "<|im_end|>\n", 11));
+
+            free(replay);
+            buf_free(&live);
+            free(prompt_text);
+            chat_msgs_free(&msgs);
+            tool_schema_orders_free(&orders);
+        }
+    }
+}
+
 static void test_qwen_tool_checkpoint_suffix_is_canonical(void) {
     const char *tool_schemas =
         "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
@@ -19138,7 +18790,9 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     r.api = API_ANTHROPIC;
     r.think_mode = DS4_THINK_HIGH;
 
-    chat_msgs msgs = {0};
+    /* A request that replays the turn its results answer is told from by its
+     * text, not bound to the live generation by its ids. */
+    chat_msgs replay = {0};
     chat_msg assistant = {0};
     assistant.role = xstrdup("assistant");
     tool_call tc = {0};
@@ -19146,8 +18800,17 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     tc.name = xstrdup("Bash");
     tc.arguments = xstrdup("{\"command\":\"pwd\"}");
     tool_calls_push(&assistant.calls, tc);
-    chat_msgs_push(&msgs, assistant);
+    chat_msgs_push(&replay, assistant);
+    chat_msg replayed_result = {0};
+    replayed_result.role = xstrdup("user");
+    replayed_result.content = xstrdup("<tool_result>/tmp</tool_result>");
+    chat_msg_add_tool_call_id(&replayed_result, "toolu_live");
+    chat_msgs_push(&replay, replayed_result);
+    anthropic_prepare_live_continuation(&r, &replay);
+    TEST_ASSERT(r.anthropic_live_call_ids.len == 0 && r.anthropic_live_suffix_text == NULL);
+    chat_msgs_free(&replay);
 
+    chat_msgs msgs = {0};
     chat_msg user = {0};
     user.role = xstrdup("user");
     user.content = xstrdup("<tool_result>/tmp</tool_result>");
@@ -19326,16 +18989,9 @@ static void test_responses_live_tail_renders_tool_outputs_only(void) {
     r.api = API_RESPONSES;
     r.think_mode = DS4_THINK_HIGH;
 
+    /* the tool output alone (a request that replays the call's turn is
+     * test_responses_replayed_tool_turn_is_matched_by_text) */
     chat_msgs msgs = {0};
-    chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
-    tool_call tc = {0};
-    tc.id = xstrdup("call_live");
-    tc.name = xstrdup("exec_command");
-    tc.arguments = xstrdup("{\"cmd\":\"pwd\"}");
-    tool_calls_push(&assistant.calls, tc);
-    chat_msgs_push(&msgs, assistant);
-
     chat_msg tool = {0};
     tool.role = xstrdup("tool");
     tool.tool_call_id = xstrdup("call_live");
@@ -19371,8 +19027,7 @@ static void test_responses_tool_output_id_validation(void) {
     chat_msgs_push(&msgs, tool);
 
     char err[160] = {0};
-    TEST_ASSERT(!responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH, NULL, NULL,
-                                                 err, sizeof(err)));
+    TEST_ASSERT(!responses_validate_tool_outputs(&s, &msgs, NULL, err, sizeof(err)));
     TEST_ASSERT(strstr(err, "Responses continuation state is not available") != NULL);
 
     pthread_mutex_lock(&s.tool_mu);
@@ -19382,8 +19037,7 @@ static void test_responses_tool_output_id_validation(void) {
     pthread_mutex_unlock(&s.tool_mu);
     err[0] = '\0';
     bool needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
-                                                &needs_live_tool_state, NULL,
+    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, &needs_live_tool_state,
                                                 err, sizeof(err)));
     TEST_ASSERT(needs_live_tool_state);
 
@@ -19392,7 +19046,11 @@ static void test_responses_tool_output_id_validation(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
-static void test_responses_stateless_tool_replay_requires_reasoning(void) {
+/* Call ids bind a request to the live generation only when they are all it
+ * says of the turn it answers.  A request that replays the turn is told from
+ * by its text, whatever of the reasoning it carries: a live history holding
+ * reasoning the client did not send back is not that request's. */
+static void test_responses_replayed_tool_turn_is_matched_by_text(void) {
     server s = {0};
     server_slot slot;
     test_server_bind_slot(&s, &slot);
@@ -19414,90 +19072,43 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
     tool.content = xstrdup("/tmp");
     chat_msgs_push(&msgs, tool);
 
-    char err[160] = {0};
-    bool needs_live_reasoning = false;
-    bool needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
-                                                &needs_live_tool_state,
-                                                &needs_live_reasoning,
-                                                err, sizeof(err)));
-    TEST_ASSERT(!needs_live_tool_state);
-    TEST_ASSERT(needs_live_reasoning);
-
     pthread_mutex_lock(&s.tool_mu);
     slot.responses_live.valid = true;
     slot.responses_live.live_tokens = 123;
     id_list_push_unique(&slot.responses_live.call_ids, "call_replay");
     pthread_mutex_unlock(&s.tool_mu);
-    err[0] = '\0';
-    needs_live_reasoning = false;
-    needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
-                                                &needs_live_tool_state,
-                                                &needs_live_reasoning,
-                                                err, sizeof(err)));
-    TEST_ASSERT(!needs_live_tool_state);
-    TEST_ASSERT(needs_live_reasoning);
 
-    free(msgs.v[0].reasoning);
-    msgs.v[0].reasoning = xstrdup("replayed hidden reasoning");
-    err[0] = '\0';
-    needs_live_reasoning = false;
-    needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_HIGH,
-                                                &needs_live_tool_state,
-                                                &needs_live_reasoning,
+    char err[160] = {0};
+    bool needs_live_tool_state = false;
+    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, &needs_live_tool_state,
                                                 err, sizeof(err)));
     TEST_ASSERT(!needs_live_tool_state);
-    TEST_ASSERT(!needs_live_reasoning);
 
-    free(msgs.v[0].reasoning);
-    msgs.v[0].reasoning = NULL;
-    err[0] = '\0';
-    needs_live_reasoning = false;
-    needs_live_tool_state = false;
-    TEST_ASSERT(responses_validate_tool_outputs(&s, &msgs, DS4_THINK_NONE,
-                                                &needs_live_tool_state,
-                                                &needs_live_reasoning,
-                                                err, sizeof(err)));
-    TEST_ASSERT(!needs_live_tool_state);
-    TEST_ASSERT(!needs_live_reasoning);
+    request replay;
+    request_init(&replay, REQ_CHAT, 128);
+    replay.api = API_RESPONSES;
+    responses_prepare_live_continuation(&replay, &msgs);
+    TEST_ASSERT(replay.responses_live_call_ids.len == 0 && !replay.responses_live_suffix_text);
+    request_free(&replay);
+
+    /* the tool output alone names the generation by its id */
+    chat_msgs outputs = {0};
+    chat_msg output = {0};
+    output.role = xstrdup("tool");
+    output.tool_call_id = xstrdup("call_replay");
+    output.content = xstrdup("/tmp");
+    chat_msgs_push(&outputs, output);
+    request only;
+    request_init(&only, REQ_CHAT, 128);
+    only.api = API_RESPONSES;
+    responses_prepare_live_continuation(&only, &outputs);
+    TEST_ASSERT(only.responses_live_call_ids.len == 1 && only.responses_live_suffix_text);
+    request_free(&only);
+    chat_msgs_free(&outputs);
 
     chat_msgs_free(&msgs);
     live_tool_state_free(&slot.responses_live);
     pthread_mutex_destroy(&s.tool_mu);
-}
-
-static void test_responses_visible_suffix_matches_client_replay(void) {
-    request r;
-    request_init(&r, REQ_CHAT, 128);
-    r.api = API_RESPONSES;
-    r.think_mode = DS4_THINK_HIGH;
-    r.reasoning_summary_emit = true;
-
-    char *suffix = build_responses_visible_assistant_suffix(&r, "5",
-                                                            "hidden summary",
-                                                            NULL);
-    TEST_ASSERT(strstr(suffix, "hidden summary") == NULL);
-    TEST_ASSERT(strstr(suffix, "</think>5") != NULL);
-    free(suffix);
-
-    tool_calls calls = {0};
-    tool_call tc = {0};
-    tc.id = xstrdup("call_live");
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
-    tool_calls_push(&calls, tc);
-
-    suffix = build_responses_visible_assistant_suffix(&r, "",
-                                                      "tool summary",
-                                                      &calls);
-    TEST_ASSERT(strstr(suffix, "tool summary</think>") != NULL);
-    TEST_ASSERT(strstr(suffix, "<｜DSML｜tool_calls>") != NULL);
-    free(suffix);
-
-    tool_calls_free(&calls);
-    request_free(&r);
 }
 
 static void test_exact_dsml_tool_replay_can_be_disabled(void) {
@@ -19988,12 +19599,9 @@ static void test_tool_history_validation_handles_large_replays(void) {
 
     char err[160] = {0};
     bool needs_live = false;
-    bool needs_reasoning = false;
     TEST_ASSERT(responses_validate_tool_outputs(
-        NULL, &responses, DS4_THINK_HIGH, &needs_live, &needs_reasoning,
-        err, sizeof(err)));
+        NULL, &responses, &needs_live, err, sizeof(err)));
     TEST_ASSERT(!needs_live);
-    TEST_ASSERT(!needs_reasoning);
     TEST_ASSERT(anthropic_validate_tool_results(
         NULL, &anthropic, &needs_live, err, sizeof(err)));
     TEST_ASSERT(!needs_live);
@@ -20316,31 +19924,6 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     r.prompt_text = xstrdup("<｜Assistant｜></think>");
     st = thinking_state_from_prompt(&r);
     TEST_ASSERT(st.inside == false);
-    request_free(&r);
-}
-
-static void test_thinking_checkpoint_remember_gate(void) {
-    request r;
-    request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
-    thinking_state st = {.inside = true};
-
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
-
-    st.inside = false;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
-    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
-
-    r.prompt_preserves_reasoning = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
-    r.prompt_preserves_reasoning = false;
-    r.has_tools = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
-    r.has_tools = false;
-    r.think_mode = DS4_THINK_NONE;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
-
     request_free(&r);
 }
 
@@ -21225,16 +20808,6 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     buf_puts(&canonical, "</think>");
     buf_puts(&canonical, content);
 
-    request r;
-    request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
-    r.prompt_text = xstrdup(prompt_text);
-    char *visible = build_toolless_thinking_visible_text(&r, content);
-    TEST_ASSERT(visible != NULL);
-    TEST_ASSERT(!strcmp(visible, canonical.ptr));
-    free(visible);
-    request_free(&r);
-
     /* Now build what the NEXT request would render: history includes this
      * assistant message, plus a new user message.  It begins with the key;
      * the turn end that follows is tokenized as part of the suffix. */
@@ -21612,21 +21185,8 @@ static void test_parsed_image_is_identified_by_fingerprint(void) {
 
 /* A state's text with its reasoning dropped reads like a replay that never
  * had it; the open block of the assistant prefix at the end stays. */
-static void test_qwen_visible_text_empties_think_blocks(void) {
-    static const char live[] =
-        "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\nlet me see\n</think>\n\n"
-        "hello<|im_end|>\n<|im_start|>user\nmore<|im_end|>\n<|im_start|>assistant\n<think>\n";
-    static const char replay[] =
-        "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        "hello<|im_end|>\n<|im_start|>user\nmore<|im_end|>\n<|im_start|>assistant\n<think>\n";
-    buf visible = {0};
-    qwen_visible_text(&visible, live, sizeof(live) - 1);
-    TEST_ASSERT(visible.len == sizeof(replay) - 1 && !memcmp(visible.ptr, replay, visible.len));
-    buf_free(&visible);
-}
 
 static void ds4_server_unit_tests_run(void) {
-    test_qwen_visible_text_empties_think_blocks();
     test_parsed_image_is_identified_by_fingerprint();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
@@ -21649,6 +21209,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_qwen_reference_cases();
     test_render_qwen_late_developer_keeps_prefix();
     test_parse_qwen_tool_call_message();
+    test_qwen_replay_begins_with_the_live_text();
     test_qwen_tool_checkpoint_suffix_is_canonical();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
@@ -21706,8 +21267,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_canonicalization_gate_exact_replay();
     test_responses_live_tail_renders_tool_outputs_only();
     test_responses_tool_output_id_validation();
-    test_responses_stateless_tool_replay_requires_reasoning();
-    test_responses_visible_suffix_matches_client_replay();
+    test_responses_replayed_tool_turn_is_matched_by_text();
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
@@ -21746,7 +21306,6 @@ static void ds4_server_unit_tests_run(void) {
     test_cancel_running_job_keeps_worker_ownership();
     test_cancel_withdraws_only_pending_decode();
     test_thinking_state_tracks_prompt_and_generated_tags();
-    test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();

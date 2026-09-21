@@ -1241,23 +1241,32 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
      * the live one and the file's checkpoints (ds4_kvstore.h); the session's
      * saved states stay in memory, where they serve the edits of the last
      * few turns: on disk they were most of a file's state bytes, rewritten
-     * by every store, and hardly ever the state a prompt resumed from. */
+     * by every store, and hardly ever the state a prompt resumed from.
+     * One saved state goes along, the one the store names (sent_len): where
+     * the client's own text ended, before what was generated after it.  The
+     * live state past it resumes a client that sends the generation back as
+     * it was, this one a client that does not (no reasoning, an edit). */
     const bool split = kc != NULL && ds4_session_block_positions(session) != 0;
-    size_t n_engine = ds4_session_state_count(session);
-    if (n_engine == 0 || ds4_session_state_position(session, 0) != (uint32_t)tokens.len) {
+    const size_t n_states = ds4_session_state_count(session);
+    if (n_states == 0 || ds4_session_state_position(session, 0) != (uint32_t)tokens.len) {
         kv_set_err(err, err_len, "session has no state to store");
         ds4_tokens_free(&tokens);
         return NULL;
     }
-    if (split) n_engine = 1;
-    uint32_t positions[64];
-    size_t lens[64];
-    if (n_engine > 63) {
+    if (n_states > 63) {
         kv_set_err(err, err_len, "too many saved states");
         ds4_tokens_free(&tokens);
         return NULL;
     }
-    for (size_t i = 0; i < n_engine; i++) positions[i] = ds4_session_state_position(session, i);
+    uint32_t positions[64];
+    size_t engine_index[64], lens[64];
+    size_t n_engine = 0;
+    for (size_t i = 0; i < n_states; i++) {
+        const uint32_t position = ds4_session_state_position(session, i);
+        if (split && i != 0 && (req->sent_len <= 0 || position != (uint32_t)req->sent_len)) continue;
+        positions[n_engine] = position;
+        engine_index[n_engine++] = i;
+    }
     /* The history's pictures.  Only a file of blocks lists them (a state
      * read back takes its own from the list), and the text must spell every
      * one whole: a history that stops inside a picture has no key. */
@@ -1283,8 +1292,8 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
         kv_state_src *s = &st[n++];
         memset(s, 0, sizeof(*s));
         s->position = positions[i];
-        s->engine_index = i;
-        s->bytes = ds4_session_state_bytes(session, i);
+        s->engine_index = engine_index[i];
+        s->bytes = ds4_session_state_bytes(session, engine_index[i]);
         if (i == 0 && override) {
             s->key = kv_xstrdup(req->key_override);
             s->key_len = (uint32_t)strlen(s->key);
@@ -1393,11 +1402,16 @@ char *ds4_kvstore_store(ds4_kvstore *kc, ds4_engine *engine, ds4_session *sessio
         }
     }
     if (oldfp) fclose(oldfp);
-    /* The live state is a checkpoint when the store says so, and always in a
-     * new file: a file begins with a checkpoint.  One the file already has
-     * at this position is not written again. */
-    if (split) st[0].in_ckpt = req->checkpoint || n == n_live;
-    for (uint32_t k = n_live; k < n; k++) if (st[k].ckpt_at && st[k].position == st[0].position) st[0].in_ckpt = false;
+    /* The live state is a checkpoint when the store says so.  A file begins
+     * with a checkpoint: a new file's is the state where the client's text
+     * ended when the store has it (what follows was generated, and no
+     * checkpoint stands on that), else the live one.  One the file already
+     * has at this position is not written again. */
+    if (split) st[0].in_ckpt = req->checkpoint;
+    if (split && n == n_live) st[n_live - 1].in_ckpt = true;
+    for (uint32_t i = 0; i < n_live; i++)
+        for (uint32_t k = n_live; k < n; k++)
+            if (st[k].ckpt_at && st[k].position == st[i].position) st[i].in_ckpt = false;
 
     uint64_t trailer_est = 0;
     const uint32_t block_positions = ds4_session_block_positions(session);
@@ -1802,6 +1816,20 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         if (result) {
             result->tokens = loaded;
             result->history_tokens = (int)e->tokens;
+            /* Whose file it is.  Resumed whole, the conversation's own.  Short
+             * of that, the conversation that left it when no checkpoint
+             * stands past the state: what the file holds beyond is the last
+             * turn's generation, which its client did not send back as it
+             * was, and extending the file from here cuts no checkpoint.  Not
+             * from a file's first state, though, which conversations that
+             * share a system prompt all begin with. */
+            uint32_t earliest = UINT32_MAX;
+            bool last = true;
+            for (uint32_t i = 0; i < e->n_states; i++) {
+                if (e->state[i].position < earliest) earliest = e->state[i].position;
+                last &= !e->state[i].in_ckpt || e->state[i].position <= st->position;
+            }
+            result->own = loaded == (int)e->tokens || (last && st->position != earliest);
             result->key_len = st->key_len;
             result->quant_bits = e->quant_bits;
             result->ext_flags = e->ext_flags;

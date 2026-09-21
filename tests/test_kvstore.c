@@ -299,6 +299,111 @@ static void test_anchor_survives_extensions(ds4_kvstore *kc, const char *dir) {
     ds4_tokens_free(&s.tokens);
 }
 
+/* Only the slot a file belongs to passes it as its own, and only that store
+ * may rewind it.  A slot that resumed an earlier state of the file read it
+ * and holds no file: whatever it stores, a history that leaves the file's,
+ * one that stops short of it, or the very text the file is named by, the
+ * file's checkpoints stand and its whole history still resumes. */
+static void test_other_slot_never_cuts_the_companion(ds4_kvstore *kc, const char *dir) {
+    clear_dir(dir);
+    ds4_session s = {0};
+    session_set(&s, SHARED);
+    char *file = store(kc, &s, NULL, "cold");
+    const char *turns[] = { SHARED "turnone", SHARED "turnoneturntwo" };
+    for (size_t i = 0; i < sizeof(turns) / sizeof(turns[0]); i++) {
+        session_set(&s, turns[i]);
+        char *grown = store(kc, &s, file, "continued");
+        CHECK(grown && file && !strcmp(grown, file));
+        free(grown);
+    }
+    const long companion = companion_bytes(file);
+    CHECK(companion == 3 * (16 + FAKE_STATE_BYTES));
+
+    const char *others[] = { SHARED, SHARED "turn", SHARED "turnoneanother", "sys" };
+    for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+        session_set(&s, others[i]);
+        char *path = store(kc, &s, NULL, i % 2 ? "evict" : "continued");
+        CHECK(path != NULL);
+        /* the file's own name is its first text: that state it covers */
+        CHECK(path && (i == 0) == !strcmp(path, file));
+        CHECK(companion_bytes(file) == companion);
+        CHECK(resume(kc, SHARED "turnoneturntwo!") == (int)strlen(SHARED "turnoneturntwo"));
+        CHECK(resume(kc, SHARED "turnone!") >= (int)strlen(SHARED "turnone"));
+        free(path);
+    }
+    free(file);
+    ds4_tokens_free(&s.tokens);
+}
+
+/* Only what a client sent is its conversation's history.  A slot given up
+ * after a turn stores the live state, generation included, and beside it the
+ * state saved where the client's text ended: a client that sends the
+ * generation back as it was resumes whole, one that does not (no reasoning,
+ * an edit) resumes from its own text, and either way the file is that
+ * conversation's to extend.  No checkpoint stands on generated text, and a
+ * file's first state, which conversations sharing a system prompt all begin
+ * with, makes nobody its owner. */
+static int resume_own(ds4_kvstore *kc, const char *prompt, bool *own) {
+    ds4_session fresh = {0};
+    ds4_tokens effective = {0};
+    ds4_kvstore_load_result lr = {0};
+    const int got = ds4_kvstore_try_load_text(kc, NULL, &fresh, prompt, &effective, &lr, NULL, false);
+    *own = lr.own;
+    ds4_kvstore_load_result_free(&lr);
+    ds4_tokens_free(&effective);
+    ds4_tokens_free(&fresh.tokens);
+    return got;
+}
+
+static void test_turn_end_store_keeps_the_sent_state(ds4_kvstore *kc, const char *dir) {
+    clear_dir(dir);
+    ds4_session s = {0};
+    char err[160] = {0};
+    bool own = false;
+    session_set(&s, SHARED);
+    char *path = store(kc, &s, NULL, "cold");
+    CHECK(path != NULL);
+
+    const char *sent = SHARED "question";
+    const char *whole = SHARED "questionthoughtsanswer";
+    session_set(&s, whole);
+    s.saved[s.n_saved++] = (uint32_t)strlen(sent);
+    const ds4_kvstore_store_request req = { .tokens = &s.tokens, .store_len = s.tokens.len,
+                                            .sent_len = (int)strlen(sent), .reason = "evict",
+                                            .extend_path = path };
+    char *stored = ds4_kvstore_store(kc, NULL, &s, &req, err, sizeof(err));
+    CHECK(stored && !strcmp(stored, path) && count_files(dir) == 1);
+    CHECK(companion_bytes(path) == 16 + FAKE_STATE_BYTES);   /* the cold one alone */
+
+    CHECK(resume_own(kc, SHARED "questionthoughtsanswernext", &own) == (int)strlen(whole) && own);
+    CHECK(resume_own(kc, SHARED "questionanswernext", &own) == (int)strlen(sent) && own);
+    CHECK(resume_own(kc, SHARED "anotherconversation", &own) == (int)strlen(SHARED) && !own);
+
+    /* the client that dropped the reasoning goes on: the file is rewritten
+     * from where its text ended, and the generation it never sent is gone */
+    session_set(&s, SHARED "questionanswernext");
+    char *grown = store(kc, &s, path, "evict");
+    CHECK(grown && !strcmp(grown, path) && count_files(dir) == 1);
+    CHECK(resume(kc, SHARED "questionanswernext!") == (int)strlen(SHARED "questionanswernext"));
+    CHECK(resume(kc, SHARED "questionthoughtsanswernext") == (int)strlen(SHARED));
+
+    /* a new file begins with a checkpoint, which is the sent state */
+    clear_dir(dir);
+    session_set(&s, whole);
+    s.saved[s.n_saved++] = (uint32_t)strlen(sent);
+    ds4_kvstore_store_request fresh = req;
+    fresh.extend_path = NULL;
+    char *first = ds4_kvstore_store(kc, NULL, &s, &fresh, err, sizeof(err));
+    CHECK(first != NULL && companion_bytes(first) == 16 + FAKE_STATE_BYTES);
+    CHECK(resume_own(kc, SHARED "questionthoughtsanswernext", &own) == (int)strlen(whole) && own);
+    CHECK(resume_own(kc, SHARED "questionanswernext", &own) == (int)strlen(sent) && !own);
+    free(first);
+    free(grown);
+    free(stored);
+    free(path);
+    ds4_tokens_free(&s.tokens);
+}
+
 /* The server's use of the store, driven at random: one slot whose history
  * grows, rewinds to an earlier point and diverges (the same conversation),
  * or is replaced by another conversation that shares a prefix with one seen
@@ -583,6 +688,8 @@ int main(int argc, char **argv) {
     test_same_state_is_covered(&kc, dir);
     test_growth_extends_file(&kc, dir);
     test_anchor_survives_extensions(&kc, dir);
+    test_other_slot_never_cuts_the_companion(&kc, dir);
+    test_turn_end_store_keeps_the_sent_state(&kc, dir);
     test_random_slot_lifecycle(&kc, dir);
     test_pictures_key_the_state(&kc, dir);
     ds4_kvstore_close(&kc);
