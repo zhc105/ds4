@@ -5,12 +5,13 @@
  *
  * A conversation's history on disk is a chain of files.  Every file but the
  * last is a sealed segment: the blocks of a run of positions and the state
- * at its end, written once and never again.  The server seals at every
- * multiple of SEGMENT_TOKENS (its prefill pieces and decode steps end
- * there), so a segment is that long, or a multiple of it where a boundary
- * fell inside a picture or on a prompt's last token; the store itself takes
- * whatever run it is given.  A segment names its parent, and is named by
- * what it stands for,
+ * at its end, written once and never again.  The server cuts at every
+ * multiple of SEGMENT_TOKENS, or where the history can be cut just before it
+ * (not inside a picture, not after a prompt's last token: ds4_server.c,
+ * chain_cut), and its prefill pieces and decode steps end there; so a segment
+ * is that long give or take a picture.  The store itself takes whatever run
+ * it is given.  A segment names its parent, and is named by what it stands
+ * for,
  *
  *     id = sha1(root, the history's rendered text from its beginning to the
  *               segment's end)

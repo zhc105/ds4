@@ -11335,25 +11335,49 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
 static int server_store_boundary(ds4_engine *e, const ds4_vision_span *images, size_t image_count,
                                  int target, size_t *stored_images);
 
+/* Where the chain store cuts the slot's history for the segment boundary at
+ * multiple m of its length: m, or the last place before it the history can
+ * be cut.  Not inside a picture: the cut moves back to where the picture
+ * begins.  Not right after a prompt's last token, the newline after <think>,
+ * which a replay without the reasoning renders merged with the next: the cut
+ * moves back one.  So a segment is its length give or take a picture, and
+ * the same history is cut at the same places whatever pieces or steps it
+ * arrived in. */
+static int chain_cut(server *s, const server_slot *slot, int m) {
+    const job *j = slot->running;
+    size_t n = 0;
+    int cut = j ? server_store_boundary(s->engine, j->req.images, j->req.image_count, m, &n) : m;
+    if (cut == slot->prompt_end) cut--;
+    return cut;
+}
+
+/* The first cut past position pos: where a prefill piece or a decode step
+ * ends, so that the state there is there to seal. */
+static int chain_next_cut(server *s, const server_slot *slot, int pos) {
+    const int seg = s->chain.segment_tokens;
+    for (int m = (pos / seg + 1) * seg;; m += seg) {
+        const int cut = chain_cut(s, slot, m);
+        if (cut > pos) return cut;
+    }
+}
+
+/* Whether pos is a cut: the one the boundary at or after it moves back to. */
+static bool chain_is_cut(server *s, const server_slot *slot, int pos) {
+    const int seg = s->chain.segment_tokens;
+    return pos > 0 && chain_cut(s, slot, (pos + seg - 1) / seg * seg) == pos;
+}
+
 /* Called as the live history grows, by a prefill piece or a decode step: the
- * place for a checkpoint.  The chain store seals a segment at every multiple
- * of its length the history stops at (prefill pieces and decode steps both
- * end there), and only there: the same history is sealed at the same places
- * whoever brings it, prompt or generation.  Not at the prompt's last token,
- * the newline after <think>: a request that replays the turn without its
- * reasoning renders it merged with the next one, so the segment's text
- * would begin that request while its tokens do not. */
+ * place for a checkpoint.  The chain store seals a segment at every cut the
+ * history stops at (prefill pieces and decode steps end on them), prompt or
+ * generation alike. */
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!s || !slot) return;
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
     if (s->chain.enabled) {
-        if (tokens->len == slot->prompt_end) return;
-        if (tokens->len % s->chain.segment_tokens != 0 || tokens->len <= (int)slot->chain_sealed_end) return;
-        const job *j = slot->running;
-        size_t n = 0;
-        if (j && server_store_boundary(s->engine, j->req.images, j->req.image_count, tokens->len, &n) != tokens->len) return;
+        if (tokens->len <= (int)slot->chain_sealed_end || !chain_is_cut(s, slot, tokens->len)) return;
         (void)kv_cache_store_live_prefix(s, slot, tokens, tokens->len, "continued");
         return;
     }
@@ -12406,15 +12430,12 @@ static int server_session_sync(server *s, server_slot *slot,
         int target = s->batched_mode ? done + server_prefill_quantum(s) : prompt->len;
         if (target > prompt->len || target < done) target = prompt->len;
         if (target <= 0) target = prompt->len;
-        /* A piece ends where a segment of the chain store does: a segment is
-         * sealed from the state at its end, which exists only if the prefill
-         * stops there.  The same history is then cut at the same places
-         * whatever pieces it arrived in, and its segments are shared.  (A
-         * boundary inside a picture is passed over, below, as is one crossed
-         * while generating: that segment ends at the next.) */
+        /* A piece ends where a segment of the chain store does (chain_cut):
+         * a segment is sealed from the state at its end, which exists only
+         * if the prefill stops there. */
         if (s->chain.enabled) {
-            const int next = (done / s->chain.segment_tokens + 1) * s->chain.segment_tokens;
-            if (target > next) target = next;
+            const int cut = chain_next_cut(s, slot, done);
+            if (target > cut) target = cut;
         }
         size_t piece_images = 0;
         target = server_piece_end(images, image_count, target, prompt->len,
@@ -13668,8 +13689,8 @@ decode_again:
          * if the decode stops on it, as a prefill piece does. */
         if (s->chain.enabled && disk) {
             const int pos = ds4_session_pos(slot->session);
-            const int to_boundary = (pos / s->chain.segment_tokens + 1) * s->chain.segment_tokens - pos;
-            if (slot->decode_spec.max_tokens > to_boundary) slot->decode_spec.max_tokens = to_boundary;
+            const int to_cut = chain_next_cut(s, slot, pos) - pos;
+            if (slot->decode_spec.max_tokens > to_cut) slot->decode_spec.max_tokens = to_cut;
         }
         slot->decode_spec.eos_token = eos_token;
         slot->decode_spec.think_mode = j->req.think_mode;
@@ -20216,6 +20237,28 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_free(&prompt);
 }
 
+/* The chain store's cuts: every multiple of the segment length, except that a
+ * prompt's last token moves its cut back one, where the prompt's state is,
+ * so the segment is one short and the next one long; no boundary is passed
+ * over, and whether a position is a cut does not depend on where the last
+ * segment ended. */
+static void test_chain_cuts_move_back_instead_of_skipping(void) {
+    server s = {0};
+    s.chain.segment_tokens = 16384;
+    server_slot slot = {0};
+    slot.prompt_end = 5000;
+    TEST_ASSERT(chain_next_cut(&s, &slot, 0) == 16384);
+    TEST_ASSERT(chain_next_cut(&s, &slot, 16383) == 16384);
+    TEST_ASSERT(chain_next_cut(&s, &slot, 16384) == 32768);
+    TEST_ASSERT(chain_is_cut(&s, &slot, 32768) && !chain_is_cut(&s, &slot, 32767));
+
+    slot.prompt_end = 32768;
+    TEST_ASSERT(chain_next_cut(&s, &slot, 16384) == 32767);
+    TEST_ASSERT(chain_next_cut(&s, &slot, 32767) == 49152);
+    TEST_ASSERT(chain_is_cut(&s, &slot, 32767) && !chain_is_cut(&s, &slot, 32768));
+    TEST_ASSERT(chain_is_cut(&s, &slot, 16384) && !chain_is_cut(&s, &slot, 0));
+}
+
 static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -21506,6 +21549,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
+    test_chain_cuts_move_back_instead_of_skipping();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
