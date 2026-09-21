@@ -214,14 +214,9 @@ static chain_links links_build(const ds4_chainstore *cs) {
     return l;
 }
 
-static bool header_read(const char *path, ds4_chainstore_node *n) {
-    FILE *fp = fopen(path, "rb");
-    uint8_t h[CHAIN_HEADER];
-    const bool ok = fp && fread(h, 1, sizeof(h), fp) == sizeof(h) &&
-                    memcmp(h, CHAIN_MAGIC, 8) == 0 && h[11] == 1 &&
-                    (h[8] == CHAIN_SEALED || h[8] == CHAIN_TAIL);
-    if (fp) fclose(fp);
-    if (!ok) return false;
+/* The index entry a file's header describes (path, size and age aside). */
+static bool header_parse(const uint8_t h[CHAIN_HEADER], ds4_chainstore_node *n) {
+    if (memcmp(h, CHAIN_MAGIC, 8) != 0 || h[11] != 1 || (h[8] != CHAIN_SEALED && h[8] != CHAIN_TAIL)) return false;
     memset(n, 0, sizeof(*n));
     n->tail = h[8] == CHAIN_TAIL;
     n->start = ds4_kvstore_le_get32(h + 16);
@@ -233,16 +228,28 @@ static bool header_read(const char *path, ds4_chainstore_node *n) {
     n->sent_text_len = ds4_kvstore_le_get32(h + 76);
     memcpy(n->sent_id, h + 80, ID_BYTES);
     n->state_bytes = get64(h + 104);
+    return n->end > n->start;
+}
+
+static bool header_read(const char *path, ds4_chainstore_node *n) {
+    FILE *fp = fopen(path, "rb");
+    uint8_t h[CHAIN_HEADER];
+    const bool ok = fp && fread(h, 1, sizeof(h), fp) == sizeof(h);
+    if (fp) fclose(fp);
     struct stat st;
-    if (stat(path, &st) != 0 || n->end <= n->start) return false;
+    if (!ok || !header_parse(h, n) || stat(path, &st) != 0) return false;
     n->file_size = (uint64_t)st.st_size;
     n->last_used = (uint64_t)st.st_mtime;
     return true;
 }
 
 uint64_t ds4_chainstore_bytes(const ds4_chainstore *cs) {
+    if (!cs || !cs->enabled) return 0;
+    pthread_mutex_t *mu = (pthread_mutex_t *)&cs->mu;
+    pthread_mutex_lock(mu);
     uint64_t bytes = 0;
-    for (int i = 0; cs && i < cs->len; i++) bytes += cs->node[i].file_size;
+    for (int i = 0; i < cs->len; i++) bytes += cs->node[i].file_size;
+    pthread_mutex_unlock(mu);
     return bytes;
 }
 
@@ -251,6 +258,13 @@ bool ds4_chainstore_open(ds4_chainstore *cs, const char *dir, uint64_t budget_mb
                          void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg), void *log_ud) {
     memset(cs, 0, sizeof(*cs));
     if (!dir || !dir[0]) return false;
+    /* recursive: the calls that make room or add a file are made from ones
+     * that hold it (write evicts) */
+    pthread_mutexattr_t recursive;
+    pthread_mutexattr_init(&recursive);
+    pthread_mutexattr_settype(&recursive, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&cs->mu, &recursive);
+    pthread_mutexattr_destroy(&recursive);
     if (mkdir(dir, 0700) != 0 && errno != EEXIST) return false;
     cs->dir = strdup(dir);
     cs->budget_bytes = budget_mb * 1024u * 1024u;
@@ -299,17 +313,20 @@ bool ds4_chainstore_open(ds4_chainstore *cs, const char *dir, uint64_t budget_mb
 }
 
 void ds4_chainstore_close(ds4_chainstore *cs) {
-    if (!cs) return;
+    if (!cs || !cs->enabled) return;
     for (int i = 0; i < cs->len; i++) free(cs->node[i].path);
     free(cs->node);
     free(cs->pin);
     free(cs->dir);
+    pthread_mutex_destroy(&cs->mu);
     memset(cs, 0, sizeof(*cs));
 }
 
 void ds4_chainstore_pin(ds4_chainstore *cs, int slot, const uint8_t *id) {
     if (!cs || !cs->enabled || slot < 0 || slot >= cs->n_pins) return;
+    pthread_mutex_lock(&cs->mu);
     memcpy(cs->pin[slot], id ? id : g_no_id, ID_BYTES);
+    pthread_mutex_unlock(&cs->mu);
 }
 
 /* The index is what the files say, and every write asks it for room, so it
@@ -347,10 +364,10 @@ static void chain_sweep(ds4_chainstore *cs) {
  * asked of the parent fields each time, not kept. */
 void ds4_chainstore_evict(ds4_chainstore *cs, uint64_t extra_bytes) {
     if (!cs || !cs->enabled) return;
+    pthread_mutex_lock(&cs->mu);
     chain_sweep(cs);
-    if (cs->budget_bytes == 0) return;
     uint64_t bytes = ds4_chainstore_bytes(cs);
-    while (bytes + extra_bytes > cs->budget_bytes) {
+    while (cs->budget_bytes != 0 && bytes + extra_bytes > cs->budget_bytes) {
         chain_links l = links_build(cs);
         int victim = -1;
         for (int i = 0; i < cs->len; i++) {
@@ -370,11 +387,15 @@ void ds4_chainstore_evict(ds4_chainstore *cs, uint64_t extra_bytes) {
         bytes -= cs->node[victim].file_size;
         node_remove(cs, victim);
     }
+    pthread_mutex_unlock(&cs->mu);
 }
 
 void ds4_chainstore_drop_tail(ds4_chainstore *cs, const char *tail_path) {
-    const int i = cs && cs->enabled ? node_find_path(cs, tail_path) : -1;
+    if (!cs || !cs->enabled) return;
+    pthread_mutex_lock(&cs->mu);
+    const int i = node_find_path(cs, tail_path);
     if (i >= 0 && cs->node[i].tail) node_remove(cs, i);
+    pthread_mutex_unlock(&cs->mu);
 }
 
 static void node_touch(ds4_chainstore_node *n) {
@@ -391,49 +412,75 @@ typedef struct {
     uint8_t id[ID_BYTES];
 } chain_state;
 
-/* One file of the live history's positions [start, end): its blocks, the
- * states given (the one at `end` first), its meta.  Written under a
- * temporary name and renamed to `path`. */
-static bool chain_write(ds4_chainstore *cs, ds4_engine *engine, ds4_session *session,
-                        const char *path, uint8_t kind, const uint8_t *parent, uint32_t start,
-                        const chain_state *st, uint32_t n_states, const char *text,
-                        const ds4_kvstore_trailer_hooks *hooks, uint64_t *size_out,
-                        char *err, size_t err_len) {
+struct ds4_chainstore_file {
+    uint8_t *buf;           /* the whole file, header first */
+    size_t len;
+    char *path;
+    bool sealed;            /* a segment: written once, by whoever gets there first */
+    uint32_t sent;          /* a tail's second state, for the log */
+    char *reason;
+    double make_ms;
+};
+
+void ds4_chainstore_file_free(ds4_chainstore_file *f) {
+    if (!f) return;
+    free(f->buf);
+    free(f->path);
+    free(f->reason);
+    free(f);
+}
+
+/* The file of the live history's positions [start, end), made in memory: its
+ * blocks, the states given (the one at `end` first), its meta.  The size is
+ * worked out first and the file written into exactly that much memory, so
+ * that the engine writing more or less than it said is an error here, not a
+ * file that reads wrong later.  The caller holds the session; not the
+ * store's lock, which a copy this long must not hold up. */
+static ds4_chainstore_file *chain_make(ds4_chainstore *cs, ds4_engine *engine, ds4_session *session,
+                                       char *path, uint8_t kind, const uint8_t *parent, uint32_t start,
+                                       const chain_state *st, uint32_t n_states, const char *text,
+                                       const ds4_kvstore_trailer_hooks *hooks, char *err, size_t err_len) {
+    const double t0 = now_sec();
     const ds4_tokens *tokens = ds4_session_tokens(session);
     const uint32_t end = st[0].position;
     const uint32_t bp = ds4_session_block_positions(session);
     const uint64_t state_bytes = ds4_session_state_bytes(session, st[0].engine_index);
     size_t n_images = 0;
     const ds4_vision_identity *images = ds4_session_vision_identities(session, &n_images);
+    const uint32_t first_block = start - start % bp;
+    uint32_t n_own = 0;
+    for (size_t i = 0; i < n_images; i++) n_own += images[i].token_start >= start && images[i].token_start < end;
 
     uint64_t trailer_bytes = 0;
     if (hooks && hooks->serialized_size && !hooks->serialized_size(hooks->ud, text, &trailer_bytes)) {
         set_err(err, err_len, "the trailer cannot be sized");
-        return false;
+        free(path);
+        return NULL;
     }
-    uint64_t need = CHAIN_HEADER + ds4_session_block_bytes(session, start - start % bp, end) + n_states * state_bytes +
-                    (uint64_t)(end - start) * 4u + st[0].text_len + trailer_bytes + 64u;
-    if (cs->budget_bytes != 0 && need > cs->budget_bytes) {
+    const uint64_t size = CHAIN_HEADER + ds4_session_block_bytes(session, first_block, end) +
+                          n_states * state_bytes +
+                          4u + (uint64_t)(end - start) * 4u +
+                          4u + (uint64_t)n_own * (8u + sizeof(images[0].fingerprint)) +
+                          4u + st[0].text_len +
+                          8u + trailer_bytes;
+    if ((cs->budget_bytes != 0 && size > cs->budget_bytes) || size > SIZE_MAX) {
         set_err(err, err_len, "the file is larger than the store's budget");
-        return false;
+        free(path);
+        return NULL;
     }
-    ds4_chainstore_evict(cs, need);
-    /* Under a segment that is gone the file could never be resumed.  The
-     * session holds every row from the beginning, so the file begins the
-     * chain anew instead (and is that much larger). */
-    if (!id_is_none(parent) && node_find(cs, parent) < 0) {
-        chain_logf(cs, DS4_KVSTORE_LOG_WARNING, "%s: kv chain parent of tokens=%u.. is gone: written from 0",
-                   cs->log_name, start);
-        parent = NULL;
-        start = 0;
+    ds4_chainstore_file *f = calloc(1, sizeof(*f));
+    f->path = path;
+    f->sealed = kind == CHAIN_SEALED;
+    f->sent = n_states > 1 ? st[1].position : 0;
+    f->buf = malloc((size_t)size);
+    FILE *fp = f->buf ? fmemopen(f->buf, (size_t)size, "wb") : NULL;
+    if (!fp) {
+        set_err(err, err_len, "no memory for the file");
+        ds4_chainstore_file_free(f);
+        return NULL;
     }
-    const uint32_t first_block = start - start % bp;
-
-    char tmp[1200];
-    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
-    FILE *fp = fopen(tmp, "wb");
     uint8_t h[CHAIN_HEADER] = {0};
-    bool ok = fp && fwrite(h, 1, sizeof(h), fp) == sizeof(h);
+    bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h);
     for (uint32_t b = first_block; ok && b < end; b += bp) {
         const uint32_t to = b + bp < end ? b + bp : end;
         ok = ds4_session_write_blocks(session, fp, b, to, err, err_len) == 0;
@@ -445,8 +492,6 @@ static bool chain_write(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
     const off_t meta = ok ? ftello(fp) : -1;
     ok = ok && meta >= 0 && write_u32(fp, end - start);
     for (uint32_t i = start; ok && i < end; i++) ok = write_u32(fp, (uint32_t)tokens->v[i]);
-    uint32_t n_own = 0;
-    for (size_t i = 0; i < n_images; i++) n_own += images[i].token_start >= start && images[i].token_start < end;
     ok = ok && write_u32(fp, n_own);
     for (size_t i = 0; ok && i < n_images; i++) {
         if (images[i].token_start < start || images[i].token_start >= end) continue;
@@ -460,7 +505,11 @@ static bool chain_write(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
     put64(tb, 0);
     ok = ok && trailer_at >= 0 && fwrite(tb, 1, 8, fp) == 8;
     if (ok && hooks && hooks->write && trailer_bytes != 0) ok = hooks->write(hooks->ud, fp, text, &written);
-    const off_t size = ok ? ftello(fp) : -1;
+    const off_t len = ok ? ftello(fp) : -1;
+    if (ok && (uint64_t)len != size) {
+        set_err(err, err_len, "the file came out another size than its parts said");
+        ok = false;
+    }
     if (ok && written != 0) {
         put64(tb, written);
         ok = fseeko(fp, trailer_at, SEEK_SET) == 0 && fwrite(tb, 1, 8, fp) == 8;
@@ -487,16 +536,106 @@ static bool chain_write(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
     put64(h + 104, state_bytes);
     put64(h + 112, ok ? (uint64_t)meta : 0);
     put64(h + 120, (uint64_t)time(NULL));
-    ok = ok && size >= 0 && fseeko(fp, 0, SEEK_SET) == 0 && fwrite(h, 1, sizeof(h), fp) == sizeof(h);
-    if (fp && fclose(fp) != 0) ok = false;
-    ok = ok && rename(tmp, path) == 0;
+    ok = ok && fseeko(fp, 0, SEEK_SET) == 0 && fwrite(h, 1, sizeof(h), fp) == sizeof(h);
+    if (fclose(fp) != 0) ok = false;
     if (!ok) {
+        if (err && err_len && !err[0]) set_err(err, err_len, "the file could not be made");
+        ds4_chainstore_file_free(f);
+        return NULL;
+    }
+    f->len = (size_t)size;
+    f->make_ms = (now_sec() - t0) * 1000.0;
+    return f;
+}
+
+/* Where a file under `parent` begins: at sealed_end, or at 0 when that
+ * segment is gone, since the file could never be resumed under it and the
+ * session holds every row from the beginning.  Under the store's lock. */
+static uint32_t chain_start(ds4_chainstore *cs, const uint8_t **parent, uint32_t sealed_end) {
+    chain_sweep(cs);   /* a segment the chain lost on the way to it is gone too */
+    if (id_is_none(*parent) || node_find(cs, *parent) >= 0) return sealed_end;
+    chain_logf(cs, DS4_KVSTORE_LOG_WARNING, "%s: kv chain parent of tokens=%u.. is gone: written from 0",
+               cs->log_name, sealed_end);
+    *parent = NULL;
+    return 0;
+}
+
+/* Make a file durable before it has a name: its data and then, once renamed,
+ * the directory entry.  A crash leaves the old file or the new one, whole;
+ * at worst a temporary file, which the next open removes. */
+static bool chain_put(ds4_chainstore *cs, const ds4_chainstore_file *f, unsigned serial, char *err, size_t err_len) {
+    char tmp[1200];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld.%u", f->path, (long)getpid(), serial);
+    FILE *fp = fopen(tmp, "wb");
+    bool ok = fp && fwrite(f->buf, 1, f->len, fp) == f->len && fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+    if (fp && fclose(fp) != 0) ok = false;
+    ok = ok && rename(tmp, f->path) == 0;
+    if (!ok) {
+        set_err(err, err_len, strerror(errno));
         unlink(tmp);
-        if (err && err_len && !err[0]) set_err(err, err_len, strerror(errno));
         return false;
     }
-    *size_out = (uint64_t)size;
+    const int dir = open(cs->dir, O_RDONLY);
+    if (dir >= 0) {
+        (void)fsync(dir);
+        close(dir);
+    }
     return true;
+}
+
+char *ds4_chainstore_write(ds4_chainstore *cs, ds4_chainstore_file *f, char *err, size_t err_len) {
+    if (err && err_len) err[0] = '\0';
+    if (!cs || !cs->enabled || !f) {
+        ds4_chainstore_file_free(f);
+        return NULL;
+    }
+    const double t0 = now_sec();
+    ds4_chainstore_node n;
+    header_parse(f->buf, &n);
+    pthread_mutex_lock(&cs->mu);
+    /* a segment another conversation wrote since this one was made is the same file */
+    const int have = f->sealed ? node_find(cs, n.id) : -1;
+    if (have >= 0) {
+        node_touch(&cs->node[have]);
+        char *path = strdup(cs->node[have].path);
+        pthread_mutex_unlock(&cs->mu);
+        ds4_chainstore_file_free(f);
+        return path;
+    }
+    ds4_chainstore_evict(cs, f->len);
+    const unsigned serial = cs->serial++;
+    pthread_mutex_unlock(&cs->mu);
+
+    if (!chain_put(cs, f, serial, err, err_len)) {
+        chain_logf(cs, DS4_KVSTORE_LOG_WARNING, "%s: kv chain write failed: %s: %s", cs->log_name, f->path, err);
+        ds4_chainstore_file_free(f);
+        return NULL;
+    }
+    const double write_ms = (now_sec() - t0) * 1000.0;
+
+    pthread_mutex_lock(&cs->mu);
+    n.path = strdup(f->path);
+    n.file_size = f->len;
+    n.last_used = (uint64_t)time(NULL);
+    const int was = node_find_path(cs, f->path);
+    if (was >= 0) node_forget(cs, was);   /* the file was replaced: so is its entry */
+    node_add(cs, &n);
+    pthread_mutex_unlock(&cs->mu);
+    if (f->sealed) {
+        chain_logf(cs, DS4_KVSTORE_LOG_KVCACHE,
+                   "%s: kv chain sealed tokens=%u..%u text=%u size=%.2f MiB copy=%.1f ms write=%.1f ms file=%s",
+                   cs->log_name, n.start, n.end, n.text_len, (double)f->len / 1048576.0,
+                   f->make_ms, write_ms, f->path);
+    } else {
+        chain_logf(cs, DS4_KVSTORE_LOG_KVCACHE,
+                   "%s: kv chain tail stored tokens=%u..%u sent=%u reason=%s size=%.2f MiB copy=%.1f ms write=%.1f ms file=%s",
+                   cs->log_name, n.start, n.end, f->sent, f->reason ? f->reason : "unknown",
+                   (double)f->len / 1048576.0, f->make_ms, write_ms, f->path);
+    }
+    char *path = f->path;
+    f->path = NULL;
+    ds4_chainstore_file_free(f);
+    return path;
 }
 
 /* The live history's text, and how much of it stands for the first `upto`
@@ -510,24 +649,26 @@ static char *history_text(ds4_engine *engine, ds4_session *session, uint32_t upt
     return ds4_kvstore_render_history_text(engine, &prefix, images, n_images, len);
 }
 
-bool ds4_chainstore_seal(ds4_chainstore *cs, ds4_engine *engine, ds4_session *session,
-                         const uint8_t *parent, uint32_t sealed_end,
-                         const ds4_kvstore_trailer_hooks *hooks,
-                         uint8_t id_out[ID_BYTES], char *err, size_t err_len) {
+ds4_chainstore_file *ds4_chainstore_make_segment(ds4_chainstore *cs, ds4_engine *engine, ds4_session *session,
+                                                 const uint8_t *parent, uint32_t sealed_end,
+                                                 const ds4_kvstore_trailer_hooks *hooks,
+                                                 uint8_t id_out[ID_BYTES], bool *exists,
+                                                 char *err, size_t err_len) {
     if (err && err_len) err[0] = '\0';
-    if (!cs || !cs->enabled || ds4_session_block_positions(session) == 0) return false;
+    *exists = false;
+    if (!cs || !cs->enabled || ds4_session_block_positions(session) == 0) return NULL;
     const ds4_tokens *tokens = ds4_session_tokens(session);
     if (!tokens || (uint32_t)tokens->len <= sealed_end || ds4_session_state_count(session) == 0 ||
         ds4_session_state_position(session, 0) != (uint32_t)tokens->len) {
         set_err(err, err_len, "the session has no live state past the last segment");
-        return false;
+        return NULL;
     }
     size_t text_len = 0;
     char *text = history_text(engine, session, (uint32_t)tokens->len, &text_len);
     if (!text || text_len > UINT32_MAX) {
         free(text);
         set_err(err, err_len, "the history's text cannot be rendered");
-        return false;
+        return NULL;
     }
     uint8_t root[ID_BYTES];
     chain_root(engine, session, root);
@@ -535,39 +676,42 @@ bool ds4_chainstore_seal(ds4_chainstore *cs, ds4_engine *engine, ds4_session *se
     chain_id(root, text, text_len, st.id);
     memcpy(id_out, st.id, ID_BYTES);
 
+    pthread_mutex_lock(&cs->mu);
     const int have = node_find(cs, st.id);
-    if (have >= 0) {   /* another conversation with this history sealed it */
-        node_touch(&cs->node[have]);
+    if (have >= 0) node_touch(&cs->node[have]);   /* another conversation with this history sealed it */
+    const uint32_t start = have >= 0 ? 0 : chain_start(cs, &parent, sealed_end);
+    pthread_mutex_unlock(&cs->mu);
+    if (have >= 0) {
+        *exists = true;
         free(text);
-        return true;
+        return NULL;
     }
     char name[2 * ID_BYTES + 8];
     id_hex(st.id, name);
     strcat(name, ".kvs");
-    char *path = ds4_kvstore_path_join(cs->dir, name);
-    const double t0 = now_sec();
-    uint64_t size = 0;
-    const bool ok = chain_write(cs, engine, session, path, CHAIN_SEALED, parent, sealed_end, &st, 1,
-                                text, hooks, &size, err, err_len);
-    ds4_chainstore_node n;
-    if (ok && header_read(path, &n)) {
-        n.path = path;
-        path = NULL;
-        node_add(cs, &n);
-        chain_logf(cs, DS4_KVSTORE_LOG_KVCACHE,
-                   "%s: kv chain sealed tokens=%u..%u text=%zu size=%.2f MiB save=%.1f ms file=%s",
-                   cs->log_name, sealed_end, (uint32_t)tokens->len, text_len,
-                   (double)size / 1048576.0, (now_sec() - t0) * 1000.0, n.path);
-    }
-    free(path);
+    ds4_chainstore_file *f = chain_make(cs, engine, session, ds4_kvstore_path_join(cs->dir, name), CHAIN_SEALED,
+                                        parent, start, &st, 1, text, hooks, err, err_len);
     free(text);
-    return ok;
+    return f;
 }
 
-char *ds4_chainstore_store_tail(ds4_chainstore *cs, ds4_engine *engine, ds4_session *session,
-                                const uint8_t *parent, uint32_t sealed_end, int sent_len,
-                                const char *tail_path, const char *reason,
-                                const ds4_kvstore_trailer_hooks *hooks, char *err, size_t err_len) {
+bool ds4_chainstore_seal(ds4_chainstore *cs, ds4_engine *engine, ds4_session *session,
+                         const uint8_t *parent, uint32_t sealed_end,
+                         const ds4_kvstore_trailer_hooks *hooks,
+                         uint8_t id_out[ID_BYTES], char *err, size_t err_len) {
+    bool exists = false;
+    ds4_chainstore_file *f = ds4_chainstore_make_segment(cs, engine, session, parent, sealed_end, hooks,
+                                                         id_out, &exists, err, err_len);
+    if (exists) return true;
+    char *path = ds4_chainstore_write(cs, f, err, err_len);
+    free(path);
+    return path != NULL;
+}
+
+ds4_chainstore_file *ds4_chainstore_make_tail(ds4_chainstore *cs, ds4_engine *engine, ds4_session *session,
+                                              const uint8_t *parent, uint32_t sealed_end, int sent_len,
+                                              const char *tail_path, const char *reason,
+                                              const ds4_kvstore_trailer_hooks *hooks, char *err, size_t err_len) {
     if (err && err_len) err[0] = '\0';
     if (!cs || !cs->enabled || ds4_session_block_positions(session) == 0) return NULL;
     const ds4_tokens *tokens = ds4_session_tokens(session);
@@ -607,40 +751,33 @@ char *ds4_chainstore_store_tail(ds4_chainstore *cs, ds4_engine *engine, ds4_sess
      * does.  A history that went back behind its segment left that tail on
      * a branch of its own, which stays as it is; the new one gets a name. */
     char *path = NULL;
+    pthread_mutex_lock(&cs->mu);
+    const uint32_t start = chain_start(cs, &parent, sealed_end);
     const int old = node_find_path(cs, tail_path);
     if (old >= 0 && cs->node[old].tail &&
         memcmp(cs->node[old].parent, parent ? parent : g_no_id, ID_BYTES) == 0) {
         path = strdup(tail_path);
     } else {
-        static unsigned serial;
         char name[64];
         snprintf(name, sizeof(name), "tail-%lx-%lx-%x.kvt", (unsigned long)time(NULL),
-                 (unsigned long)getpid(), serial++);
+                 (unsigned long)getpid(), cs->serial++);
         path = ds4_kvstore_path_join(cs->dir, name);
     }
-    const double t0 = now_sec();
-    uint64_t size = 0;
-    bool ok = chain_write(cs, engine, session, path, CHAIN_TAIL, parent, sealed_end, st, n_states,
-                          text, hooks, &size, err, err_len);
-    ds4_chainstore_node n;
-    ok = ok && header_read(path, &n);
-    if (ok) {
-        const int was = node_find_path(cs, path);
-        if (was >= 0) {   /* the file was replaced: so is its entry */
-            node_forget(cs, was);
-        }
-        n.path = strdup(path);
-        node_add(cs, &n);
-        chain_logf(cs, DS4_KVSTORE_LOG_KVCACHE,
-                   "%s: kv chain tail stored tokens=%u..%d sent=%u reason=%s size=%.2f MiB save=%.1f ms file=%s",
-                   cs->log_name, sealed_end, tokens->len, n_states > 1 ? st[1].position : 0u,
-                   reason ? reason : "unknown", (double)size / 1048576.0, (now_sec() - t0) * 1000.0, path);
-    } else {
-        free(path);
-        path = NULL;
-    }
+    pthread_mutex_unlock(&cs->mu);
+    ds4_chainstore_file *f = chain_make(cs, engine, session, path, CHAIN_TAIL, parent, start, st, n_states,
+                                        text, hooks, err, err_len);
+    if (f) f->reason = strdup(reason ? reason : "unknown");
     free(text);
-    return path;
+    return f;
+}
+
+char *ds4_chainstore_store_tail(ds4_chainstore *cs, ds4_engine *engine, ds4_session *session,
+                                const uint8_t *parent, uint32_t sealed_end, int sent_len,
+                                const char *tail_path, const char *reason,
+                                const ds4_kvstore_trailer_hooks *hooks, char *err, size_t err_len) {
+    ds4_chainstore_file *f = ds4_chainstore_make_tail(cs, engine, session, parent, sealed_end, sent_len,
+                                                      tail_path, reason, hooks, err, err_len);
+    return f ? ds4_chainstore_write(cs, f, err, err_len) : NULL;
 }
 
 /* ---- lookup -------------------------------------------------------------
@@ -697,12 +834,20 @@ static bool chain_find(const ds4_chainstore *cs, const chain_links *l, const uin
 
 void ds4_chainstore_ancestor_at(const ds4_chainstore *cs, const uint8_t *id, uint32_t upto,
                                 uint8_t id_out[ID_BYTES], uint32_t *end_out) {
-    int i = cs && cs->enabled ? node_find(cs, id) : -1;
+    memcpy(id_out, g_no_id, ID_BYTES);
+    *end_out = 0;
+    if (!cs || !cs->enabled) return;
+    pthread_mutex_t *mu = (pthread_mutex_t *)&cs->mu;
+    pthread_mutex_lock(mu);
+    int i = node_find(cs, id);
     chain_links l = i >= 0 ? links_build(cs) : (chain_links){ 0 };
     while (i >= 0 && cs->node[i].end > upto) i = l.up[i];
-    memcpy(id_out, i >= 0 ? cs->node[i].id : g_no_id, ID_BYTES);
-    *end_out = i >= 0 ? cs->node[i].end : 0;
+    if (i >= 0) {
+        memcpy(id_out, cs->node[i].id, ID_BYTES);
+        *end_out = cs->node[i].end;
+    }
     links_free(&l);
+    pthread_mutex_unlock(mu);
 }
 
 /* ---- loading ------------------------------------------------------------ */
@@ -774,9 +919,11 @@ int ds4_chainstore_load(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
     uint8_t root[ID_BYTES];
     chain_root(engine, session, root);
     chain_key key;
+    pthread_mutex_lock(&cs->mu);
     chain_links l = links_build(cs);
     if (!chain_find(cs, &l, root, prompt_text, strlen(prompt_text), &key)) {
         links_free(&l);
+        pthread_mutex_unlock(&cs->mu);
         return 0;
     }
 
@@ -793,6 +940,7 @@ int ds4_chainstore_load(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
         chain[depth++].path = strdup(cs->node[i].path);
     }
     links_free(&l);
+    pthread_mutex_unlock(&cs->mu);
     const ds4_chainstore_node *last = &chain[0];
     const uint32_t position = key.sent ? last->sent_end : last->end;
 
@@ -869,10 +1017,12 @@ void ds4_chainstore_touch(ds4_chainstore *cs, ds4_engine *engine, ds4_session *s
     uint8_t root[ID_BYTES];
     chain_root(engine, session, root);
     chain_key key;
+    pthread_mutex_lock(&cs->mu);
     chain_links l = links_build(cs);
     if (chain_find(cs, &l, root, prompt_text, strlen(prompt_text), &key))
         for (int i = key.node; i >= 0; i = l.up[i]) node_touch(&cs->node[i]);
     links_free(&l);
+    pthread_mutex_unlock(&cs->mu);
 }
 
 typedef struct {
@@ -891,13 +1041,18 @@ static int node_newer_first(const void *a, const void *b) {
  * hook says it has all it wanted. */
 void ds4_chainstore_load_trailers(ds4_chainstore *cs, const ds4_kvstore_trailer_hooks *hooks) {
     if (!cs || !cs->enabled || !hooks || !hooks->load) return;
-    node_age *order = malloc((size_t)(cs->len + 1) * sizeof(*order));
-    for (int i = 0; i < cs->len; i++) order[i] = (node_age){ cs->node[i].last_used, i };
-    qsort(order, (size_t)cs->len, sizeof(*order), node_newer_first);
+    /* the paths, newest first, and the store's lock let go before any is read */
+    pthread_mutex_lock(&cs->mu);
+    const int len = cs->len;
+    node_age *order = malloc((size_t)(len + 1) * sizeof(*order));
+    for (int i = 0; i < len; i++) order[i] = (node_age){ cs->node[i].last_used, i };
+    qsort(order, (size_t)len, sizeof(*order), node_newer_first);
+    char **paths = malloc((size_t)(len + 1) * sizeof(*paths));
+    for (int k = 0; k < len; k++) paths[k] = strdup(cs->node[order[k].node].path);
+    pthread_mutex_unlock(&cs->mu);
     bool done = false;
-    for (int k = 0; k < cs->len && !done; k++) {
-        const ds4_chainstore_node *n = &cs->node[order[k].node];
-        FILE *fp = fopen(n->path, "rb");
+    for (int k = 0; k < len && !done; k++) {
+        FILE *fp = fopen(paths[k], "rb");
         uint8_t hd[CHAIN_HEADER], tb[8];
         uint32_t count = 0;
         bool ok = fp && fread(hd, 1, sizeof(hd), fp) == sizeof(hd) && get64(hd + 112) <= (uint64_t)INT64_MAX &&
@@ -910,6 +1065,8 @@ void ds4_chainstore_load_trailers(ds4_chainstore *cs, const ds4_kvstore_trailer_
         if (ok) done = hooks->load(hooks->ud, fp, hooks->load_wanted) < 0;
         if (fp) fclose(fp);
     }
+    for (int k = 0; k < len; k++) free(paths[k]);
+    free(paths);
     free(order);
 }
 

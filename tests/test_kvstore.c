@@ -894,6 +894,51 @@ static void test_chain_load_is_entered_by_a_store(const char *dir) {
     ds4_tokens_free(&s.tokens);
 }
 
+/* A file is made from the session and written without it: the server lets
+ * the engine go on between the two, so what reaches disk is what the session
+ * held when the file was made, whatever it holds by the time it is written.
+ * A segment another conversation wrote meanwhile is not written twice. */
+static void test_chain_file_is_written_without_the_session(const char *dir) {
+    clear_dir(dir);
+    ds4_chainstore cs;
+    chain_open(&cs, dir, 64);
+    ds4_session s = {0};
+    char err[160] = {0};
+    uint8_t id[DS4_CHAINSTORE_ID_BYTES];
+    bool exists = true;
+    session_set(&s, SEG1);
+    ds4_chainstore_file *seg = ds4_chainstore_make_segment(&cs, NULL, &s, NULL, 0, NULL, id, &exists, err, sizeof(err));
+    CHECK(seg != NULL && !exists && cs.len == 0);
+    session_set(&s, SEG1 "question");
+    s.saved[s.n_saved++] = (uint32_t)strlen(SEG1);
+    ds4_chainstore_file *tail = ds4_chainstore_make_tail(&cs, NULL, &s, id, (uint32_t)strlen(SEG1), 0, NULL,
+                                                         "evict", NULL, err, sizeof(err));
+    CHECK(tail != NULL && count_chain_files(dir) == 0);   /* nothing on disk yet */
+
+    session_set(&s, "somethingelseentirely");             /* the engine went on */
+    char *seg_path = ds4_chainstore_write(&cs, seg, err, sizeof(err));
+    char *tail_path = ds4_chainstore_write(&cs, tail, err, sizeof(err));
+    CHECK(seg_path && tail_path && cs.len == 2 && count_chain_files(dir) == 2);
+    CHECK(chain_resume(&cs, SEG1 "question!", NULL, NULL) == (int)strlen(SEG1 "question"));
+
+    /* the same segment made twice before either is written: one file */
+    session_set(&s, "sharedstart");
+    ds4_chainstore_file *a = ds4_chainstore_make_segment(&cs, NULL, &s, NULL, 0, NULL, id, &exists, err, sizeof(err));
+    ds4_chainstore_file *b = ds4_chainstore_make_segment(&cs, NULL, &s, NULL, 0, NULL, id, &exists, err, sizeof(err));
+    char *pa = ds4_chainstore_write(&cs, a, err, sizeof(err));
+    char *pb = ds4_chainstore_write(&cs, b, err, sizeof(err));
+    CHECK(pa && pb && !strcmp(pa, pb) && cs.len == 3 && count_chain_files(dir) == 3);
+    /* and a segment on disk already is not made at all */
+    CHECK(ds4_chainstore_make_segment(&cs, NULL, &s, NULL, 0, NULL, id, &exists, err, sizeof(err)) == NULL && exists);
+
+    free(pa);
+    free(pb);
+    free(seg_path);
+    free(tail_path);
+    ds4_chainstore_close(&cs);
+    ds4_tokens_free(&s.tokens);
+}
+
 /* Files go missing behind the store's back (removed by hand, lost): nothing
  * it keeps can then disagree with the directory.  A tail gone is forgotten
  * at the next write, its bytes with it, and what it hung from becomes a leaf
@@ -1020,6 +1065,7 @@ int main(int argc, char **argv) {
     test_chain_tail_keeps_both_states(dir);
     test_chain_load_is_entered_by_a_store(dir);
     test_chain_survives_files_removed_by_hand(dir);
+    test_chain_file_is_written_without_the_session(dir);
     test_chain_evicts_leaves_first(dir);
     clear_dir(dir);
     rmdir(dir);

@@ -11107,31 +11107,43 @@ static bool kv_cache_store_live_prefix_at(server *s, server_slot *slot,
     if (s->chain.enabled) {
         /* A checkpoint is a segment sealed: the history past the last one,
          * all of it rows its tail held, which the slot lets go of.  Any
-         * other store is the slot's tail. */
-        bool stored = false;
-        char *tail = NULL;
+         * other store is the slot's tail.
+         *
+         * The file is made while the engine is held and written once it is
+         * let go: a segment is 543 MiB, and written under inference_mu it
+         * held every slot's decoding up for a third of a second.  Made, it
+         * needs the session no more.  (The engine's page reclaim stores from
+         * inside the engine, which it cannot let go of: there the write
+         * waits on it as before.) */
+        ds4_chainstore_file *file = NULL;
+        uint8_t id[DS4_CHAINSTORE_ID_BYTES];
+        bool exists = false;
         pthread_mutex_lock(&s->kv_mu);
-        if (ds4_session_pos(slot->session) != store_len) {
-            /* only the live history is stored */
-        } else if (checkpoint) {
-            uint8_t id[DS4_CHAINSTORE_ID_BYTES];
-            stored = ds4_chainstore_seal(&s->chain, s->engine, slot->session, slot->chain_parent,
-                                         slot->chain_sealed_end, &hooks, id, err, sizeof(err));
-            if (stored) {
-                memcpy(slot->chain_parent, id, sizeof(id));
-                slot->chain_sealed_end = (uint32_t)store_len;
-                ds4_chainstore_pin(&s->chain, slot->id, id);
-                ds4_chainstore_drop_tail(&s->chain, slot->kv_path);
-            }
-        } else {
-            tail = ds4_chainstore_store_tail(&s->chain, s->engine, slot->session, slot->chain_parent,
-                                             slot->chain_sealed_end, sent_len, slot->kv_path, reason,
-                                             &hooks, err, sizeof(err));
-            stored = tail != NULL;
+        if (ds4_session_pos(slot->session) == store_len) {   /* only the live history is stored */
+            file = checkpoint ?
+                ds4_chainstore_make_segment(&s->chain, s->engine, slot->session, slot->chain_parent,
+                                            slot->chain_sealed_end, &hooks, id, &exists, err, sizeof(err)) :
+                ds4_chainstore_make_tail(&s->chain, s->engine, slot->session, slot->chain_parent,
+                                         slot->chain_sealed_end, sent_len, slot->kv_path, reason,
+                                         &hooks, err, sizeof(err));
         }
         pthread_mutex_unlock(&s->kv_mu);
         if (!inference_locked) pthread_mutex_unlock(&s->inference_mu);
-        if (stored && (checkpoint || tail)) slot_set_kv_path(s, slot, tail);
+
+        char *path = file ? ds4_chainstore_write(&s->chain, file, err, sizeof(err)) : NULL;
+        const bool stored = path != NULL || exists;
+        pthread_mutex_lock(&s->kv_mu);
+        if (stored && checkpoint) {
+            memcpy(slot->chain_parent, id, sizeof(id));
+            slot->chain_sealed_end = (uint32_t)store_len;
+            ds4_chainstore_pin(&s->chain, slot->id, id);
+            ds4_chainstore_drop_tail(&s->chain, slot->kv_path);
+            slot_set_kv_path(s, slot, NULL);
+            free(path);
+        } else if (stored) {
+            slot_set_kv_path(s, slot, path);
+        }
+        pthread_mutex_unlock(&s->kv_mu);
         if (!stored && err[0]) server_log(DS4_LOG_WARNING, "ds4-server: kv chain store (%s) failed: %s", reason, err);
         return stored;
     }

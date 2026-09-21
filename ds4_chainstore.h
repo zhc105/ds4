@@ -45,6 +45,7 @@
 #include "ds4.h"
 #include "ds4_kvstore.h"
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -73,14 +74,23 @@ typedef struct {
     uint64_t budget_bytes;
     int min_tokens;
     int segment_tokens;
+    /* The index and the pins.  Every call takes it for as long as it reads
+     * or changes them, and for nothing else: not while a file is written,
+     * nor while one is read into a session. */
+    pthread_mutex_t mu;
     ds4_chainstore_node *node;
     int len, cap;
     uint8_t (*pin)[DS4_CHAINSTORE_ID_BYTES];    /* one per slot: the segment its live chain ends with */
     int n_pins;
+    unsigned serial;            /* tails and temporary files named apart */
     const char *log_name;
     void *log_ud;
     void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg);
 } ds4_chainstore;
+
+/* A file made from a session and not yet on disk (ds4_chainstore_make_*):
+ * the whole of it in memory. */
+typedef struct ds4_chainstore_file ds4_chainstore_file;
 
 typedef struct {
     int tokens;                 /* the position resumed; 0: nothing */
@@ -98,19 +108,40 @@ bool ds4_chainstore_open(ds4_chainstore *cs, const char *dir, uint64_t budget_mb
                          void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg), void *log_ud);
 void ds4_chainstore_close(ds4_chainstore *cs);
 
-/* Seal the live history's positions [sealed_end, live) as a segment under
- * `parent` (NULL or zeros: the chain's first).  The live state must stand on
- * text a client sent.  The id written to id_out names it; a segment already
- * there is left as it is. */
+/* Storing is two steps, so that a file hundreds of MiB long goes to disk
+ * without the session.  make_* copies what the file holds out of the session
+ * into memory, and needs the session to itself (its caller holds whatever
+ * keeps the engine off it); write puts that on disk, durably (fsync, then an
+ * atomic rename, then the directory's fsync), and indexes it, and needs
+ * nothing but the store.
+ *
+ * make_segment: the live history's positions [sealed_end, live) as a segment
+ * under `parent` (NULL or zeros: the chain's first).  id_out names it.  NULL
+ * with *exists when that segment is on disk already (nothing to write), NULL
+ * with err set on failure. */
+ds4_chainstore_file *ds4_chainstore_make_segment(ds4_chainstore *cs, ds4_engine *engine, ds4_session *session,
+                                                 const uint8_t *parent, uint32_t sealed_end,
+                                                 const ds4_kvstore_trailer_hooks *hooks,
+                                                 uint8_t id_out[DS4_CHAINSTORE_ID_BYTES], bool *exists,
+                                                 char *err, size_t err_len);
+/* make_tail: the slot's tail, positions [sealed_end, live), the live state
+ * and, when sent_len lies between, the saved state there.  tail_path is the
+ * tail this slot wrote or resumed before (replaced), or NULL. */
+ds4_chainstore_file *ds4_chainstore_make_tail(ds4_chainstore *cs, ds4_engine *engine, ds4_session *session,
+                                              const uint8_t *parent, uint32_t sealed_end, int sent_len,
+                                              const char *tail_path, const char *reason,
+                                              const ds4_kvstore_trailer_hooks *hooks, char *err, size_t err_len);
+/* Put the file on disk and in the index; the path (to free), or NULL.  The
+ * file is freed either way. */
+char *ds4_chainstore_write(ds4_chainstore *cs, ds4_chainstore_file *file, char *err, size_t err_len);
+void ds4_chainstore_file_free(ds4_chainstore_file *file);
+
+/* Both steps at once, for a caller that has nothing to gain from splitting
+ * them.  seal: true when the segment is on disk, written now or before. */
 bool ds4_chainstore_seal(ds4_chainstore *cs, ds4_engine *engine, ds4_session *session,
                          const uint8_t *parent, uint32_t sealed_end,
                          const ds4_kvstore_trailer_hooks *hooks,
                          uint8_t id_out[DS4_CHAINSTORE_ID_BYTES], char *err, size_t err_len);
-
-/* Write the slot's tail: positions [sealed_end, live), the live state and,
- * when sent_len lies between, the saved state there.  tail_path is the tail
- * this slot wrote or resumed before (replaced), or NULL.  Returns the path
- * (to free), NULL when nothing was written. */
 char *ds4_chainstore_store_tail(ds4_chainstore *cs, ds4_engine *engine, ds4_session *session,
                                 const uint8_t *parent, uint32_t sealed_end, int sent_len,
                                 const char *tail_path, const char *reason,
