@@ -119,6 +119,8 @@ typedef struct {
     uint8_t ext_flag;
     bool (*serialized_size)(void *ud, const char *text, uint64_t *bytes_out);
     bool (*write)(void *ud, FILE *fp, const char *text, uint64_t *written_bytes);
+    /* entries loaded; negative when load_wanted is all found, and a caller
+     * reading many files for it can stop */
     int (*load)(void *ud, FILE *fp, const void *wanted);
     const void *load_wanted;
 } ds4_kvstore_trailer_hooks;

@@ -10641,20 +10641,6 @@ static void id_list_free(stop_list *ids) {
     memset(ids, 0, sizeof(*ids));
 }
 
-static void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids) {
-    if (!msgs || !ids) return;
-    for (int i = 0; i < msgs->len; i++) {
-        id_list_push_unique(ids, msgs->v[i].tool_call_id);
-        for (int j = 0; j < msgs->v[i].tool_call_ids_len; j++) {
-            id_list_push_unique(ids, msgs->v[i].tool_call_ids[j]);
-        }
-        const tool_calls *calls = &msgs->v[i].calls;
-        for (int j = 0; j < calls->len; j++) {
-            id_list_push_unique(ids, calls->v[j].id);
-        }
-    }
-}
-
 static bool sha_hex_name(const char *name, char sha[41]) {
     return ds4_kvstore_sha_hex_name(name, sha);
 }
@@ -10836,8 +10822,12 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
     return ok;
 }
 
-static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wanted) {
+/* Load the tool-call map at fp's position: every entry, or with `wanted` (a
+ * set of ids) those in it, each taken out of it as it is found; nothing is
+ * read once it is empty. */
+static int kv_tool_map_load_from_pos(server *s, FILE *fp, rax *wanted) {
     if (!s || s->disable_exact_dsml_tool_replay || !fp) return 0;
+    if (wanted && raxSize(wanted) == 0) return 0;
     uint8_t h[KV_TOOL_MAP_HEADER];
     size_t n = fread(h, 1, sizeof(h), fp);
     if (n == 0 && feof(fp)) return 0;
@@ -10861,7 +10851,7 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
                   fread(dsml, 1, dsml_len, fp) == dsml_len;
         id[id_len] = '\0';
         dsml[dsml_len] = '\0';
-        if (ok && (!wanted || id_list_contains(wanted, id))) {
+        if (ok && (!wanted || raxRemove(wanted, (unsigned char *)id, id_len, NULL))) {
             tool_memory_put_source(s, id, dsml, TOOL_MEMORY_DISK);
             loaded++;
         }
@@ -10872,20 +10862,37 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
     return loaded;
 }
 
-static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s, const stop_list *wanted);
+static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s, rax *wanted);
 
+/* Add id to `wanted` unless the tool memory holds it already. */
+static void tool_id_want(server *s, rax *wanted, const char *id) {
+    if (id && id[0] && !tool_memory_has_id(s, id)) raxInsert(wanted, (unsigned char *)id, strlen(id), NULL, NULL);
+}
+
+/* Bring back from disk the sampled tool-call text of the calls a history
+ * names.  Only for the ids the tool memory does not hold: a running server
+ * holds every call it made, so this reads nothing but after a restart, for
+ * a conversation from before it. */
 static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs) {
     if (!s || s->disable_exact_dsml_tool_replay || !msgs) return;
     if (!s->kv.enabled && !s->chain.enabled) return;
-    stop_list wanted = {0};
-    collect_tool_call_ids(msgs, &wanted);
-    if (wanted.len == 0) return;
+    rax *wanted = raxNew();
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        tool_id_want(s, wanted, m->tool_call_id);
+        for (int j = 0; j < m->tool_call_ids_len; j++) tool_id_want(s, wanted, m->tool_call_ids[j]);
+        for (int j = 0; j < m->calls.len; j++) tool_id_want(s, wanted, m->calls.v[j].id);
+    }
+    if (raxSize(wanted) == 0) {
+        raxFree(wanted);
+        return;
+    }
     if (s->chain.enabled) {
-        const ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, &wanted);
+        const ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, wanted);
         pthread_mutex_lock(&s->kv_mu);
         ds4_chainstore_load_trailers(&s->chain, &hooks);
         pthread_mutex_unlock(&s->kv_mu);
-        id_list_free(&wanted);
+        raxFree(wanted);
         return;
     }
     /* Tool replay payloads are stored next to KV checkpoints; keep them model
@@ -10895,11 +10902,11 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
 
     DIR *d = opendir(s->kv.dir);
     if (!d) {
-        id_list_free(&wanted);
+        raxFree(wanted);
         return;
     }
     struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
+    while (raxSize(wanted) != 0 && (de = readdir(d)) != NULL) {
         char sha[41];
         if (!sha_hex_name(de->d_name, sha)) continue;
         (void)sha;
@@ -10914,13 +10921,13 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
             hdr.trailer_offset <= (uint64_t)INT64_MAX &&
             fseeko(fp, (off_t)hdr.trailer_offset, SEEK_SET) == 0)
         {
-            kv_tool_map_load_from_pos(s, fp, &wanted);
+            kv_tool_map_load_from_pos(s, fp, wanted);
         }
         free(hdr.state);
         fclose(fp);
     }
     closedir(d);
-    id_list_free(&wanted);
+    raxFree(wanted);
 }
 
 #ifdef DS4_SERVER_TEST
@@ -11014,11 +11021,12 @@ static bool kv_cache_tool_map_write_cb(void *ud, FILE *fp, const char *text,
 }
 
 static int kv_cache_tool_map_load_cb(void *ud, FILE *fp, const void *wanted) {
-    return kv_tool_map_load_from_pos((server *)ud, fp, (const stop_list *)wanted);
+    const int loaded = kv_tool_map_load_from_pos((server *)ud, fp, (rax *)wanted);
+    return wanted && raxSize((rax *)wanted) == 0 ? -1 : loaded;
 }
 
-static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
-                                                         const stop_list *wanted) {
+/* wanted: the set of tool-call ids to load (taken out as found), NULL for all */
+static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s, rax *wanted) {
     return (ds4_kvstore_trailer_hooks){
         .ud = s,
         .ext_flag = KV_EXT_TOOL_MAP,
@@ -18917,11 +18925,6 @@ static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
     TEST_ASSERT(msgs.len == 2);
     TEST_ASSERT(msgs.v[1].tool_call_id && !strcmp(msgs.v[1].tool_call_id, "toolu_exact"));
 
-    stop_list ids = {0};
-    collect_tool_call_ids(&msgs, &ids);
-    TEST_ASSERT(id_list_contains(&ids, "toolu_exact"));
-    id_list_free(&ids);
-
     tool_replay_stats stats = {0};
     tool_memory_attach_to_messages(&s, &msgs, &stats);
     TEST_ASSERT(msgs.v[0].calls.raw_tool_text != NULL);
@@ -20584,6 +20587,23 @@ static void test_kv_tool_map_handles_qwen_blocks(void) {
     TEST_ASSERT(kv_tool_map_serialized_size(&src, text, &estimated_bytes));
     TEST_ASSERT(kv_tool_map_write(&src, fp, text, &bytes));
     TEST_ASSERT(bytes > 0 && estimated_bytes == bytes);
+    /* the ids wanted, each taken out as it is found: an empty set reads nothing */
+    server some = {0};
+    pthread_mutex_init(&some.tool_mu, NULL);
+    rax *wanted = raxNew();
+    raxInsert(wanted, (unsigned char *)"call_c", 6, NULL, NULL);
+    raxInsert(wanted, (unsigned char *)"call_z", 6, NULL, NULL);
+    rewind(fp);
+    TEST_ASSERT(kv_tool_map_load_from_pos(&some, fp, wanted) == 1 && raxSize(wanted) == 1);
+    TEST_ASSERT(tool_memory_has_id(&some, "call_c") && !tool_memory_has_id(&some, "call_a"));
+    raxRemove(wanted, (unsigned char *)"call_z", 6, NULL);
+    rewind(fp);
+    const long at = ftell(fp);
+    TEST_ASSERT(kv_cache_tool_map_load_cb(&some, fp, wanted) < 0 && ftell(fp) == at);
+    raxFree(wanted);
+    tool_memory_free(&some.tool_mem);
+    pthread_mutex_destroy(&some.tool_mu);
+
     rewind(fp);
     TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == 3);
 

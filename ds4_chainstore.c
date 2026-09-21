@@ -875,12 +875,28 @@ void ds4_chainstore_touch(ds4_chainstore *cs, ds4_engine *engine, ds4_session *s
     links_free(&l);
 }
 
-/* Hand every file's trailer to the hook (the server's tool-call memory,
- * which a restart empties and the files still hold). */
+typedef struct {
+    uint64_t last_used;
+    int node;
+} node_age;
+
+static int node_newer_first(const void *a, const void *b) {
+    const uint64_t x = ((const node_age *)a)->last_used, y = ((const node_age *)b)->last_used;
+    return x > y ? -1 : x < y;
+}
+
+/* Hand the files' trailers to the hook (the server's tool-call memory, which
+ * a restart empties and the files still hold), the most recently used first:
+ * a conversation's latest file holds every call it made so far.  Until the
+ * hook says it has all it wanted. */
 void ds4_chainstore_load_trailers(ds4_chainstore *cs, const ds4_kvstore_trailer_hooks *hooks) {
     if (!cs || !cs->enabled || !hooks || !hooks->load) return;
-    for (int i = 0; i < cs->len; i++) {
-        const ds4_chainstore_node *n = &cs->node[i];
+    node_age *order = malloc((size_t)(cs->len + 1) * sizeof(*order));
+    for (int i = 0; i < cs->len; i++) order[i] = (node_age){ cs->node[i].last_used, i };
+    qsort(order, (size_t)cs->len, sizeof(*order), node_newer_first);
+    bool done = false;
+    for (int k = 0; k < cs->len && !done; k++) {
+        const ds4_chainstore_node *n = &cs->node[order[k].node];
         FILE *fp = fopen(n->path, "rb");
         uint8_t hd[CHAIN_HEADER], tb[8];
         uint32_t count = 0;
@@ -891,9 +907,10 @@ void ds4_chainstore_load_trailers(ds4_chainstore *cs, const ds4_kvstore_trailer_
                   fseeko(fp, (off_t)count * (8 + (off_t)sizeof(((ds4_vision_identity *)0)->fingerprint)), SEEK_CUR) == 0 &&
                   read_u32(fp, &count) && fseeko(fp, (off_t)count, SEEK_CUR) == 0 &&
                   fread(tb, 1, 8, fp) == 8 && get64(tb) != 0;
-        if (ok) hooks->load(hooks->ud, fp, hooks->load_wanted);
+        if (ok) done = hooks->load(hooks->ud, fp, hooks->load_wanted) < 0;
         if (fp) fclose(fp);
     }
+    free(order);
 }
 
 void ds4_chainstore_load_result_free(ds4_chainstore_load_result *result) {
