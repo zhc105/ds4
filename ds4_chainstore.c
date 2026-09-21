@@ -140,23 +140,89 @@ static void node_add(ds4_chainstore *cs, const ds4_chainstore_node *n) {
         cs->node = realloc(cs->node, (size_t)cs->cap * sizeof(cs->node[0]));
         if (!cs->node) abort();
     }
-    cs->node[cs->len] = *n;
-    cs->node[cs->len].children = 0;
-    for (int i = 0; i < cs->len; i++) {
-        if (!n->tail && memcmp(cs->node[i].parent, n->id, ID_BYTES) == 0) cs->node[cs->len].children++;
-    }
-    const int parent = node_find(cs, n->parent);
-    if (parent >= 0) cs->node[parent].children++;
-    cs->len++;
+    cs->node[cs->len++] = *n;
 }
 
-/* Forget a node and remove its file. */
-static void node_remove(ds4_chainstore *cs, int i) {
-    const int parent = node_find(cs, cs->node[i].parent);
-    if (parent >= 0 && cs->node[parent].children > 0) cs->node[parent].children--;
-    unlink(cs->node[i].path);
+/* Forget a node (its file removed, or gone already). */
+static void node_forget(ds4_chainstore *cs, int i) {
     free(cs->node[i].path);
     cs->node[i] = cs->node[--cs->len];
+}
+
+static void node_remove(ds4_chainstore *cs, int i) {
+    unlink(cs->node[i].path);
+    node_forget(cs, i);
+}
+
+/* The index's links, worked out from the parent fields themselves, which are
+ * the files' own headers: nothing is kept beside them to fall out of step
+ * with the files.  For every node, where its parent is (LINK_ROOT: it begins
+ * a chain; LINK_GONE: the parent is not in the index), whether anything
+ * hangs from it, and whether its chain reaches back to position 0 through
+ * files that meet end to start.  One sort of the segments by id, then a
+ * binary search per node. */
+enum { LINK_ROOT = -1, LINK_GONE = -2 };
+
+typedef struct {
+    int *up;
+    bool *has_child;
+    bool *whole;
+} chain_links;
+
+typedef struct {
+    const uint8_t *id;
+    int node;
+} id_ref;
+
+static int id_ref_cmp(const void *a, const void *b) {
+    return memcmp(((const id_ref *)a)->id, ((const id_ref *)b)->id, ID_BYTES);
+}
+
+static void links_free(chain_links *l) {
+    free(l->up);
+    free(l->has_child);
+    free(l->whole);
+}
+
+static chain_links links_build(const ds4_chainstore *cs) {
+    const int n = cs->len;
+    chain_links l = { malloc((size_t)(n + 1) * sizeof(int)), calloc((size_t)n + 1, sizeof(bool)),
+                      calloc((size_t)n + 1, sizeof(bool)) };
+    id_ref *seg = malloc((size_t)(n + 1) * sizeof(*seg));
+    int m = 0;
+    for (int i = 0; i < n; i++) if (!cs->node[i].tail) seg[m++] = (id_ref){ cs->node[i].id, i };
+    qsort(seg, (size_t)m, sizeof(*seg), id_ref_cmp);
+    for (int i = 0; i < n; i++) {
+        const id_ref key = { cs->node[i].parent, -1 };
+        const id_ref *p = id_is_none(cs->node[i].parent) ? NULL :
+                          bsearch(&key, seg, (size_t)m, sizeof(*seg), id_ref_cmp);
+        l.up[i] = id_is_none(cs->node[i].parent) ? LINK_ROOT : p ? p->node : LINK_GONE;
+        if (l.up[i] >= 0) l.has_child[l.up[i]] = true;
+    }
+    free(seg);
+    /* whole: 0 unknown, 1 yes, 2 no, 3 on the walk now (a cycle, which no
+     * writer makes, counts as broken) */
+    uint8_t *state = calloc((size_t)n + 1, 1);
+    int *walk = malloc((size_t)(n + 1) * sizeof(int));
+    for (int i = 0; i < n; i++) {
+        int depth = 0, at = i;
+        uint8_t verdict = 0;
+        while (!verdict) {
+            if (state[at] == 1 || state[at] == 2) { verdict = state[at]; break; }
+            if (state[at] == 3) { verdict = 2; break; }
+            state[at] = 3;
+            walk[depth++] = at;
+            const int up = l.up[at];
+            if (up == LINK_ROOT) verdict = cs->node[at].start == 0 ? 1 : 2;
+            else if (up == LINK_GONE || cs->node[up].end != cs->node[at].start) verdict = 2;
+            else at = up;
+        }
+        while (depth > 0) state[walk[--depth]] = verdict;
+    }
+    for (int i = 0; i < n; i++) l.whole[i] = state[i] == 1;
+    free(walk);
+    free(state);
+    return l;
 }
 
 static bool header_read(const char *path, ds4_chainstore_node *n) {
@@ -257,22 +323,56 @@ void ds4_chainstore_pin(ds4_chainstore *cs, int slot, const uint8_t *id) {
     memcpy(cs->pin[slot], id ? id : g_no_id, ID_BYTES);
 }
 
+/* The index is what the files say, and every write asks it for room, so it
+ * is made to agree with the directory here first: a file gone (removed by
+ * hand, lost) is forgotten, and a node whose chain no longer reaches its
+ * beginning (an ancestor gone) is removed, as nothing can be resumed
+ * through it; its descendants follow, being cut off too.  Neither needs
+ * anything to have been kept in step. */
+static void chain_sweep(ds4_chainstore *cs) {
+    for (int i = 0; i < cs->len;) {
+        struct stat st;
+        if (stat(cs->node[i].path, &st) == 0) {
+            cs->node[i].file_size = (uint64_t)st.st_size;
+            i++;
+            continue;
+        }
+        chain_logf(cs, DS4_KVSTORE_LOG_WARNING, "%s: kv chain file gone: %s", cs->log_name, cs->node[i].path);
+        node_forget(cs, i);
+    }
+    chain_links l = links_build(cs);
+    /* last to first: a removal moves the index's last entry into its place,
+     * one already looked at */
+    for (int i = cs->len - 1; i >= 0; i--) {
+        if (l.whole[i]) continue;
+        chain_logf(cs, DS4_KVSTORE_LOG_WARNING, "%s: kv chain cut off, removed: tokens=%u..%u %s",
+                   cs->log_name, cs->node[i].start, cs->node[i].end, cs->node[i].path);
+        node_remove(cs, i);
+    }
+    links_free(&l);
+}
+
 /* A leaf goes before anything it hangs from, and a chain a slot is living on
  * stays: its tail is not on disk while the slot holds the conversation, so
- * its last segment looks like a leaf nobody needs. */
+ * its last segment looks like a leaf nobody needs.  Which nodes are leaves is
+ * asked of the parent fields each time, not kept. */
 void ds4_chainstore_evict(ds4_chainstore *cs, uint64_t extra_bytes) {
-    if (!cs || !cs->enabled || cs->budget_bytes == 0) return;
+    if (!cs || !cs->enabled) return;
+    chain_sweep(cs);
+    if (cs->budget_bytes == 0) return;
     uint64_t bytes = ds4_chainstore_bytes(cs);
     while (bytes + extra_bytes > cs->budget_bytes) {
+        chain_links l = links_build(cs);
         int victim = -1;
         for (int i = 0; i < cs->len; i++) {
             const ds4_chainstore_node *n = &cs->node[i];
-            if (n->children != 0) continue;
+            if (l.has_child[i]) continue;
             bool pinned = false;
             for (int p = 0; p < cs->n_pins && !n->tail; p++) pinned |= memcmp(cs->pin[p], n->id, ID_BYTES) == 0;
             if (pinned) continue;
             if (victim < 0 || n->last_used < cs->node[victim].last_used) victim = i;
         }
+        links_free(&l);
         if (victim < 0) break;
         chain_logf(cs, DS4_KVSTORE_LOG_KVCACHE, "%s: kv chain evicted %s tokens=%u..%u %.1f MiB",
                    cs->log_name, cs->node[victim].tail ? "tail" : "segment",
@@ -313,7 +413,6 @@ static bool chain_write(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
     const ds4_tokens *tokens = ds4_session_tokens(session);
     const uint32_t end = st[0].position;
     const uint32_t bp = ds4_session_block_positions(session);
-    const uint32_t first = start - start % bp;
     const uint64_t state_bytes = ds4_session_state_bytes(session, st[0].engine_index);
     size_t n_images = 0;
     const ds4_vision_identity *images = ds4_session_vision_identities(session, &n_images);
@@ -323,20 +422,30 @@ static bool chain_write(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
         set_err(err, err_len, "the trailer cannot be sized");
         return false;
     }
-    uint64_t need = CHAIN_HEADER + ds4_session_block_bytes(session, first, end) + n_states * state_bytes +
+    uint64_t need = CHAIN_HEADER + ds4_session_block_bytes(session, start - start % bp, end) + n_states * state_bytes +
                     (uint64_t)(end - start) * 4u + st[0].text_len + trailer_bytes + 64u;
     if (cs->budget_bytes != 0 && need > cs->budget_bytes) {
         set_err(err, err_len, "the file is larger than the store's budget");
         return false;
     }
     ds4_chainstore_evict(cs, need);
+    /* Under a segment that is gone the file could never be resumed.  The
+     * session holds every row from the beginning, so the file begins the
+     * chain anew instead (and is that much larger). */
+    if (!id_is_none(parent) && node_find(cs, parent) < 0) {
+        chain_logf(cs, DS4_KVSTORE_LOG_WARNING, "%s: kv chain parent of tokens=%u.. is gone: written from 0",
+                   cs->log_name, start);
+        parent = NULL;
+        start = 0;
+    }
+    const uint32_t first_block = start - start % bp;
 
     char tmp[1200];
     snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
     FILE *fp = fopen(tmp, "wb");
     uint8_t h[CHAIN_HEADER] = {0};
     bool ok = fp && fwrite(h, 1, sizeof(h), fp) == sizeof(h);
-    for (uint32_t b = first; ok && b < end; b += bp) {
+    for (uint32_t b = first_block; ok && b < end; b += bp) {
         const uint32_t to = b + bp < end ? b + bp : end;
         ok = ds4_session_write_blocks(session, fp, b, to, err, err_len) == 0;
     }
@@ -529,10 +638,7 @@ char *ds4_chainstore_store_tail(ds4_chainstore *cs, ds4_engine *engine, ds4_sess
     if (ok) {
         const int was = node_find_path(cs, path);
         if (was >= 0) {   /* the file was replaced: so is its entry */
-            const int p = node_find(cs, cs->node[was].parent);
-            if (p >= 0 && cs->node[p].children > 0) cs->node[p].children--;
-            free(cs->node[was].path);
-            cs->node[was] = cs->node[--cs->len];
+            node_forget(cs, was);
         }
         n.path = strdup(path);
         node_add(cs, &n);
@@ -564,20 +670,9 @@ static int chain_key_cmp(const void *a, const void *b) {
     return x->text_len < y->text_len ? -1 : x->text_len > y->text_len;
 }
 
-static bool chain_whole(const ds4_chainstore *cs, int node) {
-    for (int guard = 0; guard <= cs->len; guard++) {
-        const ds4_chainstore_node *n = &cs->node[node];
-        if (id_is_none(n->parent)) return n->start == 0;
-        const int p = node_find(cs, n->parent);
-        if (p < 0 || cs->node[p].end != n->start) return false;
-        node = p;
-    }
-    return false;
-}
-
-/* The longest state whose text begins `text`. */
-static bool chain_find(const ds4_chainstore *cs, const uint8_t root[ID_BYTES], const char *text, size_t text_len,
-                       chain_key *out) {
+/* The longest state whose text begins `text`, of a chain that is whole (l). */
+static bool chain_find(const ds4_chainstore *cs, const chain_links *l, const uint8_t root[ID_BYTES],
+                       const char *text, size_t text_len, chain_key *out) {
     chain_key *keys = malloc(((size_t)cs->len * 2 + 1) * sizeof(*keys));
     int n = 0;
     for (int i = 0; i < cs->len; i++) {
@@ -603,7 +698,7 @@ static bool chain_find(const ds4_chainstore *cs, const uint8_t root[ID_BYTES], c
         }
         const ds4_chainstore_node *d = &cs->node[keys[k].node];
         if (memcmp(keys[k].sent ? d->sent_id : d->id, digest, ID_BYTES) != 0) continue;
-        if (!chain_whole(cs, keys[k].node)) continue;
+        if (!l->whole[keys[k].node]) continue;
         *out = keys[k];
         found = true;   /* keys ascend: the last one found is the longest */
     }
@@ -614,9 +709,11 @@ static bool chain_find(const ds4_chainstore *cs, const uint8_t root[ID_BYTES], c
 void ds4_chainstore_ancestor_at(const ds4_chainstore *cs, const uint8_t *id, uint32_t upto,
                                 uint8_t id_out[ID_BYTES], uint32_t *end_out) {
     int i = cs && cs->enabled ? node_find(cs, id) : -1;
-    while (i >= 0 && cs->node[i].end > upto) i = node_find(cs, cs->node[i].parent);
+    chain_links l = i >= 0 ? links_build(cs) : (chain_links){ 0 };
+    while (i >= 0 && cs->node[i].end > upto) i = l.up[i];
     memcpy(id_out, i >= 0 ? cs->node[i].id : g_no_id, ID_BYTES);
     *end_out = i >= 0 ? cs->node[i].end : 0;
+    links_free(&l);
 }
 
 /* ---- loading ------------------------------------------------------------ */
@@ -688,7 +785,11 @@ int ds4_chainstore_load(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
     uint8_t root[ID_BYTES];
     chain_root(engine, session, root);
     chain_key key;
-    if (!chain_find(cs, root, prompt_text, strlen(prompt_text), &key)) return 0;
+    chain_links l = links_build(cs);
+    if (!chain_find(cs, &l, root, prompt_text, strlen(prompt_text), &key)) {
+        links_free(&l);
+        return 0;
+    }
 
     /* The chain, from the node resumed back to its beginning: copies, marked
      * as in use before anything is read.  Reading blocks takes K/V pages,
@@ -697,11 +798,12 @@ int ds4_chainstore_load(ds4_chainstore *cs, ds4_engine *engine, ds4_session *ses
      * and moves the index.  Nothing below looks at the index again. */
     ds4_chainstore_node *chain = malloc((size_t)(cs->len + 1) * sizeof(*chain));
     int depth = 0;
-    for (int i = key.node; i >= 0; i = node_find(cs, cs->node[i].parent)) {
+    for (int i = key.node; i >= 0; i = l.up[i]) {
         node_touch(&cs->node[i]);
         chain[depth] = cs->node[i];
         chain[depth++].path = strdup(cs->node[i].path);
     }
+    links_free(&l);
     const ds4_chainstore_node *last = &chain[0];
     const uint32_t position = key.sent ? last->sent_end : last->end;
 
@@ -778,8 +880,10 @@ void ds4_chainstore_touch(ds4_chainstore *cs, ds4_engine *engine, ds4_session *s
     uint8_t root[ID_BYTES];
     chain_root(engine, session, root);
     chain_key key;
-    if (!chain_find(cs, root, prompt_text, strlen(prompt_text), &key)) return;
-    for (int i = key.node; i >= 0; i = node_find(cs, cs->node[i].parent)) node_touch(&cs->node[i]);
+    chain_links l = links_build(cs);
+    if (chain_find(cs, &l, root, prompt_text, strlen(prompt_text), &key))
+        for (int i = key.node; i >= 0; i = l.up[i]) node_touch(&cs->node[i]);
+    links_free(&l);
 }
 
 /* Hand every file's trailer to the hook (the server's tool-call memory,

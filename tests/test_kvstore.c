@@ -894,6 +894,65 @@ static void test_chain_load_is_entered_by_a_store(const char *dir) {
     ds4_tokens_free(&s.tokens);
 }
 
+/* Files go missing behind the store's back (removed by hand, lost): nothing
+ * it keeps can then disagree with the directory.  A tail gone is forgotten
+ * at the next write, its bytes with it, and what it hung from becomes a leaf
+ * the budget can take.  A segment gone cuts off everything under it, which
+ * is removed, since nothing can be resumed through it; a slot whose chain
+ * it was writes its next file from the beginning instead. */
+static void test_chain_survives_files_removed_by_hand(const char *dir) {
+    clear_dir(dir);
+    ds4_chainstore cs;
+    chain_open(&cs, dir, 64);
+    ds4_session s = {0};
+    chain_slot a = {0}, b = {0};
+    CHECK(chain_seal(&cs, &s, &a, SEG1));
+    CHECK(chain_give_up(&cs, &s, &a, SEG1 "question", NULL));
+    CHECK(chain_seal(&cs, &s, &b, "otherconv"));
+    CHECK(chain_seal(&cs, &s, &b, "otherconversation"));
+    CHECK(chain_seal(&cs, &s, &b, "otherconversationgoeson"));
+    CHECK(cs.len == 5);
+
+    /* a's tail removed by hand: the next write forgets it, and a's segment,
+     * a leaf now, is what the budget takes first (the oldest) */
+    const uint64_t tail_bytes = cs.node[1].file_size;
+    const uint64_t before = ds4_chainstore_bytes(&cs);
+    CHECK(unlink(a.tail) == 0);
+    ds4_chainstore_evict(&cs, 0);            /* what every write does first, with room to spare */
+    CHECK(cs.len == 4 && ds4_chainstore_bytes(&cs) == before - tail_bytes);
+    for (int i = 0; i < cs.len; i++) cs.node[i].last_used = cs.node[i].end == strlen(SEG1) ? 1 : 100 + cs.node[i].end;
+    cs.budget_bytes = ds4_chainstore_bytes(&cs);   /* room for nothing more */
+    chain_slot c = {0};
+    CHECK(chain_seal(&cs, &s, &c, "third"));
+    CHECK(chain_resume(&cs, SEG1 "!", NULL, NULL) == 0);
+    CHECK(chain_resume(&cs, "otherconversationgoeson!", NULL, NULL) == (int)strlen("otherconversationgoeson"));
+    CHECK(count_chain_files(dir) == cs.len);
+
+    /* the middle of b's chain removed by hand: the segment past it is cut
+     * off and removed; b, writing on, begins a chain of its own */
+    cs.budget_bytes = 0;
+    int mid = -1;
+    for (int i = 0; i < cs.len; i++) if (cs.node[i].end == strlen("otherconversation")) mid = i;
+    CHECK(mid >= 0 && unlink(cs.node[mid].path) == 0);
+    CHECK(chain_give_up(&cs, &s, &b, "otherconversationgoesonandon", NULL));
+    CHECK(chain_resume(&cs, "otherconversationgoeson!", NULL, NULL) == (int)strlen("otherconv"));
+    CHECK(chain_resume(&cs, "otherconversationgoesonandon!", NULL, NULL) ==
+          (int)strlen("otherconversationgoesonandon"));
+    CHECK(count_chain_files(dir) == cs.len);
+
+    /* the index says what the directory holds, after a reopen too */
+    ds4_chainstore_close(&cs);
+    chain_open(&cs, dir, 64);
+    CHECK(count_chain_files(dir) == cs.len);
+    CHECK(chain_resume(&cs, "otherconversationgoesonandon!", NULL, NULL) ==
+          (int)strlen("otherconversationgoesonandon"));
+
+    free(a.tail);
+    free(b.tail);
+    ds4_chainstore_close(&cs);
+    ds4_tokens_free(&s.tokens);
+}
+
 /* Room is made leaves first, least recently used first: a segment never
  * goes from under another, and the chain a slot lives on stays though its
  * tail is not on disk. */
@@ -960,6 +1019,7 @@ int main(int argc, char **argv) {
     test_chain_shares_what_is_the_same(dir);
     test_chain_tail_keeps_both_states(dir);
     test_chain_load_is_entered_by_a_store(dir);
+    test_chain_survives_files_removed_by_hand(dir);
     test_chain_evicts_leaves_first(dir);
     clear_dir(dir);
     rmdir(dir);

@@ -63,7 +63,6 @@ typedef struct {
     uint64_t state_bytes;
     uint64_t file_size;
     uint64_t last_used;
-    uint32_t children;
 } ds4_chainstore_node;
 
 typedef struct {
