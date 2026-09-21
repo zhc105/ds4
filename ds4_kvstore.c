@@ -1786,12 +1786,19 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         const double load_ms = (kv_now_sec() - load_t0) * 1000.0;
         kc->continued_last_store_tokens = loaded;
         ds4_kvstore_touch_file(path, e->hits + 1, 0);
+        /* `of` is the file's whole history: a hit short of it resumed an
+         * earlier state, which is how a conversation that cannot match its
+         * own later states shows.  The key kind is the matched state's: the
+         * file's flags only tell what its last store was keyed by. */
+        const char *key_kind = !st->key_offset ? "token-text" :
+            (e->ext_flags & (DS4_KVSTORE_EXT_RESPONSES_VISIBLE | DS4_KVSTORE_EXT_THINKING_VISIBLE)) ?
+            ds4_kvstore_key_kind(e->ext_flags) : "visible-transcript";
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                "%s: kv cache hit text%s%s tokens=%d of=%u text=%u quant=%u key=%s load=%.1f ms file=%s",
                 kv_log_name(kc),
                 responses_protocol ? " " : "",
                 responses_protocol ? "RESPPROTO" : "",
-                loaded, st->key_len, e->quant_bits, ds4_kvstore_key_kind(e->ext_flags), load_ms, path);
+                loaded, e->tokens, st->key_len, e->quant_bits, key_kind, load_ms, path);
         if (result) {
             result->tokens = loaded;
             result->history_tokens = (int)e->tokens;
