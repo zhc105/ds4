@@ -3478,13 +3478,15 @@ static int qwen_leading_system_count(const chat_msgs *msgs) {
 }
 
 /* ChatML turns from `start` on, as the Qwen3.8 template renders them.  Every
- * assistant turn carries a <think> block; it keeps its reasoning only for
- * turns after `drop_reasoning_through`, which the full renderer sets so old
- * reasoning is dropped outside tool loops (vLLM's reference renderings do the
- * same).  Consecutive tool results share one user turn. */
+ * assistant turn carries a <think> block holding whatever reasoning the turn
+ * came with: the template drops older reasoning only under an explicit
+ * preserve_thinking=false, and its default keeps all of it.  A turn that
+ * carries none renders the block empty, which is the same default branch
+ * with an empty reasoning_content.  Consecutive tool results share one user
+ * turn. */
 static void append_qwen_turns(buf *out, const chat_msgs *msgs, int start,
                               const tool_schema_orders *tool_orders,
-                              bool think, int drop_reasoning_through) {
+                              bool think) {
     const int leading_system = qwen_leading_system_count(msgs);
     bool pending_assistant = false;
     bool response_open = false;
@@ -3510,9 +3512,7 @@ static void append_qwen_turns(buf *out, const chat_msgs *msgs, int start,
             buf_puts(out, "<|im_start|>assistant\n");
             if (!text_starts_with_think_tag(m->content ? m->content : "")) {
                 buf_puts(out, "<think>\n");
-                if (think && i > drop_reasoning_through) {
-                    append_trimmed_text(out, m->reasoning);
-                }
+                if (think) append_trimmed_text(out, m->reasoning);
                 buf_puts(out, "\n</think>\n\n");
             }
             append_trimmed_text(out, m->content);
@@ -3531,14 +3531,11 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
                                           const tool_schema_orders *tool_orders,
                                           ds4_think_mode think_mode) {
     const bool think = ds4_think_mode_enabled(think_mode);
-    const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     const bool tools = tool_schemas && tool_schemas[0];
     const int leading_system = qwen_leading_system_count(msgs);
-    int last_user_idx = -1;
     buf system = {0};
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
-        if (role_is_user_like(m->role)) last_user_idx = i;
         if (i >= leading_system || text_is_blank(m->content)) continue;
         if (system.len) buf_puts(&system, "\n\n");
         append_trimmed_text(&system, m->content);
@@ -3562,8 +3559,15 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
         buf_puts(&out, "<|im_end|>\n");
     }
     buf_free(&system);
-    append_qwen_turns(&out, msgs, 0, tool_orders, think,
-                      tool_context ? -1 : last_user_idx);
+    /* Qwen keeps every turn's reasoning.  DeepSeek and GLM drop what lies
+     * before the last user query outside a tool loop, and this renderer did
+     * the same, but Qwen3.8's own template renders that branch only when the
+     * caller passes preserve_thinking=false; undefined, its default, keeps
+     * all of it.  Nothing changes for a client that sends no reasoning — an
+     * absent one renders the same empty <think> block either way — and one
+     * that does send it now has its turns render to the tokens the session
+     * holds, which is what lets a replay continue from them. */
+    append_qwen_turns(&out, msgs, 0, tool_orders, think);
     return buf_take(&out);
 }
 
@@ -3804,7 +3808,7 @@ static char *render_qwen_live_tool_tail(const chat_msgs *msgs, int start,
     buf out = {0};
     buf_puts(&out, "<|im_end|>\n");
     append_qwen_turns(&out, msgs, start, tool_orders,
-                      ds4_think_mode_enabled(think_mode), -1);
+                      ds4_think_mode_enabled(think_mode));
     return buf_take(&out);
 }
 
@@ -17715,7 +17719,11 @@ static void test_render_qwen_reference_cases(void) {
     free(prompt);
     chat_msgs_free(&chat);
 
-    /* Old reasoning is dropped outside tool loops, like vLLM's rendering. */
+    /* A turn's reasoning is rendered wherever it stands, tool loop or not.
+     * Qwen3.8's template drops earlier reasoning only under an explicit
+     * preserve_thinking=false; its default keeps it, and vLLM never passes
+     * that kwarg.  A replay that carries the reasoning therefore renders to
+     * the tokens the session sampled, which is what it resumes from. */
     chat_msgs turns = {0};
     chat_msgs_push_text(&turns, "user", "hi");
     chat_msg reply = {0};
@@ -17729,7 +17737,7 @@ static void test_render_qwen_reference_cases(void) {
     TEST_ASSERT(!strcmp(prompt,
         "<|im_start|>system\n" QWEN_TEST_EFFORT "<|im_end|>\n"
         "<|im_start|>user\nhi<|im_end|>\n"
-        "<|im_start|>assistant\n<think>\n\n</think>\n\nHello!<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\ngreet back\n</think>\n\nHello!<|im_end|>\n"
         "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n"));
     free(prompt);
     chat_msgs_free(&turns);
