@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
@@ -318,6 +319,7 @@ void ds4_chainstore_close(ds4_chainstore *cs) {
     free(cs->node);
     free(cs->pin);
     free(cs->dir);
+    free(cs->stage);
     pthread_mutex_destroy(&cs->mu);
     memset(cs, 0, sizeof(*cs));
 }
@@ -413,7 +415,9 @@ typedef struct {
 } chain_state;
 
 struct ds4_chainstore_file {
+    ds4_chainstore *cs;
     uint8_t *buf;           /* the whole file, header first */
+    bool staged;            /* buf is the store's own (cs->stage) */
     size_t len;
     char *path;
     bool sealed;            /* a segment: written once, by whoever gets there first */
@@ -422,9 +426,47 @@ struct ds4_chainstore_file {
     double make_ms;
 };
 
+void ds4_chainstore_reserve(ds4_chainstore *cs, size_t bytes) {
+    if (!cs || !cs->enabled || bytes == 0) return;
+    const size_t huge = 2u << 20;
+    bytes = (bytes + huge - 1) / huge * huge;
+    void *p = NULL;
+    if (posix_memalign(&p, huge, bytes) != 0) return;
+#ifdef MADV_HUGEPAGE
+    (void)madvise(p, bytes, MADV_HUGEPAGE);
+#endif
+    memset(p, 0, bytes);   /* every page mapped now, not in the first store */
+    pthread_mutex_lock(&cs->mu);
+    free(cs->stage);
+    cs->stage = p;
+    cs->stage_cap = bytes;
+    pthread_mutex_unlock(&cs->mu);
+    chain_logf(cs, DS4_KVSTORE_LOG_KVCACHE, "%s: kv chain store reserved %.1f MiB to make files in",
+               cs->log_name, (double)bytes / 1048576.0);
+}
+
+/* The memory a file of `bytes` is made in: the store's own when it is free
+ * and large enough, fresh memory otherwise.  Fresh memory is plain: asking
+ * for huge pages on a box whose memory is in use makes the kernel compact it
+ * on the first touch, which took 570 ms on spark1. */
+static uint8_t *image_take(ds4_chainstore *cs, size_t bytes, bool *staged) {
+    pthread_mutex_lock(&cs->mu);
+    *staged = !cs->stage_busy && cs->stage && cs->stage_cap >= bytes;
+    if (*staged) cs->stage_busy = true;
+    uint8_t *buf = *staged ? cs->stage : NULL;
+    pthread_mutex_unlock(&cs->mu);
+    return buf ? buf : malloc(bytes);
+}
+
 void ds4_chainstore_file_free(ds4_chainstore_file *f) {
     if (!f) return;
-    free(f->buf);
+    if (f->staged) {
+        pthread_mutex_lock(&f->cs->mu);
+        f->cs->stage_busy = false;
+        pthread_mutex_unlock(&f->cs->mu);
+    } else {
+        free(f->buf);
+    }
     free(f->path);
     free(f->reason);
     free(f);
@@ -469,10 +511,11 @@ static ds4_chainstore_file *chain_make(ds4_chainstore *cs, ds4_engine *engine, d
         return NULL;
     }
     ds4_chainstore_file *f = calloc(1, sizeof(*f));
+    f->cs = cs;
     f->path = path;
     f->sealed = kind == CHAIN_SEALED;
     f->sent = n_states > 1 ? st[1].position : 0;
-    f->buf = malloc((size_t)size);
+    f->buf = image_take(cs, (size_t)size, &f->staged);
     FILE *fp = f->buf ? fmemopen(f->buf, (size_t)size, "wb") : NULL;
     if (!fp) {
         set_err(err, err_len, "no memory for the file");

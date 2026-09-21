@@ -15618,8 +15618,14 @@ int main(int argc, char **argv) {
     }
 
     if (cfg.kv_disk_dir && ds4_session_block_positions(s.slots[0].session) != 0) {
+        ds4_session *s0 = s.slots[0].session;
         ds4_chainstore_open(&s.chain, cfg.kv_disk_dir, cfg.kv_disk_space_mb, cfg.kv_cache.min_tokens,
                             s.slot_count, "ds4-server", kv_cache_log_cb, NULL);
+        /* The largest file made: a tail of a segment's length and a block
+         * more, with its two states, and its tokens, text and tool calls. */
+        const uint32_t positions = (uint32_t)s.chain.segment_tokens + ds4_session_block_positions(s0);
+        ds4_chainstore_reserve(&s.chain, (size_t)(ds4_session_block_bytes(s0, 0, positions) +
+                                                  2u * ds4_session_state_bytes(s0, 0) + (32u << 20)));
     } else if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);

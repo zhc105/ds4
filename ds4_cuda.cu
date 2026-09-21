@@ -3171,6 +3171,20 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return ok;
 }
 
+/* A read into pageable memory goes through the driver's pinned bounce
+ * buffer, at a few GB/s; into pinned memory it is one DMA. */
+extern "C" void *ds4_gpu_host_alloc(uint64_t bytes) {
+    void *ptr = NULL;
+    WITH_DEVICE(g_gpu[0].device_id) {
+        if (!cuda_ok(cudaMallocHost(&ptr, (size_t)(bytes ? bytes : 1)), "pinned host alloc")) ptr = NULL;
+    }
+    return ptr;
+}
+
+extern "C" void ds4_gpu_host_free(void *ptr) {
+    if (ptr) (void)cudaFreeHost(ptr);
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {

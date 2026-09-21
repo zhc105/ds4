@@ -83,6 +83,14 @@ typedef struct {
     uint8_t (*pin)[DS4_CHAINSTORE_ID_BYTES];    /* one per slot: the segment its live chain ends with */
     int n_pins;
     unsigned serial;            /* tails and temporary files named apart */
+    /* The memory files are made in, reserved and touched before serving
+     * (ds4_chainstore_reserve) and kept: a buffer of half a GiB touched for
+     * the first time faults page by page, and that took 160 of a copy's
+     * 190 ms while the engine waited.  One file at a time; a file made while
+     * another is still being written, or larger, gets fresh memory. */
+    uint8_t *stage;
+    size_t stage_cap;
+    bool stage_busy;
     const char *log_name;
     void *log_ud;
     void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg);
@@ -131,6 +139,10 @@ ds4_chainstore_file *ds4_chainstore_make_tail(ds4_chainstore *cs, ds4_engine *en
                                               const uint8_t *parent, uint32_t sealed_end, int sent_len,
                                               const char *tail_path, const char *reason,
                                               const ds4_kvstore_trailer_hooks *hooks, char *err, size_t err_len);
+/* Set aside and touch `bytes` of memory to make files in (the largest file
+ * the server makes: a segment's blocks and a tail's two states), so that no
+ * store pays for fresh memory while the engine is held. */
+void ds4_chainstore_reserve(ds4_chainstore *cs, size_t bytes);
 /* Put the file on disk and in the index; the path (to free), or NULL.  The
  * file is freed either way. */
 char *ds4_chainstore_write(ds4_chainstore *cs, ds4_chainstore_file *file, char *err, size_t err_len);

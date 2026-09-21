@@ -902,6 +902,7 @@ static void test_chain_file_is_written_without_the_session(const char *dir) {
     clear_dir(dir);
     ds4_chainstore cs;
     chain_open(&cs, dir, 64);
+    ds4_chainstore_reserve(&cs, 1u << 20);   /* the store's own memory for one file, fresh for a second */
     ds4_session s = {0};
     char err[160] = {0};
     uint8_t id[DS4_CHAINSTORE_ID_BYTES];

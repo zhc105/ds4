@@ -8881,6 +8881,15 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
     return 1;
 }
 
+/* Unified memory: a tensor read is a memcpy, into any host memory alike. */
+void *ds4_gpu_host_alloc(uint64_t bytes) {
+    return malloc((size_t)(bytes ? bytes : 1));
+}
+
+void ds4_gpu_host_free(void *ptr) {
+    free(ptr);
+}
+
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes) {

@@ -57330,6 +57330,11 @@ struct ds4_session {
     /* The history the K/V rows currently hold, row by row (-1: a rejected
      * draft); a copy is usable only while its history is still in the rows. */
     token_vec qwen_kv_tokens;
+    /* Pinned host memory the disk checkpoint's rows and states pass through
+     * (DS4_SESSION_IO_CHUNK, on first use): a read from the device into
+     * pageable memory crawls through the driver's own bounce buffer, and a
+     * store copies half a GiB while the engine is held. */
+    uint8_t *qwen_io_stage;
 #endif
     token_vec checkpoint;
     ds4_vision_identity *checkpoint_images;
@@ -68638,6 +68643,8 @@ void ds4_session_free(ds4_session *s) {
                 token_vec_free(&s->qwen_states[i].tokens);
             }
             token_vec_free(&s->qwen_kv_tokens);
+            ds4_gpu_host_free(s->qwen_io_stage);
+            s->qwen_io_stage = NULL;
             qwen_graph_free(&s->qwen_graph);
             free(s->qwen_mtp_logits);
             free(s->qwen_mtp_rows);
@@ -70222,6 +70229,13 @@ static int qwen_page_rows_io(ds4_qwen_gpu_graph *g, FILE *fp, uint64_t off, uint
     return rc;
 }
 
+/* The session's pinned bounce buffer for a disk checkpoint (qwen_io_stage),
+ * allocated once: NULL when no pinned memory can be had. */
+static uint8_t *qwen_io_stage(ds4_session *s) {
+    if (!s->qwen_io_stage) s->qwen_io_stage = ds4_gpu_host_alloc(DS4_SESSION_IO_CHUNK);
+    return s->qwen_io_stage;
+}
+
 /* One block's rows, layer by layer: K, V, then the block keys.  A read
  * takes the rows of [from, to) out of a block the file holds as
  * [from, stored_to), into pages taken for them first. */
@@ -70235,7 +70249,11 @@ static int qwen_block_io(ds4_session *s, FILE *fp, uint32_t from, uint32_t to, u
         payload_set_err(err, errlen, "no KV pages for the checkpoint block");
         return 1;
     }
-    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    uint8_t *buf = qwen_io_stage(s);
+    if (!buf) {
+        payload_set_err(err, errlen, "no pinned memory for the checkpoint's rows");
+        return 1;
+    }
     int rc = 0;
     for (uint32_t il = 0; rc == 0 && il <= DS4_N_LAYER; il++) {
         if (!qwen_layer_has_kv(g->mtp, il) || stored_to == from) continue;
@@ -70250,7 +70268,6 @@ static int qwen_block_io(ds4_session *s, FILE *fp, uint32_t from, uint32_t to, u
                                    from / r, to / r, stored_to / r, read, buf, err, errlen);
         }
     }
-    free(buf);
     return rc;
 }
 
@@ -70313,11 +70330,12 @@ static int qwen_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_
             return 1;
         }
     }
-    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-    int rc = payload_write_u32(fp, (c ? c->mtp_pending : s->qwen_mtp_pending) ? 1u : 0u, err, errlen);
+    uint8_t *buf = qwen_io_stage(s);
+    int rc = buf ? 0 : 1;
+    if (!buf) payload_set_err(err, errlen, "no pinned memory for the checkpoint's state");
+    if (rc == 0) rc = payload_write_u32(fp, (c ? c->mtp_pending : s->qwen_mtp_pending) ? 1u : 0u, err, errlen);
     if (rc == 0) rc = payload_write_tensor_span(fp, state, 0, state_bytes, buf, DS4_SESSION_IO_CHUNK, err, errlen);
     if (rc == 0) rc = payload_write_bytes(fp, c ? c->logits : s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen);
-    free(buf);
     if (!c) ds4_gpu_tensor_free(state);
     return rc;
 }
@@ -70370,11 +70388,12 @@ static int qwen_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t
     }
     uint64_t remaining = qwen_state_blob_bytes(s);
     uint32_t pending = 0;
-    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-    int rc = payload_read_u32(fp, &pending, &remaining, err, errlen);
+    uint8_t *buf = qwen_io_stage(s);
+    int rc = buf ? 0 : 1;
+    if (!buf) payload_set_err(err, errlen, "no pinned memory for the checkpoint's state");
+    if (rc == 0) rc = payload_read_u32(fp, &pending, &remaining, err, errlen);
     if (rc == 0) rc = payload_read_tensor_span(fp, state, 0, state_bytes, buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
     if (rc == 0) rc = payload_read_bytes(fp, c ? c->logits : s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), &remaining, err, errlen);
-    free(buf);
     if (c) {
         if (rc != 0) return 1;
         for (uint32_t t = 0; t < position; t++) token_vec_push(&c->tokens, tokens[t]);
