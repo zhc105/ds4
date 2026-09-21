@@ -11071,9 +11071,10 @@ static void slot_set_kv_path(server *s, server_slot *slot, char *path) {
     pthread_mutex_unlock(&s->kv_mu);
 }
 
-/* Store the slot's live prefix, to its conversation's file when it has one.
- * sent_len: where the client's text ended when the prefix goes on with what
- * was generated after it (ds4_kvstore_store_request). */
+/* Store the slot's live prefix: a segment or the slot's tail in the chain
+ * store, else the conversation's file.  sent_len: where the client's text
+ * ended when the prefix goes on with what was generated after it; a tail
+ * keeps the state saved there beside the live one (ds4_chainstore.h). */
 static bool kv_cache_store_live_prefix_at(server *s, server_slot *slot,
                                           const ds4_tokens *tokens,
                                           int store_len, int sent_len, const char *reason,
@@ -11126,7 +11127,6 @@ static bool kv_cache_store_live_prefix_at(server *s, server_slot *slot,
     const ds4_kvstore_store_request req = {
         .tokens = tokens,
         .store_len = store_len,
-        .sent_len = sent_len,
         .reason = reason,
         .checkpoint = checkpoint,
         .hooks = &hooks,
@@ -11412,10 +11412,9 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
     pthread_mutex_unlock(&s->kv_mu);
-    /* where a store left its conversation is a state of the slot's own,
-     * like the ones it saves before a generation: the request's text begins
-     * with it, so its client sent all of it */
-    if (loaded > 0 && lr.own) (void)ds4_session_save_state(slot->session);
+    /* a file's whole history is its conversation where a store left it: a
+     * state of the slot's own */
+    if (loaded > 0 && lr.tokens == lr.history_tokens) (void)ds4_session_save_state(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
     /* the history is on disk up to here: its next checkpoint is due in the next interval */
     if (loaded > 0) slot->continued_last_store_tokens = loaded;
@@ -11423,12 +11422,12 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
         slot->sent_len = loaded;
         if (key_len_out) *key_len_out = lr.key_len;
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
-        /* The file is this conversation's when it was resumed where its
-         * conversation stood (ds4_kvstore_load_result.own: a restart, a
-         * slot brought back from disk).  An earlier state of it begins
-         * another conversation, or a branch its own slot can no longer
-         * resume from memory: that one reads the file and stores a new one. */
-        slot_set_kv_path(s, slot, lr.path && lr.own ? xstrdup(lr.path) : NULL);
+        /* The file is this conversation's only when its whole history was
+         * resumed (a restart, a slot brought back from disk).  An earlier
+         * state of it begins another conversation, or a branch its own
+         * slot can no longer resume from memory: that one reads the file
+         * and stores a new one. */
+        slot_set_kv_path(s, slot, lr.path && lr.tokens == lr.history_tokens ? xstrdup(lr.path) : NULL);
     }
     ds4_kvstore_load_result_free(&lr);
     return loaded;

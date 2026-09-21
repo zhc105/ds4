@@ -207,14 +207,21 @@ bool ds4_chainstore_open(ds4_chainstore *cs, const char *dir, uint64_t budget_mb
     cs->log_ud = log_ud;
     cs->enabled = true;
 
+    int old_files = 0;
     DIR *d = opendir(dir);
     for (struct dirent *de; d && (de = readdir(d));) {
         const size_t len = strlen(de->d_name);
         char *path = ds4_kvstore_path_join(dir, de->d_name);
         const bool ours = len > 4 && (!strcmp(de->d_name + len - 4, ".kvs") || !strcmp(de->d_name + len - 4, ".kvt"));
         ds4_chainstore_node n;
-        if (strstr(de->d_name, ".tmp.")) {
-            unlink(path);   /* a store that did not finish */
+        /* Files of the one-file store that kept this directory before (a
+         * digest's name, .kv and its .ckpt companion): nothing resumes them
+         * any more, and they are in no index the budget could take them by. */
+        const bool old = (len == 43 && !strcmp(de->d_name + 40, ".kv")) ||
+                         (len == 45 && !strcmp(de->d_name + 40, ".ckpt"));
+        if (strstr(de->d_name, ".tmp.") || old) {
+            unlink(path);   /* those, and a store that did not finish */
+            old_files += old;
         } else if (ours && header_read(path, &n)) {
             n.path = path;
             path = NULL;
@@ -225,6 +232,10 @@ bool ds4_chainstore_open(ds4_chainstore *cs, const char *dir, uint64_t budget_mb
         free(path);
     }
     if (d) closedir(d);
+    if (old_files) {
+        chain_logf(cs, DS4_KVSTORE_LOG_KVCACHE, "%s: kv chain store removed %d files of the one-file store",
+                   cs->log_name, old_files);
+    }
     chain_logf(cs, DS4_KVSTORE_LOG_KVCACHE, "%s: kv chain store %s: %d files, %.1f MiB of %.1f MiB",
                cs->log_name, dir, cs->len, (double)ds4_chainstore_bytes(cs) / 1048576.0,
                (double)cs->budget_bytes / 1048576.0);
