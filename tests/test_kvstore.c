@@ -940,6 +940,67 @@ static void test_chain_file_is_written_without_the_session(const char *dir) {
     ds4_tokens_free(&s.tokens);
 }
 
+/* A file's trailer (the server's tool-call map) comes back byte for byte,
+ * its last byte too, which is the file's: made in a memory stream written to
+ * its end, that byte came back a NUL, and a tool call replayed from it cut
+ * short. */
+static const char g_trailer[] = "KTM-a-tool-map-that-ends-with-the-file</tool_call>";
+static char g_trailer_read[sizeof(g_trailer)];
+
+static bool trailer_size(void *ud, const char *text, uint64_t *bytes) {
+    (void)ud; (void)text;
+    *bytes = sizeof(g_trailer) - 1;
+    return true;
+}
+
+static bool trailer_write(void *ud, FILE *fp, const char *text, uint64_t *written) {
+    (void)ud; (void)text;
+    *written = fwrite(g_trailer, 1, sizeof(g_trailer) - 1, fp);
+    return *written == sizeof(g_trailer) - 1;
+}
+
+static int trailer_load(void *ud, FILE *fp, const void *wanted) {
+    (void)ud; (void)wanted;
+    memset(g_trailer_read, 0, sizeof(g_trailer_read));
+    return (int)fread(g_trailer_read, 1, sizeof(g_trailer) - 1, fp);
+}
+
+static void test_chain_trailer_comes_back_whole(const char *dir) {
+    clear_dir(dir);
+    ds4_chainstore cs;
+    chain_open(&cs, dir, 64);
+    ds4_chainstore_reserve(&cs, 1u << 20);
+    const ds4_kvstore_trailer_hooks hooks = { .serialized_size = trailer_size, .write = trailer_write,
+                                              .load = trailer_load };
+    ds4_session s = {0};
+    char err[160] = {0};
+    uint8_t id[DS4_CHAINSTORE_ID_BYTES];
+    session_set(&s, SEG1);
+    CHECK(ds4_chainstore_seal(&cs, NULL, &s, NULL, 0, &hooks, id, err, sizeof(err)));
+    session_set(&s, SEG1 "question");
+    char *tail = ds4_chainstore_store_tail(&cs, NULL, &s, id, (uint32_t)strlen(SEG1), 0, NULL, "evict",
+                                           &hooks, err, sizeof(err));
+    CHECK(tail != NULL);
+    /* a segment resumed and a tail resumed: the trailer of the last file read */
+    const char *prompts[] = { SEG1 "!", SEG1 "question!" };
+    for (size_t i = 0; i < 2; i++) {
+        ds4_session fresh = {0};
+        ds4_chainstore_load_result lr = {0};
+        memset(g_trailer_read, 0, sizeof(g_trailer_read));
+        CHECK(ds4_chainstore_load(&cs, NULL, &fresh, prompts[i], NULL, &hooks, &lr) > 0);
+        CHECK(!memcmp(g_trailer_read, g_trailer, sizeof(g_trailer) - 1));
+        ds4_chainstore_load_result_free(&lr);
+        ds4_tokens_free(&fresh.tokens);
+    }
+    /* and the trailer scan reads it the same */
+    memset(g_trailer_read, 0, sizeof(g_trailer_read));
+    ds4_chainstore_load_trailers(&cs, &hooks);
+    CHECK(!memcmp(g_trailer_read, g_trailer, sizeof(g_trailer) - 1));
+    free(tail);
+    ds4_chainstore_close(&cs);
+    ds4_tokens_free(&s.tokens);
+}
+
 /* Files go missing behind the store's back (removed by hand, lost): nothing
  * it keeps can then disagree with the directory.  A tail gone is forgotten
  * at the next write, its bytes with it, and what it hung from becomes a leaf
@@ -1067,6 +1128,7 @@ int main(int argc, char **argv) {
     test_chain_load_is_entered_by_a_store(dir);
     test_chain_survives_files_removed_by_hand(dir);
     test_chain_file_is_written_without_the_session(dir);
+    test_chain_trailer_comes_back_whole(dir);
     test_chain_evicts_leaves_first(dir);
     clear_dir(dir);
     rmdir(dir);

@@ -515,8 +515,11 @@ static ds4_chainstore_file *chain_make(ds4_chainstore *cs, ds4_engine *engine, d
     f->path = path;
     f->sealed = kind == CHAIN_SEALED;
     f->sent = n_states > 1 ? st[1].position : 0;
-    f->buf = image_take(cs, (size_t)size, &f->staged);
-    FILE *fp = f->buf ? fmemopen(f->buf, (size_t)size, "wb") : NULL;
+    /* One byte more than the file: a memory stream written to its end puts
+     * a NUL in its last byte when it is closed (glibc does, "b" or not), and
+     * that byte was the file's last, the tool map's last '>'. */
+    f->buf = image_take(cs, (size_t)size + 1, &f->staged);
+    FILE *fp = f->buf ? fmemopen(f->buf, (size_t)size + 1, "wb") : NULL;
     if (!fp) {
         set_err(err, err_len, "no memory for the file");
         ds4_chainstore_file_free(f);

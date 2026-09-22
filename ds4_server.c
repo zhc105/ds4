@@ -10854,6 +10854,17 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, rax *wanted) {
                   fread(dsml, 1, dsml_len, fp) == dsml_len;
         id[id_len] = '\0';
         dsml[dsml_len] = '\0';
+        /* A text with a NUL in it is no text the model sampled: the chain
+         * store's files of b4aa88c..e363c59 have one for their last byte,
+         * the last entry's closing '>'.  Kept, it replays as a tool call cut
+         * short, the history reads differently from then on, and a request
+         * resumes tens of thousands of tokens back; left out, the call is
+         * rendered from its JSON instead. */
+        if (ok && memchr(dsml, '\0', dsml_len)) {
+            free(id);
+            free(dsml);
+            continue;
+        }
         if (ok && (!wanted || raxRemove(wanted, (unsigned char *)id, id_len, NULL))) {
             tool_memory_put_source(s, id, dsml, TOOL_MEMORY_DISK);
             loaded++;
@@ -20703,6 +20714,18 @@ static void test_kv_tool_map_handles_qwen_blocks(void) {
     TEST_ASSERT(msgs.v[0].calls.raw_tool_text && !strcmp(msgs.v[0].calls.raw_tool_text, run));
     TEST_ASSERT(msgs.v[1].calls.raw_tool_text && !strcmp(msgs.v[1].calls.raw_tool_text, after_content));
     TEST_ASSERT(stats.disk == 2 && stats.canonical == 0);
+
+    /* A map whose last byte came back a NUL (the chain store's files of
+     * b4aa88c..e363c59): the entry it cut short is left out, the others load. */
+    server damaged = {0};
+    pthread_mutex_init(&damaged.tool_mu, NULL);
+    TEST_ASSERT(fseeko(fp, -1, SEEK_END) == 0 && fputc(0, fp) == 0);
+    rewind(fp);
+    TEST_ASSERT(kv_tool_map_load_from_pos(&damaged, fp, NULL) == 2);
+    TEST_ASSERT(tool_memory_has_id(&damaged, "call_a") + tool_memory_has_id(&damaged, "call_b") +
+                tool_memory_has_id(&damaged, "call_c") == 2);
+    tool_memory_free(&damaged.tool_mem);
+    pthread_mutex_destroy(&damaged.tool_mu);
 
     chat_msgs_free(&msgs);
     fclose(fp);
