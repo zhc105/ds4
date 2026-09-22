@@ -730,6 +730,13 @@ size_t ds4_session_state_count(ds4_session *s);
 uint32_t ds4_session_state_position(ds4_session *s, size_t i);
 uint64_t ds4_session_state_bytes(ds4_session *s, size_t i);
 int ds4_session_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_t errlen);
+/* The same blocks and states copied into memory, in the file's order: dst
+ * holds ds4_session_block_bytes() or ds4_session_state_bytes() of them.  For
+ * a store that makes its file while it holds the session and writes it to
+ * disk once the session is let go.  Sessions with blocks only. */
+int ds4_session_copy_blocks(ds4_session *s, uint8_t *dst, uint32_t from, uint32_t to,
+                            char *err, size_t errlen);
+int ds4_session_copy_state(ds4_session *s, size_t i, uint8_t *dst, char *err, size_t errlen);
 /* Bring back a state read from a file: as the live state, or as a saved
  * one the live history (already restored) can fall back to.  The history
  * folded into it is tokens[0..position) and, of the file's pictures, those

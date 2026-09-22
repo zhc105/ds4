@@ -108,6 +108,12 @@ int ds4_session_write_blocks(ds4_session *s, FILE *fp, uint32_t from, uint32_t t
     (void)err; (void)errlen;
     return fwrite(s->tokens.v + from, sizeof(int), to - from, fp) == to - from ? 0 : 1;
 }
+int ds4_session_copy_blocks(ds4_session *s, uint8_t *dst, uint32_t from, uint32_t to,
+                            char *err, size_t errlen) {
+    (void)err; (void)errlen;
+    memcpy(dst, s->tokens.v + from, (to - from) * sizeof(int));
+    return 0;
+}
 int ds4_session_read_blocks(ds4_session *s, FILE *fp, uint32_t from, uint32_t to,
                             uint32_t stored_to, char *err, size_t errlen) {
     (void)err; (void)errlen;
@@ -135,6 +141,12 @@ int ds4_session_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_
     (void)err; (void)errlen;
     uint32_t blob[FAKE_STATE_BYTES / 4] = { ds4_session_state_position(s, i), 0x57a7e };
     return fwrite(blob, sizeof(blob), 1, fp) == 1 ? 0 : 1;
+}
+int ds4_session_copy_state(ds4_session *s, size_t i, uint8_t *dst, char *err, size_t errlen) {
+    (void)err; (void)errlen;
+    uint32_t blob[FAKE_STATE_BYTES / 4] = { ds4_session_state_position(s, i), 0x57a7e };
+    memcpy(dst, blob, sizeof(blob));
+    return 0;
 }
 int ds4_session_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position,
                            const ds4_vision_identity *images, size_t image_count,
@@ -941,9 +953,9 @@ static void test_chain_file_is_written_without_the_session(const char *dir) {
 }
 
 /* A file's trailer (the server's tool-call map) comes back byte for byte,
- * its last byte too, which is the file's: made in a memory stream written to
- * its end, that byte came back a NUL, and a tool call replayed from it cut
- * short. */
+ * its last byte too, which is the file's: when files were made in a glibc
+ * memory stream (fmemopen) written to its end, that byte came back a NUL, and
+ * a tool call replayed from it cut short. */
 static const char g_trailer[] = "KTM-a-tool-map-that-ends-with-the-file</tool_call>";
 static char g_trailer_read[sizeof(g_trailer)];
 

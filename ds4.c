@@ -59358,12 +59358,12 @@ static int qwen_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t
 static int qwen_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
                                      char *err, size_t errlen);
 static uint64_t qwen_block_bytes(const ds4_qwen_gpu_graph *g, uint32_t from, uint32_t to);
-static int qwen_block_io(ds4_session *s, FILE *fp, uint32_t from, uint32_t to, uint32_t stored_to,
+static int qwen_block_io(ds4_session *s, FILE *fp, uint8_t *mem, uint32_t from, uint32_t to, uint32_t stored_to,
                          bool read, char *err, size_t errlen);
 static size_t qwen_session_state_count(ds4_session *s);
 static const qwen_state_copy *qwen_session_saved_state(ds4_session *s, size_t i);
 static uint64_t qwen_state_blob_bytes(ds4_session *s);
-static int qwen_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_t errlen);
+static int qwen_write_state(ds4_session *s, size_t i, FILE *fp, uint8_t *mem, char *err, size_t errlen);
 static int qwen_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position,
                            const ds4_vision_identity *images, size_t image_count, bool live,
                            char *err, size_t errlen);
@@ -60479,10 +60479,23 @@ uint64_t ds4_session_block_bytes(ds4_session *s, uint32_t from, uint32_t to) {
 int ds4_session_write_blocks(ds4_session *s, FILE *fp, uint32_t from, uint32_t to,
                              char *err, size_t errlen) {
 #ifdef DS4_QWEN_GPU
-    if (session_has_blocks(s)) return qwen_block_io(s, fp, from, to, to, false, err, errlen);
+    if (session_has_blocks(s)) return qwen_block_io(s, fp, NULL, from, to, to, false, err, errlen);
 #endif
     (void)s;
     (void)fp;
+    (void)from;
+    (void)to;
+    payload_set_err(err, errlen, "this session keeps no checkpoint blocks");
+    return 1;
+}
+
+int ds4_session_copy_blocks(ds4_session *s, uint8_t *dst, uint32_t from, uint32_t to,
+                            char *err, size_t errlen) {
+#ifdef DS4_QWEN_GPU
+    if (session_has_blocks(s) && dst) return qwen_block_io(s, NULL, dst, from, to, to, false, err, errlen);
+#endif
+    (void)s;
+    (void)dst;
     (void)from;
     (void)to;
     payload_set_err(err, errlen, "this session keeps no checkpoint blocks");
@@ -60501,7 +60514,7 @@ int ds4_session_read_blocks(ds4_session *s, FILE *fp, uint32_t from, uint32_t to
             s->checkpoint_valid = false;   /* the rows are being overwritten */
             s->mtp_draft_valid = false;
         }
-        return qwen_block_io(s, fp, from, to, stored_to, true, err, errlen);
+        return qwen_block_io(s, fp, NULL, from, to, stored_to, true, err, errlen);
     }
 #endif
     (void)s;
@@ -60541,13 +60554,24 @@ uint64_t ds4_session_state_bytes(ds4_session *s, size_t i) {
 
 int ds4_session_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_t errlen) {
 #ifdef DS4_QWEN_GPU
-    if (session_has_blocks(s)) return qwen_write_state(s, i, fp, err, errlen);
+    if (session_has_blocks(s)) return qwen_write_state(s, i, fp, NULL, err, errlen);
 #endif
     if (i != 0) {
         payload_set_err(err, errlen, "this session has no saved states");
         return 1;
     }
     return ds4_session_save_payload(s, fp, err, errlen);
+}
+
+int ds4_session_copy_state(ds4_session *s, size_t i, uint8_t *dst, char *err, size_t errlen) {
+#ifdef DS4_QWEN_GPU
+    if (session_has_blocks(s) && dst) return qwen_write_state(s, i, NULL, dst, err, errlen);
+#endif
+    (void)s;
+    (void)i;
+    (void)dst;
+    payload_set_err(err, errlen, "this session keeps no checkpoint blocks");
+    return 1;
 }
 
 int ds4_session_read_state(ds4_session *s, FILE *fp, const int *tokens, uint32_t position,
@@ -70203,11 +70227,11 @@ static uint64_t qwen_block_bytes(const ds4_qwen_gpu_graph *g, uint32_t from, uin
 
 /* The rows [i0, i1) of one layer's K, V or block keys (`off` their offset
  * within a page, `per_page` how many a page holds) to or from the file,
- * page by page; a read then skips the rest of a run the file holds as
- * [i0, stored_i1). */
-static int qwen_page_rows_io(ds4_qwen_gpu_graph *g, FILE *fp, uint64_t off, uint32_t per_page, uint64_t row_bytes,
-                             uint32_t i0, uint32_t i1, uint32_t stored_i1, bool read, uint8_t *buf,
-                             char *err, size_t errlen) {
+ * page by page, or with `mem` into memory at *mem, which it advances; a
+ * read then skips the rest of a run the file holds as [i0, stored_i1). */
+static int qwen_page_rows_io(ds4_qwen_gpu_graph *g, FILE *fp, uint8_t **mem, uint64_t off, uint32_t per_page,
+                             uint64_t row_bytes, uint32_t i0, uint32_t i1, uint32_t stored_i1, bool read,
+                             uint8_t *buf, char *err, size_t errlen) {
     int rc = 0;
     for (uint32_t i = i0; rc == 0 && i < i1;) {
         const uint32_t page = i / per_page;
@@ -70217,6 +70241,12 @@ static int qwen_page_rows_io(ds4_qwen_gpu_graph *g, FILE *fp, uint64_t off, uint
             uint64_t remaining = n * row_bytes;
             rc = payload_read_tensor_span(fp, g->pages[page], at, n * row_bytes, buf, DS4_SESSION_IO_CHUNK,
                                           &remaining, err, errlen);
+        } else if (mem) {
+            if (ds4_gpu_tensor_read(g->pages[page], at, *mem, n * row_bytes) == 0) {
+                payload_set_err(err, errlen, "failed to read accelerator session tensor");
+                rc = 1;
+            }
+            *mem += n * row_bytes;
         } else {
             rc = payload_write_tensor_span(fp, g->pages[page], at, n * row_bytes, buf, DS4_SESSION_IO_CHUNK, err, errlen);
         }
@@ -70238,8 +70268,9 @@ static uint8_t *qwen_io_stage(ds4_session *s) {
 
 /* One block's rows, layer by layer: K, V, then the block keys.  A read
  * takes the rows of [from, to) out of a block the file holds as
- * [from, stored_to), into pages taken for them first. */
-static int qwen_block_io(ds4_session *s, FILE *fp, uint32_t from, uint32_t to, uint32_t stored_to,
+ * [from, stored_to), into pages taken for them first.  A write with `mem`
+ * copies them there instead of to the file, in the file's order. */
+static int qwen_block_io(ds4_session *s, FILE *fp, uint8_t *mem, uint32_t from, uint32_t to, uint32_t stored_to,
                          bool read, char *err, size_t errlen) {
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
     const qwen_kv_pool *pool = g->pool;
@@ -70249,22 +70280,25 @@ static int qwen_block_io(ds4_session *s, FILE *fp, uint32_t from, uint32_t to, u
         payload_set_err(err, errlen, "no KV pages for the checkpoint block");
         return 1;
     }
-    uint8_t *buf = qwen_io_stage(s);
-    if (!buf) {
+    uint8_t *buf = mem ? NULL : qwen_io_stage(s);
+    if (!mem && !buf) {
         payload_set_err(err, errlen, "no pinned memory for the checkpoint's rows");
         return 1;
     }
+    uint8_t **at = mem ? &mem : NULL;
     int rc = 0;
     for (uint32_t il = 0; rc == 0 && il <= DS4_N_LAYER; il++) {
         if (!qwen_layer_has_kv(g->mtp, il) || stored_to == from) continue;
-        rc = qwen_page_rows_io(g, fp, pool->k_off[il], QWEN_BLOCK_POSITIONS, row, from, to, stored_to, read, buf, err, errlen);
+        rc = qwen_page_rows_io(g, fp, at, pool->k_off[il], QWEN_BLOCK_POSITIONS, row, from, to, stored_to, read,
+                               buf, err, errlen);
         if (rc == 0) {
-            rc = qwen_page_rows_io(g, fp, pool->v_off[il], QWEN_BLOCK_POSITIONS, row, from, to, stored_to, read, buf, err, errlen);
+            rc = qwen_page_rows_io(g, fp, at, pool->v_off[il], QWEN_BLOCK_POSITIONS, row, from, to, stored_to, read,
+                                   buf, err, errlen);
         }
         if (rc == 0 && ds4_qwen_layer_is_qsa(il)) {
             const uint32_t r = g_ds4_compress_ratios[il];
             if (stored_to / r == from / r) continue;
-            rc = qwen_page_rows_io(g, fp, pool->bkey_off[il], QWEN_BLOCK_POSITIONS / r, key,
+            rc = qwen_page_rows_io(g, fp, at, pool->bkey_off[il], QWEN_BLOCK_POSITIONS / r, key,
                                    from / r, to / r, stored_to / r, read, buf, err, errlen);
         }
     }
@@ -70301,7 +70335,8 @@ static uint64_t qwen_state_blob_bytes(ds4_session *s) {
     return sizeof(uint32_t) + qwen_graph_state_walk(&s->qwen_graph, NULL, 0) + (uint64_t)DS4_N_VOCAB * sizeof(float);
 }
 
-static int qwen_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_t errlen) {
+/* To the file, or with `mem` into memory in the file's order. */
+static int qwen_write_state(ds4_session *s, size_t i, FILE *fp, uint8_t *mem, char *err, size_t errlen) {
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
     const uint64_t state_bytes = qwen_graph_state_walk(g, NULL, 0);
     const qwen_state_copy *c = i ? qwen_session_saved_state(s, i - 1) : NULL;
@@ -70330,12 +70365,25 @@ static int qwen_write_state(ds4_session *s, size_t i, FILE *fp, char *err, size_
             return 1;
         }
     }
-    uint8_t *buf = qwen_io_stage(s);
-    int rc = buf ? 0 : 1;
-    if (!buf) payload_set_err(err, errlen, "no pinned memory for the checkpoint's state");
-    if (rc == 0) rc = payload_write_u32(fp, (c ? c->mtp_pending : s->qwen_mtp_pending) ? 1u : 0u, err, errlen);
-    if (rc == 0) rc = payload_write_tensor_span(fp, state, 0, state_bytes, buf, DS4_SESSION_IO_CHUNK, err, errlen);
-    if (rc == 0) rc = payload_write_bytes(fp, c ? c->logits : s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen);
+    const uint32_t pending = (c ? c->mtp_pending : s->qwen_mtp_pending) ? 1u : 0u;
+    const float *logits = c ? c->logits : s->logits;
+    const uint64_t logit_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    int rc = 0;
+    if (mem) {
+        payload_put_u32(mem, pending);
+        if (ds4_gpu_tensor_read(state, 0, mem + 4, state_bytes) == 0) {
+            payload_set_err(err, errlen, "failed to read accelerator session tensor");
+            rc = 1;
+        }
+        memcpy(mem + 4 + state_bytes, logits, logit_bytes);
+    } else {
+        uint8_t *buf = qwen_io_stage(s);
+        rc = buf ? 0 : 1;
+        if (!buf) payload_set_err(err, errlen, "no pinned memory for the checkpoint's state");
+        if (rc == 0) rc = payload_write_u32(fp, pending, err, errlen);
+        if (rc == 0) rc = payload_write_tensor_span(fp, state, 0, state_bytes, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        if (rc == 0) rc = payload_write_bytes(fp, logits, logit_bytes, err, errlen);
+    }
     if (!c) ds4_gpu_tensor_free(state);
     return rc;
 }
@@ -70466,10 +70514,10 @@ static int qwen_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t
     for (uint32_t i = 0; i < n; i++) {
         if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
     }
-    int rc = qwen_block_io(s, fp, 0, n, n, false, err, errlen);
+    int rc = qwen_block_io(s, fp, NULL, 0, n, n, false, err, errlen);
     for (size_t i = 0; rc == 0 && i < states; i++) {
         if (i) rc = payload_write_u32(fp, (uint32_t)qwen_session_saved_state(s, i - 1)->tokens.len, err, errlen);
-        if (rc == 0) rc = qwen_write_state(s, i, fp, err, errlen);
+        if (rc == 0) rc = qwen_write_state(s, i, fp, NULL, err, errlen);
     }
     return rc;
 }

@@ -121,7 +121,8 @@ void ds4_chainstore_close(ds4_chainstore *cs);
  * into memory, and needs the session to itself (its caller holds whatever
  * keeps the engine off it); write puts that on disk, durably (fsync, then an
  * atomic rename, then the directory's fsync), and indexes it, and needs
- * nothing but the store.
+ * nothing but the store.  The trailer is written then, through the hooks
+ * make_* was given (a copy of them is kept: what they point to must last).
  *
  * make_segment: the live history's positions [sealed_end, live) as a segment
  * under `parent` (NULL or zeros: the chain's first).  id_out names it.  NULL
