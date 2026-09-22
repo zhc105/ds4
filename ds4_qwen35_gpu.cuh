@@ -850,6 +850,24 @@ __global__ static void qwen35_q8_pack_q8_0_kernel(
     for (uint32_t i = 0; i < 32u; i++) q[b * 32u + i] = (int8_t)blk[2u + i];
 }
 
+/* A packed weight's source is read once, here, through the file mapping and
+ * never again (the weight lives only in its packed buffers), but the pages
+ * read stay mapped and resident: 6.6 GiB on Flash-Next.  MADV_PAGEOUT drops
+ * clean file pages outright; a kernel without it still unmaps them
+ * (MADV_DONTNEED) and leaves them to the page cache to reclaim.  Only whole
+ * pages inside the span: a neighbour may be read in place. */
+static void qwen35_q8_release_source(const char *src, uint64_t bytes) {
+    const long pg_l = sysconf(_SC_PAGESIZE);
+    const uintptr_t pg = pg_l > 0 ? (uintptr_t)pg_l : 4096u;
+    const uintptr_t p0 = ((uintptr_t)src + pg - 1u) & ~(pg - 1u);
+    const uintptr_t p1 = ((uintptr_t)src + bytes) & ~(pg - 1u);
+    if (p1 <= p0) return;
+#ifdef MADV_PAGEOUT
+    if (madvise((void *)p0, (size_t)(p1 - p0), MADV_PAGEOUT) == 0) return;
+#endif
+    (void)madvise((void *)p0, (size_t)(p1 - p0), MADV_DONTNEED);
+}
+
 extern "C" int ds4_gpu_qwen35_q8_pack(
         const void *model_map,
         uint64_t    model_size,
@@ -906,6 +924,7 @@ extern "C" int ds4_gpu_qwen35_q8_pack(
         return 0;
     }
     g_qwen35_q8_packs.push_back(p);
+    qwen35_q8_release_source(src, bytes);
     return 1;
 }
 
