@@ -5848,6 +5848,46 @@ static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
 #define DS4_PARAM_START_SHORT "<" DS4_DSML_SHORT "parameter"
 #define DS4_PARAM_END_SHORT "</" DS4_DSML_SHORT "parameter>"
 
+/* A Qwen call stands at the start of a line: the template puts it after a
+ * blank line, or after </think>, with nothing before it on its line.  A
+ * <tool_call> inside a line is the model writing about the format (`the
+ * <tool_call> block`), and a stream that took it for a call stopped sending
+ * the reply there.  A line that opens with the marker is an attempt at a
+ * call even when what follows is malformed, and the parse's recovery gets
+ * it.  The decision needs only the bytes before the marker, which a stream
+ * always has.  base is where the text begins (a line start: the prompt ends
+ * on the assistant's prefix); the first opener in s at or after it, or NULL. */
+static const char *qwen_tool_open(const char *base, const char *s) {
+    static const char open[] = "<tool_call>";
+    for (const char *p = strstr(s, open); p; p = strstr(p + 1, open)) {
+        const char *q = p;
+        while (q > base && (q[-1] == ' ' || q[-1] == '\t')) q--;
+        if (q == base || q[-1] == '\n') return p;
+        if (q - base >= 8 && !memcmp(q - 8, "</think>", 8)) return p;
+    }
+    return NULL;
+}
+
+static const char *find_any_tool_start(const char *s);
+
+/* The first tool-call opener of the model's syntax in s, a suffix of the
+ * text that begins at base.  Qwen's <tool_call> counts at a line start
+ * only; every other syntax matches as before, on any of the markers. */
+static const char *find_tool_start(server_model_syntax syntax, const char *base,
+                                   const char *s) {
+    if (syntax != SERVER_MODEL_SYNTAX_QWEN) return find_any_tool_start(s);
+    const char *best = qwen_tool_open(base, s);
+    const char *others[] = {
+        strstr(s, DS4_TOOL_CALLS_START),
+        strstr(s, DS4_TOOL_CALLS_START_SHORT),
+        strstr(s, "<tool_calls>"),
+    };
+    for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+        if (others[i] && (!best || others[i] < best)) best = others[i];
+    }
+    return best;
+}
+
 static const char *find_any_tool_start(const char *s) {
     const char *best = NULL;
     const char *candidates[] = {
@@ -5876,11 +5916,12 @@ static const char *find_any_tool_end(const char *s) {
     return best;
 }
 
-static void observe_tool_markers(const char *scan, bool *saw_start,
-                                 bool *saw_end, bool *orphan_end) {
+static void observe_tool_markers(server_model_syntax syntax, const char *base,
+                                 const char *scan, bool *saw_start, bool *saw_end,
+                                 bool *orphan_end) {
     if (!scan) return;
     bool had_start = *saw_start;
-    const char *start = find_any_tool_start(scan);
+    const char *start = find_tool_start(syntax, base, scan);
     if (start) *saw_start = true;
 
     const char *end_scan = had_start ? scan : (start ? start : NULL);
@@ -6501,7 +6542,7 @@ static bool parse_qwen_generated_message_ex(const char *text,
     if (require_thinking_closed) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
-            const char *candidate = strstr(text, tool_start);
+            const char *candidate = qwen_tool_open(text, text);
             if (!candidate || !strstr(candidate, tool_end)) {
                 fprintf(stderr, "ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning\n");
                 ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
@@ -6515,7 +6556,8 @@ static bool parse_qwen_generated_message_ex(const char *text,
         }
     }
 
-    const char *start = strstr(tool_search, tool_start);
+    /* The same opener the stream acts on: a <tool_call> in prose is text. */
+    const char *start = qwen_tool_open(text, tool_search);
     if (!start) {
         split_reasoning_content(text, strlen(text), content_out, reasoning_out);
         qwen_trim_message(content_out, reasoning_out);
@@ -7198,7 +7240,7 @@ static const char *openai_tool_stream_id(server *s, openai_tool_stream *ts,
 }
 
 static size_t text_stream_safe_limit(const char *raw, size_t start,
-                                     size_t raw_len, bool has_tools,
+                                     size_t raw_len, const request *r,
                                      bool final);
 
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
@@ -7966,7 +8008,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
         const char *tool = r->has_tools ?
-            find_any_tool_start(raw + st->emit_pos) : NULL;
+            find_tool_start(r->model_syntax, raw, raw + st->emit_pos) : NULL;
         const bool tool_before_close = tool && (!close || tool < close);
         const bool complete_tool =
             tool_before_close && find_any_tool_end(tool) != NULL;
@@ -8016,7 +8058,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         if (st->guard_second_reasoning) {
             const char *close = strstr(raw + st->emit_pos, "</think>");
             const char *tool = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
+                find_tool_start(r->model_syntax, raw, raw + st->emit_pos) : NULL;
             if (close && (!tool || close < tool)) {
                 const size_t limit = (size_t)(close - raw);
                 if (limit > st->emit_pos &&
@@ -8034,9 +8076,9 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         }
 
         st->emit_pos = stream_content_start_for_syntax(r, raw, raw_len, st->emit_pos);
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        const char *tool = r->has_tools ? find_tool_start(r->model_syntax, raw, raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
+                                              r, final);
 
         if (limit > st->emit_pos) {
             if (!sse_chat_delta_n(fd, r, id, "content",
@@ -8067,10 +8109,20 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
 static bool openai_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                    openai_stream *st, const char *raw,
-                                   size_t raw_len, const tool_calls *calls,
+                                   size_t raw_len, bool recovered,
+                                   const tool_calls *calls,
                                    const char *finish, int prompt_tokens,
                                    int completion_tokens) {
     if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
+    /* A call the final parse could not read goes back as text, but the
+     * stream stopped sending at its marker: send what it held back, so a
+     * streaming client ends with the text a non-streaming one gets. */
+    if (recovered && st->emit_pos < raw_len) {
+        if (!sse_chat_delta_n(fd, r, id, "content", raw + st->emit_pos,
+                              raw_len - st->emit_pos)) return false;
+        st->sent_content = true;
+        st->emit_pos = raw_len;
+    }
 
     buf b = {0};
     long now = (long)time(NULL);
@@ -8727,7 +8779,7 @@ static bool responses_sse_stream_update(int fd, const request *r,
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
         const char *tool = r->has_tools ?
-            find_any_tool_start(raw + st->emit_pos) : NULL;
+            find_tool_start(r->model_syntax, raw, raw + st->emit_pos) : NULL;
         const bool tool_before_close = tool && (!close || tool < close);
         const bool complete_tool =
             tool_before_close && find_any_tool_end(tool) != NULL;
@@ -8790,9 +8842,9 @@ static bool responses_sse_stream_update(int fd, const request *r,
 
     if (st->mode == RESP_STREAM_TEXT) {
         st->emit_pos = stream_content_start_for_syntax(r, raw, raw_len, st->emit_pos);
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        const char *tool = r->has_tools ? find_tool_start(r->model_syntax, raw, raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
+                                              r, final);
 
         if (limit > st->emit_pos) {
             if (!st->message_item_opened) {
@@ -9579,13 +9631,13 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
 }
 
 static size_t text_stream_safe_limit(const char *raw, size_t start,
-                                     size_t raw_len, bool has_tools,
+                                     size_t raw_len, const request *r,
                                      bool final) {
     if (raw_len <= start) return raw_len;
 
     size_t limit = raw_len;
-    if (has_tools) {
-        const char *tool = find_any_tool_start(raw + start);
+    if (r->has_tools) {
+        const char *tool = find_tool_start(r->model_syntax, raw, raw + start);
         if (tool) {
             limit = trim_tool_separator_ws(raw, start, (size_t)(tool - raw));
             return utf8_stream_safe_len(raw, start, limit, true);
@@ -9640,7 +9692,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
         const char *tool = r->has_tools ?
-            find_any_tool_start(raw + st->emit_pos) : NULL;
+            find_tool_start(r->model_syntax, raw, raw + st->emit_pos) : NULL;
         const bool tool_before_close = tool && (!close || tool < close);
         const bool complete_tool =
             tool_before_close && find_any_tool_end(tool) != NULL;
@@ -9695,7 +9747,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         if (st->guard_second_reasoning) {
             const char *close = strstr(raw + st->emit_pos, "</think>");
             const char *tool = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
+                find_tool_start(r->model_syntax, raw, raw + st->emit_pos) : NULL;
             if (close && (!tool || close < tool)) {
                 const size_t limit = (size_t)(close - raw);
                 if (limit > st->emit_pos) {
@@ -9716,9 +9768,9 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         }
 
         st->emit_pos = stream_content_start_for_syntax(r, raw, raw_len, st->emit_pos);
-        const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
+        const char *tool = r->has_tools ? find_tool_start(r->model_syntax, raw, raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
-                                              r->has_tools, final);
+                                              r, final);
 
         if (limit > st->emit_pos) {
             if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
@@ -9818,9 +9870,21 @@ static bool anthropic_sse_stop_live(int fd, const char *finish,
 
 static bool anthropic_sse_finish_live(int fd, server *s, const request *r, const char *id,
                                       anthropic_stream *st, const char *raw,
-                                      size_t raw_len, const tool_calls *calls,
+                                      size_t raw_len, bool recovered,
+                                      const tool_calls *calls,
                                       const char *finish, int completion_tokens) {
     if (!anthropic_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
+    /* As openai_sse_finish_live: the text held back at an unreadable call. */
+    if (recovered && st->emit_pos < raw_len) {
+        if (st->open_block != ANTH_BLOCK_NONE && st->open_block != ANTH_BLOCK_TEXT &&
+            !anthropic_sse_close_block_live(fd, id, st)) return false;
+        if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
+        if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_TEXT, raw + st->emit_pos,
+                                      raw_len - st->emit_pos)) return false;
+        if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+        st->sent_text = true;
+        st->emit_pos = raw_len;
+    }
 
     if (st->sent_thinking && !st->sent_text && (!calls || calls->len == 0)) {
         if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
@@ -12171,11 +12235,12 @@ static thinking_state thinking_state_from_prompt(const request *r) {
 /* A completed tool block inside unclosed reasoning can be recovered without
  * predicting what the model will emit after an injected close marker. Keep a
  * short overlap until the opening appears, then wait for its matching end. */
-static bool complete_tool_call_inside_thinking(const char *text, size_t len,
+static bool complete_tool_call_inside_thinking(server_model_syntax syntax,
+                                               const char *text, size_t len,
                                                size_t *scan_from) {
     if (!text || !scan_from) return false;
     if (*scan_from > len) *scan_from = len;
-    const char *start = find_any_tool_start(text + *scan_from);
+    const char *start = find_tool_start(syntax, text, text + *scan_from);
     if (!start) {
         const size_t hold = 80;
         *scan_from = len > hold ? len - hold : 0;
@@ -13830,7 +13895,8 @@ decode_again:
                      * recover without asking the model to restart it after an
                      * injected close marker. */
                     if (complete_tool_call_inside_thinking(
-                            text.ptr, text.len, &think_recovery_scan_from)) {
+                            j->req.model_syntax, text.ptr, text.len,
+                            &think_recovery_scan_from)) {
                         saw_tool_start = true;
                         saw_tool_end = true;
                         finish = "tool_calls";
@@ -13860,7 +13926,8 @@ decode_again:
                     bool orphan_end = false;
                     bool old_start = saw_tool_start;
                     bool old_end = saw_tool_end;
-                    observe_tool_markers(tool_scan, &saw_tool_start, &saw_tool_end, &orphan_end);
+                    observe_tool_markers(j->req.model_syntax, text.ptr ? text.ptr : "", tool_scan,
+                                         &saw_tool_start, &saw_tool_end, &orphan_end);
                     if (orphan_end && !saw_orphan_tool_end) {
                         saw_orphan_tool_end = true;
                         server_log(DS4_LOG_WARNING,
@@ -14256,10 +14323,12 @@ decode_again:
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
+                                                    recovered_tool_parse_failure,
                                                     &parsed_calls, final_finish, completion);
         } else if (openai_live_chat) {
             response_ok = openai_sse_finish_live(j->fd, s, &j->req, id, &openai_live,
                                                  text.ptr ? text.ptr : "", text.len,
+                                                 recovered_tool_parse_failure,
                                                  &parsed_calls, final_finish,
                                                  prompt_tokens, completion);
         } else if (responses_live_chat) {
@@ -16366,7 +16435,7 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
 
     tool_calls calls = make_swapped_bash_call();
     TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_test", &st,
-                                          raw, strlen(raw), &calls,
+                                          raw, strlen(raw), false, &calls,
                                           "tool_calls", 8));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -16417,7 +16486,7 @@ static void test_anthropic_stream_reroutes_second_reasoning_pass(void) {
                                             &st, partial, strlen(partial), false));
     const char *complete = "first pass</think>escaped draft</think>final answer";
     TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_second_think",
-                                          &st, complete, strlen(complete), NULL,
+                                          &st, complete, strlen(complete), false, NULL,
                                           "stop", 9));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -16479,7 +16548,7 @@ static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     TEST_ASSERT(calls.v[0].id != NULL);
     TEST_ASSERT(!strncmp(calls.v[0].id, "toolu_", 6));
     TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_tool", &st,
-                                          raw_complete, strlen(raw_complete),
+                                          raw_complete, strlen(raw_complete), false,
                                           &calls, "tool_calls", 5));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -16570,6 +16639,147 @@ static void test_anthropic_usage_reports_cache_details(void) {
     request_free(&r);
 }
 
+/* A Qwen call stands at a line start; a <tool_call> inside a line is the
+ * model writing about the format.  Production 2026-09-23: a reply that
+ * explained the template wrote `<tool_call>` inline, the stream took it for
+ * a call and sent nothing more, and the parse that followed failed. */
+static void test_qwen_tool_open_at_line_start(void) {
+    const char *inl = "the `<tool_call>` block";
+    TEST_ASSERT(!qwen_tool_open(inl, inl));
+    const char *bare = "use the <tool_call> tag";
+    TEST_ASSERT(!qwen_tool_open(bare, bare));
+    const char *list = "- <tool_call> opens it";
+    TEST_ASSERT(!qwen_tool_open(list, list));
+    const char *two = "a `<tool_call>` b\n\n<tool_call>\n<function=bash>";
+    TEST_ASSERT(qwen_tool_open(two, two) == strstr(two, "\n<tool_call>") + 1);
+    const char *first = "<tool_call>\n<function=bash>";
+    TEST_ASSERT(qwen_tool_open(first, first) == first);
+    const char *indent = "x\n  <tool_call>";
+    TEST_ASSERT(qwen_tool_open(indent, indent) == strstr(indent, "<tool_call>"));
+    const char *think = "ok</think><tool_call>";
+    TEST_ASSERT(qwen_tool_open(think, think) == strstr(think, "<tool_call>"));
+    /* the scan may start mid-text: the line is judged in the whole text */
+    const char *mid = "ab\n<tool_call>";
+    TEST_ASSERT(qwen_tool_open(mid, mid + 3) == mid + 3);
+    TEST_ASSERT(!qwen_tool_open(mid, mid + 4));
+    /* every other syntax keeps matching the bare marker */
+    TEST_ASSERT(find_tool_start(SERVER_MODEL_SYNTAX_GLM, inl, inl) != NULL);
+
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    const char *prose = "<think>\nok\n</think>\n\nThe `<tool_call>` block and `</tool_call>` close it.";
+    TEST_ASSERT(parse_qwen_generated_message_ex(prose, true, NULL, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(content && strstr(content, "`<tool_call>` block and `</tool_call>` close it."));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_openai_qwen_stream_sends_prose_marker(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_bash_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *full = "The `<tool_call>` block goes first, then the rest.";
+    const char *cuts[] = {"The `", "The `<tool_call>", "The `<tool_call>` block",
+                          "The `<tool_call>` block goes first, then the rest."};
+    for (size_t i = 0; i < sizeof(cuts) / sizeof(cuts[0]); i++) {
+        TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_prose", &st,
+                                             cuts[i], strlen(cuts[i]), false));
+    }
+    TEST_ASSERT(st.mode == OPENAI_STREAM_TEXT);
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_prose", &st,
+                                       full, strlen(full), false, NULL, "stop", 5, 9));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(out && strstr(out, "tool_call>"));
+    TEST_ASSERT(out && strstr(out, " block goes first"));
+    TEST_ASSERT(out && strstr(out, "then the rest."));
+    TEST_ASSERT(out && !strstr(out, "\"tool_calls\""));
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+    tool_schema_orders_free(&r.tool_orders);
+}
+
+/* A call on its own line still stops the text: the reply before it is
+ * sent, the marker and what follows are not. */
+static void test_openai_qwen_stream_stops_at_line_call(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_bash_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *part = "Checking.\n\n<tool_call>\n<func";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_hold", &st,
+                                         part, strlen(part), false));
+    TEST_ASSERT(st.emit_pos <= (size_t)(strstr(part, "<tool_call>") - part));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(out && strstr(out, "Checking."));
+    TEST_ASSERT(out && !strstr(out, "tool_call"));
+    TEST_ASSERT(out && !strstr(out, "func"));
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+    tool_schema_orders_free(&r.tool_orders);
+}
+
+/* A call the final parse cannot read is returned as text; the stream had
+ * stopped at its marker, and the finish sends the rest. */
+static void test_openai_stream_sends_text_of_unreadable_call(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_bash_order();
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw = "Try.\n\n<tool_call>\n<function=bash>\n<parameter=broken";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_bad", &st,
+                                         raw, strlen(raw), false));
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_bad", &st,
+                                       raw, strlen(raw), true, NULL, "stop", 5, 9));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(out && strstr(out, "Try."));
+    TEST_ASSERT(out && strstr(out, "parameter=broken"));
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+    tool_schema_orders_free(&r.tool_orders);
+}
+
 static void test_openai_tool_stream_sends_incremental_text(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -16599,7 +16809,7 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
 
     tool_calls calls = make_swapped_bash_call();
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_test", &st,
-                                       raw, strlen(raw), &calls,
+                                       raw, strlen(raw), false, &calls,
                                        "tool_calls", 10, 8));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -16648,7 +16858,7 @@ static void test_openai_stream_reroutes_second_reasoning_pass(void) {
     const char *complete =
         "<think>first pass</think>escaped draft</think>final answer";
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_second_think",
-                                       &st, complete, strlen(complete), NULL,
+                                       &st, complete, strlen(complete), false, NULL,
                                        "stop", 5, 9));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -16780,7 +16990,7 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     const char *raw2 =
         "We need to generate a title</think>Free disk space check";
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_title", &st,
-                                       raw2, strlen(raw2), NULL,
+                                       raw2, strlen(raw2), false, NULL,
                                        "stop", 12, 8));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
@@ -16853,7 +17063,7 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     TEST_ASSERT(calls.v[0].id != NULL);
     TEST_ASSERT(!strncmp(calls.v[0].id, "call_", 5));
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_partial_tool", &st,
-                                       raw_complete, strlen(raw_complete), &calls,
+                                       raw_complete, strlen(raw_complete), false, &calls,
                                        "tool_calls", 10, 4));
 
     shutdown(sv[0], SHUT_WR);
@@ -16956,7 +17166,7 @@ static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
         &parsed_content, &parsed_reasoning, &calls));
     TEST_ASSERT(calls.len == 1);
     TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_glm_tool", &st,
-                                       raw, strlen(raw), &calls,
+                                       raw, strlen(raw), false, &calls,
                                        "tool_calls", 10, 4));
 
     shutdown(sv[0], SHUT_WR);
@@ -20159,20 +20369,20 @@ static void test_tool_marker_state_ignores_orphan_end(void) {
     bool saw_end = false;
     bool orphan_end = false;
 
-    observe_tool_markers("reasoning\n" DS4_PARAM_END "\n" DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+    observe_tool_markers(SERVER_MODEL_SYNTAX_DEEPSEEK, "", "reasoning\n" DS4_PARAM_END "\n" DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
                          &saw_start, &saw_end, &orphan_end);
     TEST_ASSERT(!saw_start);
     TEST_ASSERT(!saw_end);
     TEST_ASSERT(orphan_end);
 
     orphan_end = false;
-    observe_tool_markers(DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START " name=\"bash\">",
+    observe_tool_markers(SERVER_MODEL_SYNTAX_DEEPSEEK, "", DS4_TOOL_CALLS_START "\n" DS4_INVOKE_START " name=\"bash\">",
                          &saw_start, &saw_end, &orphan_end);
     TEST_ASSERT(saw_start);
     TEST_ASSERT(!saw_end);
     TEST_ASSERT(!orphan_end);
 
-    observe_tool_markers(DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
+    observe_tool_markers(SERVER_MODEL_SYNTAX_DEEPSEEK, "", DS4_INVOKE_END "\n" DS4_TOOL_CALLS_END,
                          &saw_start, &saw_end, &orphan_end);
     TEST_ASSERT(saw_start);
     TEST_ASSERT(saw_end);
@@ -21510,6 +21720,10 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_stream_reroutes_second_reasoning_pass();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
+    test_qwen_tool_open_at_line_start();
+    test_openai_qwen_stream_sends_prose_marker();
+    test_openai_qwen_stream_stops_at_line_call();
+    test_openai_stream_sends_text_of_unreadable_call();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_stream_reroutes_second_reasoning_pass();
     test_openai_stream_usage_reports_cache_details();
