@@ -3187,6 +3187,42 @@ __global__ static void qwen4exp_expert_matvec_kernel(
     }
 }
 
+/* qwen4exp_expert_matvec_kernel<K> for a pass of several rows, with the
+ * block's 8K weight rows (one expert's, 8K * NS * 36 bytes) first copied to
+ * shared memory with 16-byte loads: the rows' 36-byte super-blocks are not
+ * 16-byte aligned, and the kernel's own 4-byte loads of them cap it near
+ * 205 GB/s where 16-byte loads of the same bytes reach 230 (a standalone
+ * bench on GB10: 8 rows of ~50 distinct experts, 35.5 -> 33 ms of routed
+ * experts a pass).  Every lane then does exactly the other kernel's
+ * arithmetic on the same bytes, so the two are bit-identical and the
+ * dispatch may pick either by row count: a lone row loses ~3% to the copy's
+ * wait, having few blocks to hide it behind. */
+template <int K, int NS>
+__global__ static void __launch_bounds__(256) qwen4exp_expert_matvec_staged_kernel(
+        float *out, const uint8_t *w, uint64_t expert_bytes, const float *scales, const int32_t *sel,
+        const float *x, uint32_t x_per_slot, uint32_t out_dim, uint32_t n_used) {
+    constexpr uint32_t ROW = NS * 36u, BYTES = 8u * K * ROW, IN = NS * 64u;
+    static_assert(BYTES % 16u == 0u, "a block's rows are whole 16-byte units");
+    __shared__ __align__(16) uint8_t sw[BYTES];
+    const uint32_t warp = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
+    const uint32_t slot = blockIdx.x;
+    const uint32_t row0 = blockIdx.y * 8u * K;   /* out_dim is a whole number of blocks */
+    const int32_t e = sel[slot];
+    const uint4 *src = (const uint4 *)(w + (uint64_t)e * expert_bytes + (uint64_t)row0 * ROW);
+    for (uint32_t i = threadIdx.x; i < BYTES / 16u; i += blockDim.x) ((uint4 *)sw)[i] = src[i];
+    __syncthreads();
+    const uint8_t *rows[K];
+#pragma unroll
+    for (int k = 0; k < K; k++) rows[k] = sw + (warp * K + (uint32_t)k) * ROW;
+    float sums[K];
+    qwen35_nvfp4_warp_dot_cols<K>(rows, x + (uint64_t)(x_per_slot ? slot : slot / n_used) * IN, NS, lane, sums);
+    if (lane == 0u) {
+        const float scale = scales[e];
+#pragma unroll
+        for (int k = 0; k < K; k++) out[(uint64_t)slot * out_dim + row0 + warp * K + k] = sums[k] * scale;
+    }
+}
+
 extern "C" int ds4_gpu_qwen4exp_expert_matvec(
         ds4_gpu_tensor       *out,          /* [rows * n_used][out_dim] */
         const void           *model_map,
@@ -3229,6 +3265,17 @@ extern "C" int ds4_gpu_qwen4exp_expert_matvec(
     const float *xp = (const float *)x->ptr;
     const int32_t *sp = (const int32_t *)sel->ptr;
     cudaStream_t stream = cuda_decode_stream();
+    /* several rows: Flash-Next's two shapes through shared memory */
+    if (rows > 1u && out_dim % cols == 0u && ((short_rows && in_dim == 640u) || (!short_rows && in_dim == 2560u))) {
+        if (short_rows) {
+            qwen4exp_expert_matvec_staged_kernel<4, 10><<<grid, 256, 0, stream>>>(
+                o, (const uint8_t *)w, expert_bytes, scales, sp, xp, x_per_slot != 0, out_dim, n_used);
+        } else {
+            qwen4exp_expert_matvec_staged_kernel<1, 40><<<grid, 256, 0, stream>>>(
+                o, (const uint8_t *)w, expert_bytes, scales, sp, xp, x_per_slot != 0, out_dim, n_used);
+        }
+        return cuda_ok(cudaGetLastError(), "Flash-Next expert matvec launch");
+    }
     if (short_rows) {
         qwen4exp_expert_matvec_kernel<4><<<grid, 256, 0, stream>>>(
             o, (const uint8_t *)w, expert_bytes, scales, sp, xp, x_per_slot != 0, in_dim, out_dim, n_used);
