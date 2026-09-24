@@ -545,8 +545,10 @@ static uint32_t qwen35_matvec_split(uint32_t in_dim, uint32_t out_dim) {
     return out_dim <= 2560u ? 8u : 4u;
 }
 
-/* Several rows dot C columns per warp from each activation load, as the
- * packed q8 matvec does (qwen35_matvec_q8p_split). */
+/* Several rows dot C columns per warp from each activation load: at 8 rows
+ * each 16 weight bytes cost every row 32 activation bytes through L1, so
+ * sharing the loads across columns keeps a speculative verify pass off the
+ * L1 ceiling. */
 template <int N>
 static void qwen35_matvec_bf16_split(
         float *out, const uint16_t *w, const float *x, uint32_t in_dim, uint32_t out_dim, cudaStream_t stream) {
@@ -846,14 +848,18 @@ static ds4_gpu_tensor *qwen35_f32_scratch(int which, uint64_t elems) {
 
 /* ---- Load-time q8 -----------------------------------------------------
  * Bypass projections the engine quantises as it loads them (ds4.c decides
- * which): int8 quants [out][in] contiguous and the fp16 block scales
- * [out][in/32] apart, GGML q8_0's numbers (a block of 32, d = amax/127,
- * q = round(x/d)) in a layout the decode kernel can stream with 16-byte
- * loads.  GGML q8_0 interleaves the 2-byte scale with every 32 quants, so
- * a row is only 2-byte aligned and its kernel loads bytes: 200 GB/s where
- * this layout reaches the 245 GB/s of a plain read.  A q8_0 tensor in the
- * file is re-laid identically, a bf16 one quantised; the source span is
- * then not cached on the device (ds4_gpu_model_range_replaced). */
+ * which): GGML q8_0's numbers (a block of 32, d = amax/127, q = round(x/d))
+ * with the int8 quants and the fp16 scales apart, laid out for the decode
+ * kernel's tensor-core fragments (qwen35_matvec_q8p_mma_kernel).  The
+ * weight is cut into tiles of 16 rows by 32 inputs (one scale group), tile
+ * (T, G) at (T * groups + G) * 512 bytes: lane l of the warp that reads it
+ * (g = l / 4, c = l % 4) owns bytes [16l, 16l + 16), inputs 32G + 8c ..
+ * + 7 of row 16T + g, then of row 16T + g + 8.  So a warp's tile is one
+ * 512-byte run, one 16-byte load a lane, and a block's warps walk the tiles
+ * of a row band in order.  The scales of tile (T, G) are 16 fp16 at
+ * (T * groups + G) * 16, row 16T + i at i.  A q8_0 tensor in the file is
+ * re-laid, a bf16 one quantised; the source span is then not cached on the
+ * device (ds4_gpu_model_range_replaced). */
 
 struct qwen35_q8_pack {
     const void *map;
@@ -877,12 +883,39 @@ static int qwen35_q8_pack_replaces(const void *map, uint64_t offset) {
     return qwen35_q8_pack_find(map, offset) != NULL;
 }
 
-/* One thread per block of 32: quantise a bf16 row segment (the converter's
- * q8_0_quantize: half-away-from-zero rounding, d = amax / 127 in f32). */
+/* Where group gi of row r goes in the tiled layout: its 32 quants as four
+ * 8-byte pieces (inputs 8c .. 8c + 7 at quant_at(c)) and its scale. */
+struct qwen35_q8_slot {
+    uint64_t tile;    /* T * groups + G */
+    uint32_t g, half, i;
+};
+
+__device__ __forceinline__ qwen35_q8_slot qwen35_q8_slot_of(uint64_t r, uint32_t gi, uint32_t groups) {
+    qwen35_q8_slot o;
+    o.tile = (r / 16u) * groups + gi;
+    o.i = (uint32_t)(r % 16u);
+    o.g = o.i % 8u;
+    o.half = o.i / 8u;
+    return o;
+}
+
+__device__ __forceinline__ void qwen35_q8_slot_store(int8_t *q, __half *s, qwen35_q8_slot o,
+                                                     const uint32_t words[8], __half scale) {
+#pragma unroll
+    for (uint32_t c = 0; c < 4u; c++) {
+        *(uint2 *)(q + o.tile * 512u + (o.g * 4u + c) * 16u + o.half * 8u) = make_uint2(words[2u * c], words[2u * c + 1u]);
+    }
+    s[o.tile * 16u + o.i] = scale;
+}
+
+/* One thread per block of 32 of rows r0 .. of the staged source: quantise a
+ * bf16 row segment (the converter's q8_0_quantize: half-away-from-zero
+ * rounding, d = amax / 127 in f32). */
 __global__ static void qwen35_q8_pack_bf16_kernel(
-        int8_t *q, __half *s, const uint16_t *src, uint32_t in_dim, uint64_t n_blocks) {
+        int8_t *q, __half *s, const uint16_t *src, uint32_t in_dim, uint64_t r0, uint64_t n_blocks) {
     const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
+    const uint32_t groups = in_dim / 32u;
     const uint2 *w = (const uint2 *)(src + b * 32u);
     float v[32];
     for (uint32_t i = 0; i < 8u; i++) {
@@ -894,7 +927,6 @@ __global__ static void qwen35_q8_pack_bf16_kernel(
     for (uint32_t i = 0; i < 32u; i++) amax = fmaxf(amax, fabsf(v[i]));
     const float d = amax / 127.0f;
     const float id = d > 0.0f ? 1.0f / d : 0.0f;
-    s[b] = __float2half(d);
     uint32_t packed[8];
     for (uint32_t i = 0; i < 8u; i++) {
         uint32_t word = 0;
@@ -906,21 +938,24 @@ __global__ static void qwen35_q8_pack_bf16_kernel(
         }
         packed[i] = word;
     }
-    ((uint4 *)q)[b * 2u] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
-    ((uint4 *)q)[b * 2u + 1u] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
-    (void)in_dim;
+    qwen35_q8_slot_store(q, s, qwen35_q8_slot_of(r0 + b / groups, (uint32_t)(b % groups), groups), packed,
+                         __float2half(d));
 }
 
-/* One thread per block: split a GGML q8_0 block (2-byte scale, 32 quants). */
+/* One thread per block of rows r0 ..: split a GGML q8_0 block (2-byte
+ * scale, 32 quants). */
 __global__ static void qwen35_q8_pack_q8_0_kernel(
-        int8_t *q, __half *s, const uint8_t *src, uint64_t n_blocks) {
+        int8_t *q, __half *s, const uint8_t *src, uint32_t in_dim, uint64_t r0, uint64_t n_blocks) {
     const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
+    const uint32_t groups = in_dim / 32u;
     const uint8_t *blk = src + b * 34u;
     uint16_t bits;
     memcpy(&bits, blk, 2);
-    s[b] = __ushort_as_half(bits);
-    for (uint32_t i = 0; i < 32u; i++) q[b * 32u + i] = (int8_t)blk[2u + i];
+    uint32_t words[8];
+    memcpy(words, blk + 2u, 32u);
+    qwen35_q8_slot_store(q, s, qwen35_q8_slot_of(r0 + b / groups, (uint32_t)(b % groups), groups), words,
+                         __ushort_as_half(bits));
 }
 
 /* A packed weight's source is read once, here, through the file mapping and
@@ -950,8 +985,8 @@ extern "C" int ds4_gpu_qwen35_q8_pack(
         uint32_t    out_dim,
         const char *name) {
     const uint64_t bytes = qwen35_weight_bytes(wtype, in_dim, out_dim);
-    if (!model_map || bytes == 0u || in_dim % 32u != 0u || offset > model_size || bytes > model_size - offset ||
-        (wtype != QWEN35_W_BF16 && wtype != QWEN35_W_Q8_0)) {
+    if (!model_map || bytes == 0u || in_dim % 32u != 0u || out_dim % 16u != 0u || offset > model_size ||
+        bytes > model_size - offset || (wtype != QWEN35_W_BF16 && wtype != QWEN35_W_Q8_0)) {
         return 0;
     }
     if (qwen35_q8_pack_find(model_map, offset)) return 1;
@@ -967,7 +1002,7 @@ extern "C" int ds4_gpu_qwen35_q8_pack(
     /* the source comes through host memory in row chunks: it may live in
      * nothing but the file mapping, since its span is never cached */
     const uint64_t row_bytes = bytes / out_dim;
-    const uint64_t chunk_rows = (256ull << 20) / row_bytes > 0u ? (256ull << 20) / row_bytes : 1u;
+    const uint64_t chunk_rows = (256ull << 20) / row_bytes / 16u > 0u ? (256ull << 20) / row_bytes / 16u * 16u : 16u;
     void *stage = NULL;
     if (cudaMalloc(&stage, chunk_rows * row_bytes) != cudaSuccess) {
         (void)cudaFree(p.quants); (void)cudaFree(p.scales); (void)cudaGetLastError();
@@ -978,14 +1013,13 @@ extern "C" int ds4_gpu_qwen35_q8_pack(
     for (uint64_t r0 = 0; ok && r0 < out_dim; r0 += chunk_rows) {
         const uint64_t rows = out_dim - r0 < chunk_rows ? out_dim - r0 : chunk_rows;
         const uint64_t blocks = rows * (in_dim / 32u);
-        const uint64_t b0 = r0 * (in_dim / 32u);
         ok = cudaMemcpy(stage, src + r0 * row_bytes, rows * row_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
         if (!ok) break;
         const unsigned grid = (unsigned)((blocks + 255u) / 256u);
         if (wtype == QWEN35_W_BF16) {
-            qwen35_q8_pack_bf16_kernel<<<grid, 256>>>(p.quants + b0 * 32u, p.scales + b0, (const uint16_t *)stage, in_dim, blocks);
+            qwen35_q8_pack_bf16_kernel<<<grid, 256>>>(p.quants, p.scales, (const uint16_t *)stage, in_dim, r0, blocks);
         } else {
-            qwen35_q8_pack_q8_0_kernel<<<grid, 256>>>(p.quants + b0 * 32u, p.scales + b0, (const uint8_t *)stage, blocks);
+            qwen35_q8_pack_q8_0_kernel<<<grid, 256>>>(p.quants, p.scales, (const uint8_t *)stage, in_dim, r0, blocks);
         }
         ok = cudaGetLastError() == cudaSuccess;
     }
@@ -1008,149 +1042,146 @@ __device__ __forceinline__ void qwen35_unpack8(uint32_t a, uint32_t b, float *f)
     f[6] = (float)(int8_t)((b >> 16) & 0xffu); f[7] = (float)(int8_t)(b >> 24);
 }
 
-/* Decode matvec over the packed layout: W warps per output column split
- * the row (four up to 2560 columns, two beyond), a lane takes 16 quants
- * (one 16-byte load, half a block) per step, so a warp step streams 512
- * weights, and the activation rows of a speculative batch are dotted from
- * the same weights.  Measured at the device's plain-read bandwidth on
- * every bypass shape. */
-template <int N, int W, int C>
-__global__ static void qwen35_matvec_q8p_rows_kernel(
-        float *out, const int8_t *q, const __half *s, const float *x, uint32_t in_dim, uint32_t out_dim) {
-    __shared__ float part[8][C][N];
+/* Two int8 weights (bytes 2h, 2h + 1 of w) as a bf16x2 register, exactly. */
+__device__ __forceinline__ uint32_t qwen35_i8x2_bf16x2(uint32_t w, uint32_t h) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn((float)(int8_t)(w >> (16u * h)),
+                                                   (float)(int8_t)(w >> (16u * h + 8u)));
+    return *(const uint32_t *)&v;
+}
+
+__device__ __forceinline__ uint32_t qwen35_f32x2_bf16x2(float a, float b) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
+    return *(const uint32_t *)&v;
+}
+
+/* Decode-sized packed q8 matvec on the tensor cores: bf16 m16n8k16 MMAs
+ * with 16 weight rows as A (int8 -> bf16 is exact) and the pass's rows as
+ * the 8 columns of B (activations rounded to bf16, the checkpoint's recipe
+ * and the prefill's; missing rows are zero), accumulated in f32.  A row's
+ * sum takes the same instructions whether the pass has 1 or 8 rows, so a
+ * speculative verify row is bit-identical to the one-token step; and the
+ * weights are decoded once for all rows instead of per row, which made the
+ * CUDA-core matvec issue-bound at 8 rows.
+ *
+ * A block owns a row band of 16 (tile row T); its 8 warps take the band's
+ * tiles, one 32-weight scale group each, in turn (warp w: groups w, w + 8,
+ * ...).  A tile is two MMAs whose raw sum is scaled by each row's f16
+ * scale and added to the warp's f32 sum; the warps' sums are added in warp
+ * order.  Lane l (g = l / 4, c = l % 4) reads its 16 bytes of the tile
+ * (8 weights of row g, then of row g + 8, at inputs 8c .., see the packed
+ * layout above) and the 8 activations of pass row g at the same inputs:
+ * the MMA's k slots {2c, 2c + 1, 2c + 8, 2c + 9} of step s hold inputs
+ * 8c + 4s + {0, 1, 2, 3}, the same permutation of k on both operands. */
+__global__ static void __launch_bounds__(256) qwen35_matvec_q8p_mma_kernel(
+        float *out, const int8_t *q, const __half *s, const float *x, uint32_t in_dim, uint32_t out_dim,
+        uint32_t n_tok) {
+    __shared__ float part[8][32][4];
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t col0 = (blockIdx.x * (8u / W) + warp / W) * C;
-    const uint32_t kw = warp % W;
-    const uint32_t steps = in_dim / 16u;
-    const uint4 *qrow[C];
-    const __half *srow[C];
+    const uint32_t g = lane >> 2u, c = lane & 3u;
+    const uint32_t groups = in_dim / 32u;
+    const uint32_t r0 = blockIdx.x * 16u + g, r1 = r0 + 8u;
+    const uint4 *qt = (const uint4 *)q + (uint64_t)blockIdx.x * groups * 32u + lane;   /* 32 uint4 a tile */
+    const __half *sc = s + (uint64_t)blockIdx.x * groups * 16u;
+    const bool tok = g < n_tok;   /* this lane's B column is pass row g */
+    const float *xr = x + (uint64_t)(tok ? g : 0u) * in_dim + c * 8u;
+    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    /* U of the warp's groups per step, every load issued before any MMA */
+    constexpr uint32_t U = 4u;
+    for (uint32_t g0 = warp; g0 < groups; g0 += 8u * U) {
+        uint4 wv[U];
+        float4 xv[U][2];
+        __half ha[U], hb[U];
 #pragma unroll
-    for (int c = 0; c < C; c++) {   /* a column past the end reads the first one's weights and is not written */
-        const uint32_t col = col0 + c < out_dim ? col0 + c : col0;
-        qrow[c] = (const uint4 *)(q + (uint64_t)col * in_dim);
-        srow[c] = s + (uint64_t)col * (in_dim / 32u);
-    }
-    float sum[C][N];
-#pragma unroll
-    for (int c = 0; c < C; c++)
-#pragma unroll
-        for (int r = 0; r < N; r++) sum[c][r] = 0.0f;
-    if (col0 < out_dim) {
-        for (uint32_t i = kw * 32u + lane; i < steps; i += 32u * W) {
-            float wf[C][16], d[C];
-#pragma unroll
-            for (int c = 0; c < C; c++) {
-                const uint4 wq = qrow[c][i];
-                d[c] = __half2float(srow[c][i >> 1]);
-                qwen35_unpack8(wq.x, wq.y, wf[c]);
-                qwen35_unpack8(wq.z, wq.w, wf[c] + 8);
+        for (uint32_t u = 0; u < U; u++) {
+            const uint32_t gi = g0 + 8u * u;
+            if (gi >= groups) break;
+            wv[u] = qt[(uint64_t)gi * 32u];
+            ha[u] = sc[gi * 16u + g];
+            hb[u] = sc[gi * 16u + g + 8u];
+            if (tok) {
+                xv[u][0] = *(const float4 *)(xr + gi * 32u);
+                xv[u][1] = *(const float4 *)(xr + gi * 32u + 4u);
             }
+        }
 #pragma unroll
-            for (int r = 0; r < N; r++) {
-                const float4 *xs = (const float4 *)(x + (uint64_t)r * in_dim + i * 16u);
-                const float4 x0 = xs[0], x1 = xs[1], x2 = xs[2], x3 = xs[3];
-#pragma unroll
-                for (int c = 0; c < C; c++) {
-                    const float *w = wf[c];
-                    float acc = 0.0f;
-                    acc = fmaf(w[0], x0.x, acc); acc = fmaf(w[1], x0.y, acc); acc = fmaf(w[2], x0.z, acc); acc = fmaf(w[3], x0.w, acc);
-                    acc = fmaf(w[4], x1.x, acc); acc = fmaf(w[5], x1.y, acc); acc = fmaf(w[6], x1.z, acc); acc = fmaf(w[7], x1.w, acc);
-                    acc = fmaf(w[8], x2.x, acc); acc = fmaf(w[9], x2.y, acc); acc = fmaf(w[10], x2.z, acc); acc = fmaf(w[11], x2.w, acc);
-                    acc = fmaf(w[12], x3.x, acc); acc = fmaf(w[13], x3.y, acc); acc = fmaf(w[14], x3.z, acc); acc = fmaf(w[15], x3.w, acc);
-                    sum[c][r] = fmaf(d[c], acc, sum[c][r]);
-                }
+        for (uint32_t u = 0; u < U; u++) {
+            if (g0 + 8u * u >= groups) break;
+            uint32_t bx[4] = { 0u, 0u, 0u, 0u };
+            if (tok) {
+                bx[0] = qwen35_f32x2_bf16x2(xv[u][0].x, xv[u][0].y); bx[1] = qwen35_f32x2_bf16x2(xv[u][0].z, xv[u][0].w);
+                bx[2] = qwen35_f32x2_bf16x2(xv[u][1].x, xv[u][1].y); bx[3] = qwen35_f32x2_bf16x2(xv[u][1].z, xv[u][1].w);
             }
+            float d[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll
+            for (uint32_t st = 0; st < 2u; st++) {
+                const uint32_t w0 = st ? wv[u].y : wv[u].x, w1 = st ? wv[u].w : wv[u].z;   /* row g, row g + 8 */
+                const uint32_t a0 = qwen35_i8x2_bf16x2(w0, 0u), a1 = qwen35_i8x2_bf16x2(w1, 0u);
+                const uint32_t a2 = qwen35_i8x2_bf16x2(w0, 1u), a3 = qwen35_i8x2_bf16x2(w1, 1u);
+                asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(bx[2u * st]), "r"(bx[2u * st + 1u]));
+            }
+            const float s0 = __half2float(ha[u]), s1 = __half2float(hb[u]);
+            acc[0] = fmaf(d[0], s0, acc[0]);
+            acc[1] = fmaf(d[1], s0, acc[1]);
+            acc[2] = fmaf(d[2], s1, acc[2]);
+            acc[3] = fmaf(d[3], s1, acc[3]);
         }
     }
 #pragma unroll
-    for (int c = 0; c < C; c++)
-#pragma unroll
-        for (int r = 0; r < N; r++) {
-            const float total = warp_sum_f32(sum[c][r]);
-            if (lane == 0u) part[warp][c][r] = total;
-        }
+    for (int i = 0; i < 4; i++) part[warp][lane][i] = acc[i];
     __syncthreads();
-    if (kw == 0u && lane == 0u) {
+    if (warp != 0u) return;
+    float t[4];
 #pragma unroll
-        for (int c = 0; c < C; c++) {
-            if (col0 + c >= out_dim) break;
-#pragma unroll
-            for (int r = 0; r < N; r++) {
-                float total = 0.0f;
-                for (int j = 0; j < W; j++) total += part[warp + j][c][r];
-                out[(uint64_t)r * out_dim + col0 + c] = total;
-            }
-        }
+    for (int i = 0; i < 4; i++) {
+        t[i] = part[0][lane][i];
+        for (uint32_t w = 1; w < 8u; w++) t[i] += part[w][lane][i];
     }
-}
-
-/* A lone row is bound by DRAM latency: one column per warp keeps the most
- * warps in flight.  Several rows are bound by the activation loads through
- * L1 (each 16 weight bytes cost every row 64 activation bytes; at 8 rows
- * L1 ran at 99% of its peak): a warp then dots C columns with each
- * activation load (GB10, n-gram drafts on a copied file, 8-row verify
- * passes: 81 tok/s at C = 1, 92 at 2, 94 at 4).  Every column's sum is
- * formed exactly as with one column per warp. */
-template <int N, int W, int C>
-static void qwen35_matvec_q8p_launch(
-        float *out, const qwen35_q8_pack *p, const float *x, cudaStream_t stream) {
-    const uint32_t cols = (8u / W) * C;
-    qwen35_matvec_q8p_rows_kernel<N, W, C><<<(p->out_dim + cols - 1u) / cols, 256, 0, stream>>>(
-        out, p->quants, p->scales, x, p->in_dim, p->out_dim);
-}
-
-template <int N>
-static void qwen35_matvec_q8p_split(
-        float *out, const qwen35_q8_pack *p, const float *x, cudaStream_t stream) {
-    constexpr int C = N == 1 ? 1 : N < 4 ? 2 : 4;
-    if (p->out_dim > 2560u) qwen35_matvec_q8p_launch<N, 2, C>(out, p, x, stream);
-    else qwen35_matvec_q8p_launch<N, 4, C>(out, p, x, stream);
-}
-
-static void qwen35_matvec_q8p_rows(
-        float *out, const qwen35_q8_pack *p, const float *x, uint32_t n_tok, cudaStream_t stream) {
-    switch (n_tok) {
-    case 1: qwen35_matvec_q8p_split<1>(out, p, x, stream); break;
-    case 2: qwen35_matvec_q8p_split<2>(out, p, x, stream); break;
-    case 3: qwen35_matvec_q8p_split<3>(out, p, x, stream); break;
-    case 4: qwen35_matvec_q8p_split<4>(out, p, x, stream); break;
-    case 5: qwen35_matvec_q8p_split<5>(out, p, x, stream); break;
-    case 6: qwen35_matvec_q8p_split<6>(out, p, x, stream); break;
-    case 7: qwen35_matvec_q8p_split<7>(out, p, x, stream); break;
-    default: qwen35_matvec_q8p_split<8>(out, p, x, stream); break;
+    /* d0, d1: row r0 at pass rows 2c, 2c + 1; d2, d3: row r1 */
+    const uint32_t n0 = 2u * c, n1 = n0 + 1u;
+    if (n0 < n_tok) {
+        out[(uint64_t)n0 * out_dim + r0] = t[0];
+        out[(uint64_t)n0 * out_dim + r1] = t[2];
+    }
+    if (n1 < n_tok) {
+        out[(uint64_t)n1 * out_dim + r0] = t[1];
+        out[(uint64_t)n1 * out_dim + r1] = t[3];
     }
 }
 
 /* Prefill dequantises a slice of rows back to bf16 for the tensor-core
  * GEMM: the same bf16 x bf16 recipe as an unquantised bypass weight, with
- * the weights carrying q8_0's rounding.  A thread's block leaves as four
- * 16-byte stores. */
+ * the weights carrying q8_0's rounding.  A slice is whole row bands of 16;
+ * one thread per 16 packed bytes (a lane's share of a tile) writes its 8
+ * weights of each of its two rows as a 16-byte store. */
 __device__ __forceinline__ uint32_t qwen35_bf16x2_bits(float a, float b) {
     const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
     return *(const uint32_t *)&v;
 }
 
 __global__ static void qwen35_q8p_to_bf16_kernel(
-        __nv_bfloat16 *dst, const int8_t *q, const __half *s, uint64_t n_blocks) {
-    const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= n_blocks) return;
-    const float d = __half2float(s[b]);
-    const uint4 *src = (const uint4 *)(q + b * 32u);
-    uint4 *o = (uint4 *)(dst + b * 32u);
-    for (uint32_t h = 0; h < 2u; h++) {
-        const uint4 w = src[h];
-        float f[16];
-        qwen35_unpack8(w.x, w.y, f);
-        qwen35_unpack8(w.z, w.w, f + 8);
-        uint4 v[2];
-        for (uint32_t i = 0; i < 2u; i++) {
-            const float *g = f + i * 8u;
-            v[i] = make_uint4(qwen35_bf16x2_bits(g[0] * d, g[1] * d), qwen35_bf16x2_bits(g[2] * d, g[3] * d),
-                              qwen35_bf16x2_bits(g[4] * d, g[5] * d), qwen35_bf16x2_bits(g[6] * d, g[7] * d));
-        }
-        o[2u * h] = v[0];
-        o[2u * h + 1u] = v[1];
+        __nv_bfloat16 *dst, const int8_t *q, const __half *s, uint32_t in_dim, uint64_t n_tiles) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_tiles * 32u) return;
+    const uint32_t groups = in_dim / 32u;
+    const uint64_t t = i / 32u;
+    const uint32_t l = (uint32_t)(i % 32u), g = l / 4u, c = l % 4u;
+    const uint64_t band = t / groups;
+    const uint32_t gi = (uint32_t)(t % groups);
+    const uint4 w = ((const uint4 *)q)[i];
+    float f[16];
+    qwen35_unpack8(w.x, w.y, f);
+    qwen35_unpack8(w.z, w.w, f + 8);
+#pragma unroll
+    for (uint32_t h = 0; h < 2u; h++) {   /* row g, then row g + 8 */
+        const float d = __half2float(s[t * 16u + g + 8u * h]);
+        const float *v = f + 8u * h;
+        *(uint4 *)(dst + (band * 16u + g + 8u * h) * in_dim + gi * 32u + c * 8u) =
+            make_uint4(qwen35_bf16x2_bits(v[0] * d, v[1] * d), qwen35_bf16x2_bits(v[2] * d, v[3] * d),
+                       qwen35_bf16x2_bits(v[4] * d, v[5] * d), qwen35_bf16x2_bits(v[6] * d, v[7] * d));
     }
 }
 
@@ -1158,7 +1189,8 @@ static int qwen35_matmul_q8p(
         void *out, int out_bf16, const qwen35_q8_pack *p, const float *x, const __nv_bfloat16 *x_bf16,
         uint32_t n_tok, int tier, cudaStream_t stream) {
     if (n_tok <= 8u) {
-        qwen35_matvec_q8p_rows((float *)out, p, x, n_tok, stream);
+        qwen35_matvec_q8p_mma_kernel<<<p->out_dim / 16u, 256, 0, stream>>>(
+            (float *)out, p->quants, p->scales, x, p->in_dim, p->out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), "Qwen packed q8 matvec launch");
     }
     if (!g_cublas_ready) return 0;
@@ -1177,7 +1209,7 @@ static int qwen35_matmul_q8p(
      * narrower GEMMs than the overlap hides (16 MiB slices cost 8%). */
     static __nv_bfloat16 *scratch = NULL;
     static uint64_t scratch_elems = 0;
-    const uint32_t slice_rows = p->in_dim ? (uint32_t)((32ull << 20) / p->in_dim) : 0u;
+    const uint32_t slice_rows = p->in_dim ? (uint32_t)((32ull << 20) / p->in_dim / 16u * 16u) : 0u;   /* whole bands */
     const uint64_t need = (uint64_t)(slice_rows < p->out_dim ? slice_rows : p->out_dim) * p->in_dim;
     if (slice_rows == 0u) return 0;
     if (scratch_elems < need) {
@@ -1193,10 +1225,10 @@ static int qwen35_matmul_q8p(
     const float alpha = 1.0f, beta = 0.0f;
     for (uint32_t c0 = 0; c0 < p->out_dim; c0 += slice_rows) {
         const uint32_t rows = p->out_dim - c0 < slice_rows ? p->out_dim - c0 : slice_rows;
-        const uint64_t b0 = (uint64_t)c0 * (p->in_dim / 32u);
-        const uint64_t blocks = (uint64_t)rows * (p->in_dim / 32u);
-        qwen35_q8p_to_bf16_kernel<<<(unsigned)((blocks + 255u) / 256u), 256, 0, stream>>>(
-            scratch, p->quants + b0 * 32u, p->scales + b0, blocks);
+        const uint64_t t0 = (uint64_t)c0 * (p->in_dim / 32u) / 16u;   /* first tile of the slice */
+        const uint64_t tiles = (uint64_t)rows * (p->in_dim / 32u) / 16u;
+        qwen35_q8p_to_bf16_kernel<<<(unsigned)((tiles * 32u + 255u) / 256u), 256, 0, stream>>>(
+            scratch, p->quants + t0 * 512u, p->scales + t0 * 16u, p->in_dim, tiles);
         if (!cuda_ok(cudaGetLastError(), "Qwen packed q8 dequant launch")) return 0;
         void *o = out_bf16 ? (void *)((__nv_bfloat16 *)out + c0) : (void *)((float *)out + c0);
         const cublasStatus_t st = cublasGemmEx(cuda_cublas_for_tier(tier), CUBLAS_OP_T, CUBLAS_OP_N,
