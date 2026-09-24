@@ -354,7 +354,59 @@ static void check_speculative_distribution(void) {
            (double)counts[2] / trials);
 }
 
+static void check_ngram_draft(void) {
+    int out[8];
+    /* a copy: the window A..H read before, then 99, then A..G again with H last */
+    int hist[32];
+    int n = 0;
+    for (int i = 0; i < 12; i++) hist[n++] = 10 + i;
+    hist[n++] = 99;
+    for (int i = 0; i < 7; i++) hist[n++] = 10 + i;
+    int src = -1;
+    int d = ds4_test_ngram_draft(hist, n, 17, 8, 32, 4, 7, &src, out);
+    const int want_copy[] = {18, 19, 20, 21, 99, 10, 11};
+    CHECK(d == 7 && src == 7 && memcmp(out, want_copy, sizeof(want_copy)) == 0, "ngram copy drafts (%d)", d);
+    src = -1;
+    CHECK(ds4_test_ngram_draft(hist, n, 42, 8, 32, 4, 7, &src, out) == 0 && src == -1, "ngram without a match");
+    CHECK(ds4_test_ngram_draft(hist, 5, 14, 8, 32, 4, 7, &src, out) == 0, "ngram history shorter than the match");
+
+    /* equal matches: the latest wins (1 2 3 then 7, later 1 2 3 then 8) */
+    const int two[] = {1, 2, 3, 7, 7, 7, 7, 1, 2, 3, 8, 8, 8, 8, 5, 1, 2};
+    const int n_two = (int)(sizeof(two) / sizeof(two[0]));
+    src = -1;
+    d = ds4_test_ngram_draft(two, n_two, 3, 3, 32, 4, 4, &src, out);
+    const int want_latest[] = {8, 8, 8, 8};
+    CHECK(d == 4 && src == 9 && memcmp(out, want_latest, sizeof(want_latest)) == 0,
+          "ngram latest of equal matches (%d)", d);
+
+    /* the longest match wins over a later, shorter one: 1 2 3 4 then 7s,
+     * later 9 3 4 then 8s, and the history ends with 1 2 3 4 */
+    const int frag[] = {1, 2, 3, 4, 7, 7, 7, 7, 9, 3, 4, 8, 8, 8, 8, 5, 1, 2, 3};
+    const int n_frag = (int)(sizeof(frag) / sizeof(frag[0]));
+    src = -1;
+    d = ds4_test_ngram_draft(frag, n_frag, 4, 2, 32, 4, 4, &src, out);
+    const int want_long[] = {7, 7, 7, 7};
+    CHECK(d == 4 && src == 3 && memcmp(out, want_long, sizeof(want_long)) == 0, "ngram longest match (%d)", d);
+    /* the copy being followed is kept while it matches at least match_min,
+     * even with a longer match elsewhere; a stale one is searched past */
+    src = 10;
+    d = ds4_test_ngram_draft(frag, n_frag, 4, 2, 32, 4, 4, &src, out);
+    const int want_follow[] = {8, 8, 8, 8};
+    CHECK(d == 4 && src == 10 && memcmp(out, want_follow, sizeof(want_follow)) == 0, "ngram followed copy (%d)", d);
+    src = 5;
+    d = ds4_test_ngram_draft(frag, n_frag, 4, 2, 32, 4, 4, &src, out);
+    CHECK(d == 4 && src == 3, "ngram stale copy searched past (%d, %d)", d, src);
+
+    /* a repeating pattern: the drafts run into the window itself */
+    const int rep[] = {5, 6, 5, 6, 5, 6, 5, 6, 5, 6};
+    src = -1;
+    d = ds4_test_ngram_draft(rep, 10, 5, 3, 32, 4, 7, &src, out);
+    const int want_rep[] = {6, 5, 6, 5};
+    CHECK(d == 4 && memcmp(out, want_rep, sizeof(want_rep)) == 0, "ngram repeating pattern (%d)", d);
+}
+
 int main(void) {
+    check_ngram_draft();
     check_speculative_distribution();
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));

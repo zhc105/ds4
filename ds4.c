@@ -16633,6 +16633,25 @@ typedef struct {
  * of block keys in the scratch. */
 enum { QWEN_QSA_SELECT_ROWS = 128 };
 
+/* n-gram drafts (qwen_session_spec_cycle): the place in the session's
+ * history whose preceding tokens match the history's end longest (at least
+ * QWEN_NGRAM_MATCH_MIN, compared up to QWEN_NGRAM_MATCH_MAX; ngram_draft)
+ * gives up to QWEN_NGRAM_DRAFT_MAX drafts, used when there are at least
+ * QWEN_NGRAM_DRAFT_MIN (fewer is what the drafter offers anyway).  The
+ * longest match and the copy the previous cycle followed pick the right
+ * one of the places a repeated fragment occurs.  A shorter minimum picks
+ * a copy up no sooner after an edit (measured, 4 against 8) but guesses
+ * wrong more often in new text.  The cap keeps the verify pass at 8 rows:
+ * past that qwen_graph_forward switches to the prefill recipe, whose
+ * logits are not those of a decode step.  The routed experts cost each
+ * row its own weight reads, so a pass of 8 rows costs about two steps and
+ * a failed lookup is expensive: every consecutive failure makes the lookup
+ * sit out one more cycle. */
+enum {
+    QWEN_NGRAM_MATCH_MIN = 8, QWEN_NGRAM_MATCH_MAX = 32,
+    QWEN_NGRAM_DRAFT_MIN = 4, QWEN_NGRAM_DRAFT_MAX = 7
+};
+
 /* The row table: a slot per (kernel kind, layer, row), rows innermost so a
  * kernel indexes its (kind, layer) run by row.  Before a pass the host
  * describes the graph of every row at its position (qwen_graph_slots) and
@@ -43848,7 +43867,63 @@ static int sample_top_p_min_p(
     return ids[filtered - 1];
 }
 
+#if defined(DS4_QWEN_GPU) || defined(DS4_TEST_HOOKS)
+/* How many tokens up to hist[e] equal the ones up to `last`, the token
+ * after hist[0, n) (so e < n), counting at most `cap`. */
+static int ngram_suffix(const int *hist, int n, int last, int e, int cap) {
+    if (hist[e] != last) return 0;
+    int l = 1;
+    while (l < cap && e - l >= 0 && hist[e - l] == hist[n - l]) l++;
+    return l;
+}
+
+/* Prompt-lookup drafts for the history hist[0, n) followed by `last`: the
+ * place e earlier in the history that ends the longest run of tokens equal
+ * to the history's end (counted up to match_max, the latest of equals),
+ * when that run is at least match_min long and at least `min` tokens
+ * follow e, and up to `max` of those tokens.  The tokens after e may run
+ * into the window itself, which is how a repeating pattern extends.
+ *
+ * *src carries a copy across cycles: on entry the place the previous
+ * drafts continue at (-1: none), taken over whenever it still ends a run
+ * of match_min, since a fragment the copied text repeats elsewhere may
+ * end a run as long there, followed by something else; on return e, or -1.
+ * Returns the draft count, 0 when there is no such place.  The search is a
+ * backward scan: a few hundred microseconds at 262144 tokens, against a
+ * verify pass of about 100 ms. */
+static int ngram_draft(const int *hist, int n, int last, int match_min, int match_max, int min, int max,
+                       int *src, int *out) {
+    int best = -1;
+    if (match_min >= 1 && min >= 1 && max >= min && n >= min) {
+        const int c = *src;
+        if (c >= 0 && c <= n - min && ngram_suffix(hist, n, last, c, match_min) >= match_min) {
+            best = c;
+        } else {
+            int best_l = 0;
+            for (int e = n - min; e >= 0 && best_l < match_max; e--) {
+                const int l = ngram_suffix(hist, n, last, e, match_max);
+                if (l > best_l) {
+                    best_l = l;
+                    best = e;
+                }
+            }
+            if (best_l < match_min) best = -1;
+        }
+    }
+    *src = best;
+    if (best < 0) return 0;
+    const int d = n - best < max ? n - best : max;
+    for (int i = 0; i < d; i++) out[i] = best + 1 + i < n ? hist[best + 1 + i] : last;
+    return d;
+}
+#endif
+
 #ifdef DS4_TEST_HOOKS
+int ds4_test_ngram_draft(const int *hist, int n, int last, int match_min, int match_max, int min, int max,
+                         int *src, int *out) {
+    return ngram_draft(hist, n, last, match_min, match_max, min, max, src, out);
+}
+
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,
@@ -57325,6 +57400,13 @@ struct ds4_session {
     float *qwen_mtp_rows;      /* the verify batch's distributions, spec_rows x vocab */
     uint64_t qwen_mtp_probe_n, qwen_mtp_probe_hit;
     uint64_t qwen_mtp_cycles, qwen_mtp_committed;   /* speculative statistics */
+    /* n-gram drafts (qwen_session_spec_cycle): after a lookup whose drafts
+     * failed, the next qwen_ngram_skip cycles go to the drafter;
+     * qwen_ngram_src is where in the history the copy being followed goes
+     * on (ngram_draft's *src), -1 when none */
+    uint32_t qwen_ngram_skip, qwen_ngram_misses;
+    int qwen_ngram_src;
+    uint64_t qwen_ngram_cycles, qwen_ngram_committed;
     /* The recurrent state after the last prompts' prefills (qwen_session_state_save). */
     qwen_state_copy qwen_states[QWEN_STATE_COPIES];
     /* The history the K/V rows currently hold, row by row (-1: a rejected
@@ -68313,14 +68395,18 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s);
             return 1;
         }
+        /* verify rows: the drafter's drafts or the n-gram ones, whichever are more */
+        const uint32_t drafts = e->mtp_draft_tokens > QWEN_NGRAM_DRAFT_MAX ? (uint32_t)e->mtp_draft_tokens
+                                                                             : QWEN_NGRAM_DRAFT_MAX;
         if (!qwen_graph_alloc(&s->qwen_graph, (uint32_t)ctx_size, rows,
-                              e->mtp_ready ? (uint32_t)e->mtp_draft_tokens + 1u : 0u,
+                              e->mtp_ready ? drafts + 1u : 0u,
                               &e->qwen_pool, ws && ws->slots ? ws : NULL)) {
             fprintf(stderr, "ds4: failed to allocate the Qwen3.5 graph\n");
             free(s);
             return 1;
         }
         if (ws && !ws->slots) qwen_graph_transfer_scratch(ws, &s->qwen_graph);
+        s->qwen_ngram_src = -1;
         if (!qwen_graph_load_directional_steering(&s->qwen_graph,
                                                   e->directional_steering_file,
                                                   e->directional_steering_attn_scale,
@@ -70854,7 +70940,11 @@ static int ds4_sessions_eval_batch_qwen(ds4_decode_item *items, int count, char 
     }
     return 0;
 }
-/* One speculative cycle with the MTP drafter.  first_token is the token the
+/* One speculative cycle.  The drafts come from the session's own history
+ * when its end occurred before (ngram_draft: an agent rewriting a file it
+ * has read, a tool output quoted back), else from the MTP drafter;
+ * everything after the drafting is the same for both.  first_token is the
+ * token the
  * loop wants evaluated next, at main position pos.  The drafter, holding
  * the main model's streams at pos - 1, guesses the token after first_token,
  * then feeds its own streams to guess up to k in a row.  The main model
@@ -70878,24 +70968,40 @@ static int qwen_session_spec_cycle(
     ds4_qwen_gpu_graph *g = &s->qwen_graph;
     const uint64_t row_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * 2u;
     const uint64_t khist_bytes = (uint64_t)(g_ds4_compress_ratios[DS4_N_LAYER] - 1u) * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    static int ngram_off = -1;
+    if (ngram_off < 0) ngram_off = getenv("DS4_QWEN_NGRAM_DISABLE") != NULL;
     const uint32_t pos = g->n_tokens;
-    int k = e->mtp_draft_tokens;
-    if (k > cap - 1) k = cap - 1;
-    if (k > (int)g->spec_rows - 1) k = (int)g->spec_rows - 1;
-    if (pos + (uint32_t)k + 1u > g->ctx) k = (int)(g->ctx - pos) - 1;
-    if (k <= 0 || !s->qwen_mtp_pending || pos == 0u) {
+    int room = (int)g->spec_rows - 1;   /* drafts the verify pass has rows for */
+    if (room > cap - 1) room = cap - 1;
+    if (pos + (uint32_t)room + 1u > g->ctx) room = (int)(g->ctx - pos) - 1;
+    int toks[32];
+    toks[0] = first_token;
+    int k = 0;
+    if (!ngram_off && room >= QWEN_NGRAM_DRAFT_MIN) {
+        if (s->qwen_ngram_skip) {
+            s->qwen_ngram_skip--;
+        } else {
+            k = ngram_draft(s->checkpoint.v, s->checkpoint.len, first_token, QWEN_NGRAM_MATCH_MIN, QWEN_NGRAM_MATCH_MAX,
+                            QWEN_NGRAM_DRAFT_MIN, room < QWEN_NGRAM_DRAFT_MAX ? room : QWEN_NGRAM_DRAFT_MAX,
+                            &s->qwen_ngram_src, toks + 1);
+        }
+    }
+    const bool ngram = k > 0;
+    if (!ngram) k = e->mtp_draft_tokens < room ? e->mtp_draft_tokens : room;
+    if (k <= 0 || (!ngram && (!s->qwen_mtp_pending || pos == 0u))) {
         if (qwen_session_eval_graph(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
     }
     if (!s->qwen_mtp_rows) s->qwen_mtp_rows = xmalloc((size_t)g->spec_rows * DS4_N_VOCAB * sizeof(float));
-    int toks[32];
-    toks[0] = first_token;
-    /* drafts: the first from the pending target streams, the rest from the drafter's own */
-    bool ok = qwen_session_mtp_draft(s, first_token, pos - 1u) &&
-              ds4_gpu_tensor_copy(g->mtp_khist, 0, g->khist[DS4_N_LAYER], 0, khist_bytes) != 0;
-    toks[1] = s->qwen_mtp_draft;
-    for (int i = 2; ok && i <= k; i++) {
+    /* drafter drafts: the first from the pending target streams, the rest from the drafter's own */
+    bool ok = true;
+    if (!ngram) {
+        ok = qwen_session_mtp_draft(s, first_token, pos - 1u) &&
+             ds4_gpu_tensor_copy(g->mtp_khist, 0, g->khist[DS4_N_LAYER], 0, khist_bytes) != 0;
+        toks[1] = s->qwen_mtp_draft;
+    }
+    for (int i = 2; !ngram && ok && i <= k; i++) {
         ok = ds4_gpu_tensor_copy(g->mtp_hid, 0, g->x, 0, row_bytes) != 0 &&
              qwen_graph_mtp_forward(g, &e->model, &e->weights, &e->mtp_model, &e->qwen_mtp,
                                     &toks[i - 1], 1, pos + (uint32_t)i - 2u, s->qwen_mtp_logits);
@@ -70965,10 +71071,26 @@ static int qwen_session_spec_cycle(
         snprintf(err, errlen, "Qwen MTP rollback failed");
         return -1;
     }
-    /* the drafter re-reads the committed drafts with the target's streams, then waits on the last row */
-    ok = ds4_gpu_tensor_copy(g->mtp_pend, 0, g->x, (uint64_t)a * row_bytes, row_bytes) != 0 &&
-         ds4_gpu_tensor_copy(g->khist[DS4_N_LAYER], 0, g->mtp_khist, 0, khist_bytes) != 0;
-    if (ok && a > 0) {
+    /* The drafter re-reads the committed drafts with the target's streams,
+     * then waits on the last row.  After n-gram drafts it has not yet
+     * consumed its pending row either: the committed rows are then a
+     * prompt chunk to it. */
+    if (ngram) {
+        ok = qwen_session_mtp_prefill(s, toks, (uint32_t)a + 1u, pos);
+        s->qwen_ngram_cycles++;
+        s->qwen_ngram_committed += (uint64_t)a + 1u;
+        /* a miss: fewer tokens than the drafter's cycle might have given */
+        if (a + 1 < QWEN_NGRAM_DRAFT_MIN) {
+            if (s->qwen_ngram_misses < 16u) s->qwen_ngram_misses++;
+            s->qwen_ngram_skip = s->qwen_ngram_misses;
+        } else {
+            s->qwen_ngram_misses = 0;
+        }
+    } else {
+        ok = ds4_gpu_tensor_copy(g->mtp_pend, 0, g->x, (uint64_t)a * row_bytes, row_bytes) != 0 &&
+             ds4_gpu_tensor_copy(g->khist[DS4_N_LAYER], 0, g->mtp_khist, 0, khist_bytes) != 0;
+    }
+    if (!ngram && ok && a > 0) {
         ok = ds4_gpu_tensor_copy(g->mtp_hid, 0, g->x, 0, (uint64_t)a * row_bytes) != 0 &&
              qwen_graph_mtp_forward(g, &e->model, &e->weights, &e->mtp_model, &e->qwen_mtp,
                                     &toks[1], (uint32_t)a, pos, NULL);
@@ -70988,11 +71110,16 @@ static int qwen_session_spec_cycle(
     qwen_session_ple_prev(s);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
+    /* the copy being followed goes on after the committed tokens */
+    if (s->qwen_ngram_src >= 0) s->qwen_ngram_src += a + 1;
     s->qwen_mtp_cycles++;
     s->qwen_mtp_committed += (uint64_t)a + 1u;
     if (getenv("DS4_QWEN_MTP_STATS") && s->qwen_mtp_cycles % 32u == 0u) {
-        fprintf(stderr, "mtp: %llu cycles, %.2f tokens per cycle\n", (unsigned long long)s->qwen_mtp_cycles,
-                (double)s->qwen_mtp_committed / (double)s->qwen_mtp_cycles);
+        fprintf(stderr, "spec: %llu cycles, %.2f tokens per cycle; ngram: %llu cycles, %.2f tokens per cycle\n",
+                (unsigned long long)s->qwen_mtp_cycles,
+                (double)s->qwen_mtp_committed / (double)s->qwen_mtp_cycles,
+                (unsigned long long)s->qwen_ngram_cycles,
+                s->qwen_ngram_cycles ? (double)s->qwen_ngram_committed / (double)s->qwen_ngram_cycles : 0.0);
     }
     return a + 1;
 }
