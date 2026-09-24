@@ -1747,30 +1747,34 @@ __host__ __device__ __forceinline__ uint32_t qwen35_attn_splits(uint32_t n_keys)
     return n == 0u ? 1u : n;
 }
 
-/* A batched row's keys under QSA: a row that sees no more completed blocks
- * than the budget (at most dense_keys keys) attends to its causal prefix
- * exactly as it would serially, whatever the pass's longest row decided;
- * the others take their selected cells.  A sequential pass follows the
- * host's one decision. */
+/* Every row of a decode-sized pass attends exactly as a one-token step at
+ * its position would, whatever the pass's other rows: a batch of sessions
+ * must equal them run serially, and a speculative verify batch the steps
+ * it replaces (a different split plan reorders the softmax sums, and a
+ * near-tie then flips the greedy token).
+ *
+ * A row's keys under QSA: a row that sees no more completed blocks than
+ * the budget (at most dense_keys keys) attends to its causal prefix, as
+ * its own step would, whatever the pass's longest row decided; the others
+ * take their selected cells. */
 __device__ __forceinline__ const int32_t *qwen35_attn_row_cells(
-        const int32_t *sel, uint32_t max_sel, uint32_t dense_keys, uint32_t t, uint32_t pos, uint32_t batched) {
-    if (!sel || (batched && pos + 1u <= dense_keys)) return NULL;
+        const int32_t *sel, uint32_t max_sel, uint32_t dense_keys, uint32_t t, uint32_t pos) {
+    if (!sel || pos + 1u <= dense_keys) return NULL;
     return sel + (uint64_t)t * max_sel;
 }
 
-/* A row's split plan: a sequential pass plans once over its whole key range
- * (pos_end keys) for every token, a batched row over its own; max_splits ==
- * 1 is the tensor-core-less prefill, unsplit. */
+/* A row's split plan, over its own keys; max_splits == 1 is the
+ * tensor-core-less prefill, unsplit. */
 __device__ __forceinline__ uint32_t qwen35_attn_row_splits(
-        uint32_t max_splits, const int32_t *cells, uint32_t max_sel, uint32_t pos, uint32_t pos_end, uint32_t batched) {
+        uint32_t max_splits, const int32_t *cells, uint32_t max_sel, uint32_t pos) {
     if (max_splits == 1u) return 1u;
-    return qwen35_attn_splits(cells ? max_sel : (batched ? pos + 1u : pos_end));
+    return qwen35_attn_splits(cells ? max_sel : pos + 1u);
 }
 
 __global__ static void qwen35_attention_kernel(
         float *att, float *part, const float *qg, const ds4_qwen_batch_slot *slots,
         const int32_t *sel, const uint32_t *n_sel, uint32_t max_sel, uint32_t dense_keys,
-        uint32_t n_head, uint32_t n_kv, uint32_t hd, uint32_t pos_end, uint32_t n_tokens, uint32_t batched,
+        uint32_t n_head, uint32_t n_kv, uint32_t hd, uint32_t n_tokens, uint32_t batched,
         uint32_t max_splits) {
     extern __shared__ float scores[];
     __shared__ float scratch[32];
@@ -1784,8 +1788,8 @@ __global__ static void qwen35_attention_kernel(
     if (t >= n_tokens || h >= n_head) return;
     const ds4_qwen_batch_slot row = slots[batched ? t : 0u];
     const uint32_t pos = batched ? row.pos : row.pos + t;
-    const int32_t *cells = qwen35_attn_row_cells(sel, max_sel, dense_keys, t, pos, batched);
-    const uint32_t n_splits = qwen35_attn_row_splits(max_splits, cells, max_sel, pos, pos_end, batched);
+    const int32_t *cells = qwen35_attn_row_cells(sel, max_sel, dense_keys, t, pos);
+    const uint32_t n_splits = qwen35_attn_row_splits(max_splits, cells, max_sel, pos);
     if (split >= n_splits) return;
     const float *q = qg + ((uint64_t)t * n_head + h) * 2u * hd;
     const float *gate = q + hd;
@@ -1850,15 +1854,15 @@ __global__ static void qwen35_attention_kernel(
 __global__ static void qwen35_attention_merge_kernel(
         float *att, const float *part, const float *qg, const ds4_qwen_batch_slot *slots,
         const int32_t *sel, uint32_t max_sel, uint32_t dense_keys,
-        uint32_t n_head, uint32_t hd, uint32_t pos_end, uint32_t n_tokens, uint32_t batched, uint32_t max_splits) {
+        uint32_t n_head, uint32_t hd, uint32_t n_tokens, uint32_t batched, uint32_t max_splits) {
     const uint32_t t = blockIdx.x;
     const uint32_t h = blockIdx.y;
     const uint32_t tid = threadIdx.x;
     if (t >= n_tokens || h >= n_head) return;
     const ds4_qwen_batch_slot row = slots[batched ? t : 0u];
     const uint32_t pos = batched ? row.pos : row.pos + t;
-    const int32_t *cells = qwen35_attn_row_cells(sel, max_sel, dense_keys, t, pos, batched);
-    const uint32_t n_splits = qwen35_attn_row_splits(max_splits, cells, max_sel, pos, pos_end, batched);
+    const int32_t *cells = qwen35_attn_row_cells(sel, max_sel, dense_keys, t, pos);
+    const uint32_t n_splits = qwen35_attn_row_splits(max_splits, cells, max_sel, pos);
     if (n_splits == 1u) return;   /* the attention kernel finalised this row itself */
     const float *base = part + ((uint64_t)t * n_head + h) * max_splits * (hd + 2u);
     float max = -INFINITY;
@@ -2384,7 +2388,7 @@ extern "C" int ds4_gpu_qwen35_attention(
         return 0;
     }
     uint32_t chunk = (n_keys + max_splits - 1u) / max_splits;
-    if (b && chunk < 128u) chunk = 128u;
+    if (max_splits > 1u && chunk < 128u) chunk = 128u;
     const size_t smem = (size_t)chunk * sizeof(float);
     static size_t smem_limit = 0;
     if (smem > smem_limit) {
@@ -2400,12 +2404,12 @@ extern "C" int ds4_gpu_qwen35_attention(
     qwen35_attention_kernel<<<dim3(n_tokens, n_head, max_splits), hd, smem, stream>>>(
         (float *)att->ptr, (float *)part->ptr, (const float *)qg->ptr, rows,
         sel ? (const int32_t *)sel->ptr : NULL, sel ? (const uint32_t *)n_sel->ptr : NULL, max_sel, dense_keys,
-        n_head, n_kv, hd, pos_end, n_tokens, b, max_splits);
+        n_head, n_kv, hd, n_tokens, b, max_splits);
     if (max_splits > 1u) {
         qwen35_attention_merge_kernel<<<dim3(n_tokens, n_head, 1u), hd, 0, stream>>>(
             (float *)att->ptr, (const float *)part->ptr, (const float *)qg->ptr, rows,
             sel ? (const int32_t *)sel->ptr : NULL, max_sel, dense_keys,
-            n_head, hd, pos_end, n_tokens, b, max_splits);
+            n_head, hd, n_tokens, b, max_splits);
     }
     return cuda_ok(cudaGetLastError(), "Qwen3.5 attention launch");
 }
