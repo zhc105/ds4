@@ -13000,6 +13000,14 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
     return true;
 }
 
+static inline void cpu_relax(void) {
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+}
+
 static void server_generation_enter(server *s) {
     if (!s || !s->batched_mode) return;
     pthread_mutex_lock(&s->model_mu);
@@ -13105,6 +13113,20 @@ static int server_eval_step(server *s, server_slot *slot, int token,
                          "shutdown requested");
             }
             break;
+        }
+        if (s->active_generations <= 1) {
+            /* Generating alone, this thread is the next step's critical
+             * path: it samples the token the worker waits for.  Asleep
+             * through a forward pass, a GB10 core drops to a deep idle
+             * state and takes ~650 us to wake, so spin until the step is
+             * done; batched slots, held for each other anyway, sleep. */
+            pthread_mutex_unlock(&s->model_mu);
+            for (unsigned i = 1; !__atomic_load_n(&slot->decode_done, __ATOMIC_ACQUIRE); i++) {
+                if ((i & 4095u) == 0 && (g_stop_requested || slot_job_cancelled(slot))) break;
+                cpu_relax();
+            }
+            pthread_mutex_lock(&s->model_mu);
+            continue;
         }
         /* An in-flight backend call still owns the session. Even during
          * shutdown or client cancellation, wait for that safe boundary before
@@ -13229,7 +13251,8 @@ static void *decode_worker_main(void *arg) {
                 snprintf(slot->decode_err, sizeof(slot->decode_err), "%s",
                          batch_err[0] ? batch_err : "batched decode failed");
             }
-            slot->decode_done = true;
+            /* release: a slot spinning without model_mu reads the results */
+            __atomic_store_n(&slot->decode_done, true, __ATOMIC_RELEASE);
         }
         pthread_cond_broadcast(&s->model_cv);
     }
