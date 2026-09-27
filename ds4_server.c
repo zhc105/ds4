@@ -12170,7 +12170,8 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
                                 bool tools, bool thinking,
                                 bool dsml_start, bool dsml_end,
                                 double decode_t0,
-                                double *last_t, int *last_completion) {
+                                double *last_t, int *last_completion,
+                                ds4_session *session, ds4_spec_stats *last_spec) {
     const double now = now_sec();
     const double elapsed = now - decode_t0;
     const double interval_s = now - *last_t;
@@ -12184,8 +12185,25 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
     char flags[80];
     log_flags(flags, sizeof(flags), responses_protocol,
               tools, thinking, dsml_start, dsml_end);
+    /* The chunk's speculation: tokens a cycle committed and the drafter's
+     * acceptance at each draft position, which is what the sampling
+     * parameters and the text do to the decode rate. */
+    char spec[96] = "";
+    ds4_spec_stats now_spec;
+    ds4_session_spec_stats(session, &now_spec);
+    const uint64_t cycles = now_spec.cycles - last_spec->cycles;
+    if (cycles) {
+        int n = snprintf(spec, sizeof(spec), " spec=%.2f t/cycle",
+                         (double)(now_spec.committed - last_spec->committed) / (double)cycles);
+        for (int i = 0; i < DS4_SPEC_STAT_POSITIONS && n > 0 && n < (int)sizeof(spec); i++) {
+            const uint64_t reached = now_spec.reached[i] - last_spec->reached[i];
+            if (!reached) break;
+            n += snprintf(spec + n, sizeof(spec) - (size_t)n, "%s%.2f", i ? "/" : " accept=",
+                          (double)(now_spec.accepted[i] - last_spec->accepted[i]) / (double)reached);
+        }
+    }
     server_log(DS4_LOG_GENERATION,
-               "ds4-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
+               "ds4-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs%s",
                kind == REQ_CHAT ? "chat" : "completion",
                ctx,
                completion,
@@ -12193,9 +12211,11 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
                flags,
                chunk_tps,
                avg_tps,
-               elapsed);
+               elapsed,
+               spec);
     *last_t = now;
     *last_completion = completion;
+    *last_spec = now_spec;
 }
 
 typedef struct {
@@ -13742,6 +13762,8 @@ decode_again:
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
+    ds4_spec_stats last_decode_log_spec;
+    ds4_session_spec_stats(slot->session, &last_decode_log_spec);
     thinking_state thinking = thinking_state_from_prompt(&j->req);
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
@@ -13990,7 +14012,8 @@ decode_again:
                                     saw_tool_end,
                                     decode_t0,
                                     &last_decode_log_t,
-                                    &last_decode_log_completion);
+                                    &last_decode_log_completion,
+                                    slot->session, &last_decode_log_spec);
                 next_decode_log += 50;
             }
 
@@ -14125,7 +14148,8 @@ decode_again:
                             saw_tool_end,
                             decode_t0,
                             &last_decode_log_t,
-                            &last_decode_log_completion);
+                            &last_decode_log_completion,
+                            slot->session, &last_decode_log_spec);
     }
 
     if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {

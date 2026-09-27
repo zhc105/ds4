@@ -57365,6 +57365,7 @@ struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
+    ds4_spec_stats spec_stats;   /* ds4_session_spec_stats; Qwen cycles only so far */
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
@@ -57399,14 +57400,12 @@ struct ds4_session {
     float *qwen_mtp_logits;
     float *qwen_mtp_rows;      /* the verify batch's distributions, spec_rows x vocab */
     uint64_t qwen_mtp_probe_n, qwen_mtp_probe_hit;
-    uint64_t qwen_mtp_cycles, qwen_mtp_committed;   /* speculative statistics */
     /* n-gram drafts (qwen_session_spec_cycle): after a lookup whose drafts
      * failed, the next qwen_ngram_skip cycles go to the drafter;
      * qwen_ngram_src is where in the history the copy being followed goes
      * on (ngram_draft's *src), -1 when none */
     uint32_t qwen_ngram_skip, qwen_ngram_misses;
     int qwen_ngram_src;
-    uint64_t qwen_ngram_cycles, qwen_ngram_committed;
     /* The recurrent state after the last prompts' prefills (qwen_session_state_save). */
     qwen_state_copy qwen_states[QWEN_STATE_COPIES];
     /* The history the K/V rows currently hold, row by row (-1: a rejected
@@ -71077,8 +71076,6 @@ static int qwen_session_spec_cycle(
      * prompt chunk to it. */
     if (ngram) {
         ok = qwen_session_mtp_prefill(s, toks, (uint32_t)a + 1u, pos);
-        s->qwen_ngram_cycles++;
-        s->qwen_ngram_committed += (uint64_t)a + 1u;
         /* a miss: fewer tokens than the drafter's cycle might have given */
         if (a + 1 < QWEN_NGRAM_DRAFT_MIN) {
             if (s->qwen_ngram_misses < 16u) s->qwen_ngram_misses++;
@@ -71112,14 +71109,15 @@ static int qwen_session_spec_cycle(
     s->mtp_draft_valid = false;
     /* the copy being followed goes on after the committed tokens */
     if (s->qwen_ngram_src >= 0) s->qwen_ngram_src += a + 1;
-    s->qwen_mtp_cycles++;
-    s->qwen_mtp_committed += (uint64_t)a + 1u;
-    if (getenv("DS4_QWEN_MTP_STATS") && s->qwen_mtp_cycles % 32u == 0u) {
-        fprintf(stderr, "spec: %llu cycles, %.2f tokens per cycle; ngram: %llu cycles, %.2f tokens per cycle\n",
-                (unsigned long long)s->qwen_mtp_cycles,
-                (double)s->qwen_mtp_committed / (double)s->qwen_mtp_cycles,
-                (unsigned long long)s->qwen_ngram_cycles,
-                s->qwen_ngram_cycles ? (double)s->qwen_ngram_committed / (double)s->qwen_ngram_cycles : 0.0);
+    ds4_spec_stats *st = &s->spec_stats;
+    st->cycles++;
+    st->committed += (uint64_t)a + 1u;
+    if (!ngram) {
+        /* draft i was checked only if drafts 0..i-1 were all accepted */
+        for (int i = 0; i < k && i <= a && i < DS4_SPEC_STAT_POSITIONS; i++) {
+            st->reached[i]++;
+            if (i < a) st->accepted[i]++;
+        }
     }
     return a + 1;
 }
@@ -79837,6 +79835,10 @@ int ds4_session_pos(ds4_session *s) {
 
 int ds4_session_ctx(ds4_session *s) {
     return s->ctx_size;
+}
+
+void ds4_session_spec_stats(ds4_session *s, ds4_spec_stats *out) {
+    *out = s->spec_stats;
 }
 
 int ds4_session_prefill_cap(ds4_session *s) {

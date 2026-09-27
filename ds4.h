@@ -629,6 +629,16 @@ void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
+/* Speculative decoding totals of a session since it was created: cycles
+ * (drafter and n-gram), the tokens they committed, and for the drafter's
+ * cycles, per draft position, how many reached it (every earlier draft
+ * accepted) and how many accepted it.  Diff two reads for a stretch. */
+enum { DS4_SPEC_STAT_POSITIONS = 8 };
+typedef struct {
+    uint64_t cycles, committed;
+    uint64_t reached[DS4_SPEC_STAT_POSITIONS], accepted[DS4_SPEC_STAT_POSITIONS];
+} ds4_spec_stats;
+void ds4_session_spec_stats(ds4_session *s, ds4_spec_stats *out);
 int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
