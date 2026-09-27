@@ -2,10 +2,11 @@
 #define DS4_NGRAM_CACHE_H
 
 /* Row cache for the Qwen PLE n-gram table: fixed-size rows of a large file,
- * addressed by row id, read with direct I/O on a cache miss.  One service
- * thread owns the cache; callers hand it a pass's row ids and get the row
- * bytes back, and may hint rows they will ask for soon.  The cache knows
- * nothing about the row encoding. */
+ * addressed by row id, read with direct I/O on a cache miss.  A caller
+ * gathers a pass's rows on its own thread, polling its reads so the forward
+ * pass it holds up never sleeps; rows hinted as needed soon are read ahead
+ * by a background thread between gathers.  The cache knows nothing about
+ * the row encoding. */
 
 #include <stdbool.h>
 #include <stdint.h>

@@ -94,27 +94,28 @@ struct ds4_ngram_cache {
     ngc_ring ring;
 #endif
 
-    /* service-thread scratch for one pass */
+    /* scratch for one pass, used by whichever thread serves (see mu) */
     uint32_t *pass_slot, *miss;
     uint8_t *pass_miss;      /* row i of the pass was read, not found */
     uint64_t scratch_cap;
     uint32_t hint_batch[NGC_HINT_BATCH];
 
+    /* The cache, its ring and scratch belong to one thread at a time: a
+     * gather's caller while it serves, else the read-ahead thread while
+     * `serving`.  A caller raises req_pending so no new read-ahead batch
+     * starts, and waits out the one in flight. */
     pthread_t thread;
     pthread_mutex_t caller;  /* one gather at a time */
     pthread_mutex_t mu;      /* guards everything below */
     pthread_cond_t wake, done;
-    bool stop, req_pending, req_ok;
-    const uint32_t *req_rows;
-    uint64_t req_n;
-    uint8_t *req_out;
+    bool stop, req_pending, serving;
     uint32_t *hint;          /* [NGC_HINT_CAP] once first used; served in order */
     uint64_t hint_n, hint_pos;
     ds4_ngram_cache_stats pub;   /* published copy of st, plus the caller-side counters */
     time_t last_log;             /* CLOCK_MONOTONIC seconds */
     uint64_t logged_lookups;
 
-    ds4_ngram_cache_stats st;    /* service thread only */
+    ds4_ngram_cache_stats st;    /* the serving thread's */
 };
 
 static void *ngc_map(uint64_t bytes) {
@@ -286,8 +287,10 @@ static bool ngc_ring_init(ngc_ring *r, unsigned entries) {
  * The ring is ours alone and n never exceeds its size, so the completion
  * queue cannot overflow.  Transient enter errors are retried; anything else
  * means the ring's bookkeeping is wrong, and continuing would pair stale
- * completions with the next pass's buffers. */
-static void ngc_ring_run(ngc_ring *r, int fd, const ngc_io *io, unsigned n, int32_t *res) {
+ * completions with the next pass's buffers.  `poll` reaps without ever
+ * blocking: a sleeping thread on GB10 takes ~650 us to wake from its idle
+ * state, several times the reads themselves. */
+static void ngc_ring_run(ngc_ring *r, int fd, const ngc_io *io, unsigned n, int32_t *res, bool poll) {
     const unsigned tail = *r->sq_tail, mask = *r->sq_mask;
     for (unsigned j = 0; j < n; j++) {
         const unsigned idx = (tail + j) & mask;
@@ -304,7 +307,8 @@ static void ngc_ring_run(ngc_ring *r, int fd, const ngc_io *io, unsigned n, int3
     *r->sq_tail = tail + n;
     unsigned submitted = 0, reaped = 0;
     while (reaped < n) {
-        const int ret = (int)syscall(__NR_io_uring_enter, r->fd, n - submitted, 1u, IORING_ENTER_GETEVENTS, NULL, 0);
+        const int ret = (int)syscall(__NR_io_uring_enter, r->fd, n - submitted, poll ? 0u : 1u,
+                                     IORING_ENTER_GETEVENTS, NULL, 0);
         if (ret < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EBUSY) continue;
             fprintf(stderr, "ds4: PLE cache io_uring_enter failed: %s\n", strerror(errno));
@@ -337,7 +341,7 @@ static bool ngc_pread(int fd, void *buf, uint32_t len, uint64_t off, uint32_t ne
  * (two sectors when the row straddles a boundary); the rest is discarded,
  * since hash-addressed neighbours are almost never wanted.  A read the ring
  * could not complete gets one synchronous retry. */
-static bool ngc_read_batch(ds4_ngram_cache *c, const uint32_t *rows, uint64_t k0, unsigned n) {
+static bool ngc_read_batch(ds4_ngram_cache *c, const uint32_t *rows, uint64_t k0, unsigned n, bool poll) {
     ngc_io io[NGC_QD];
     int32_t res[NGC_QD];
     const uint32_t rb = c->row_bytes;
@@ -350,7 +354,9 @@ static bool ngc_read_batch(ds4_ngram_cache *c, const uint32_t *rows, uint64_t k0
         res[j] = -1;
     }
 #ifdef __linux__
-    if (c->have_ring) ngc_ring_run(&c->ring, c->fd, io, n, res);
+    if (c->have_ring) ngc_ring_run(&c->ring, c->fd, io, n, res, poll);
+#else
+    (void)poll;
 #endif
     for (unsigned j = 0; j < n; j++) {
         const uint32_t need = io[j].skip + rb;
@@ -384,7 +390,8 @@ static bool ngc_scratch(ds4_ngram_cache *c, uint64_t n) {
  * slot.  *pinned counts the leading rows that were pinned, which the caller
  * unpins whether or not this succeeded.  On failure no row that was admitted
  * without its bytes stays in the index. */
-static bool ngc_ensure(ds4_ngram_cache *c, const uint32_t *rows, uint64_t n, uint64_t *pinned, uint64_t *n_read) {
+static bool ngc_ensure(ds4_ngram_cache *c, const uint32_t *rows, uint64_t n, uint64_t *pinned, uint64_t *n_read,
+                       bool poll) {
     *pinned = 0;
     *n_read = 0;
     if (!ngc_scratch(c, n)) return false;
@@ -413,7 +420,7 @@ static bool ngc_ensure(ds4_ngram_cache *c, const uint32_t *rows, uint64_t n, uin
     }
     *pinned = i;
     for (uint64_t k = 0; ok && k < n_miss; k += NGC_QD) {
-        ok = ngc_read_batch(c, rows, k, (unsigned)(n_miss - k < NGC_QD ? n_miss - k : NGC_QD));
+        ok = ngc_read_batch(c, rows, k, (unsigned)(n_miss - k < NGC_QD ? n_miss - k : NGC_QD), poll);
     }
     if (!ok) {
         for (uint64_t k = 0; k < n_miss; k++) ngc_index_remove(c, rows[c->miss[k]], c->pass_slot[c->miss[k]]);
@@ -456,7 +463,7 @@ static void ngc_log(const ds4_ngram_cache_stats *s, const char *when) {
 
 static bool ngc_serve_gather(ds4_ngram_cache *c, const uint32_t *rows, uint64_t n, uint8_t *out) {
     uint64_t pinned, n_read;
-    const bool ok = ngc_ensure(c, rows, n, &pinned, &n_read);
+    const bool ok = ngc_ensure(c, rows, n, &pinned, &n_read, true);
     if (ok) {
         for (uint64_t i = 0; i < n; i++) {
             memcpy(out + i * c->row_bytes, c->data + (uint64_t)c->pass_slot[i] * c->row_bytes, c->row_bytes);
@@ -470,43 +477,42 @@ static bool ngc_serve_gather(ds4_ngram_cache *c, const uint32_t *rows, uint64_t 
 
 static void ngc_serve_hint(ds4_ngram_cache *c, uint64_t n) {
     uint64_t pinned, n_read;
-    ngc_ensure(c, c->hint_batch, n, &pinned, &n_read);
+    ngc_ensure(c, c->hint_batch, n, &pinned, &n_read, false);
     ngc_unpin(c, pinned);
     c->st.prefetch_reads += n_read;
 }
 
-/* A gather preempts the hint between batches, so it waits for at most one
- * batch of read-ahead. */
+/* Under mu, by the thread that just served: pub takes st, keeping the
+ * caller-side counters only callers write. */
+static void ngc_publish(ds4_ngram_cache *c) {
+    c->st.slots_used = c->n_used;
+    const ds4_ngram_cache_stats caller = c->pub;
+    c->pub = c->st;
+    memcpy(c->pub.gathers, caller.gathers, sizeof caller.gathers);
+    memcpy(c->pub.wait_us, caller.wait_us, sizeof caller.wait_us);
+}
+
+/* The read-ahead thread.  Gathers are served on their caller's thread, which
+ * the forward pass is waiting on and which must not sleep; this one works
+ * through the hints between them, in batches so a gather waits for at most
+ * one batch. */
 static void *ngc_main(void *arg) {
     ds4_ngram_cache *c = arg;
     pthread_mutex_lock(&c->mu);
     for (;;) {
-        while (!c->stop && !c->req_pending && c->hint_pos == c->hint_n) pthread_cond_wait(&c->wake, &c->mu);
+        while (!c->stop && (c->req_pending || c->hint_pos == c->hint_n)) pthread_cond_wait(&c->wake, &c->mu);
         if (c->stop) break;
-        if (c->req_pending) {
-            const uint32_t *rows = c->req_rows;
-            const uint64_t n = c->req_n;
-            uint8_t *out = c->req_out;
-            pthread_mutex_unlock(&c->mu);
-            const bool ok = ngc_serve_gather(c, rows, n, out);
-            pthread_mutex_lock(&c->mu);
-            c->req_ok = ok;
-            c->req_pending = false;
-            pthread_cond_signal(&c->done);
-        } else {
-            const uint64_t left = c->hint_n - c->hint_pos;
-            const uint64_t k = left < NGC_HINT_BATCH ? left : NGC_HINT_BATCH;
-            memcpy(c->hint_batch, c->hint + c->hint_pos, (size_t)k * sizeof(uint32_t));
-            c->hint_pos += k;
-            pthread_mutex_unlock(&c->mu);
-            ngc_serve_hint(c, k);
-            pthread_mutex_lock(&c->mu);
-        }
-        c->st.slots_used = c->n_used;
-        const ds4_ngram_cache_stats caller = c->pub;
-        c->pub = c->st;
-        memcpy(c->pub.gathers, caller.gathers, sizeof caller.gathers);
-        memcpy(c->pub.wait_us, caller.wait_us, sizeof caller.wait_us);
+        const uint64_t left = c->hint_n - c->hint_pos;
+        const uint64_t k = left < NGC_HINT_BATCH ? left : NGC_HINT_BATCH;
+        memcpy(c->hint_batch, c->hint + c->hint_pos, (size_t)k * sizeof(uint32_t));
+        c->hint_pos += k;
+        c->serving = true;
+        pthread_mutex_unlock(&c->mu);
+        ngc_serve_hint(c, k);
+        pthread_mutex_lock(&c->mu);
+        c->serving = false;
+        ngc_publish(c);
+        if (c->req_pending) pthread_cond_signal(&c->done);
     }
     pthread_mutex_unlock(&c->mu);
     return NULL;
@@ -694,13 +700,14 @@ bool ds4_ngram_cache_gather(ds4_ngram_cache *c, const uint32_t *rows, uint64_t n
     ngc_now_us(&t0);
     pthread_mutex_lock(&c->caller);
     pthread_mutex_lock(&c->mu);
-    c->req_rows = rows;
-    c->req_n = n;
-    c->req_out = out;
     c->req_pending = true;
-    pthread_cond_signal(&c->wake);
-    while (c->req_pending) pthread_cond_wait(&c->done, &c->mu);
-    const bool ok = c->req_ok;
+    while (c->serving) pthread_cond_wait(&c->done, &c->mu);
+    pthread_mutex_unlock(&c->mu);
+    const bool ok = ngc_serve_gather(c, rows, n, out);
+    pthread_mutex_lock(&c->mu);
+    c->req_pending = false;
+    if (c->hint_pos != c->hint_n) pthread_cond_signal(&c->wake);
+    ngc_publish(c);
     const time_t now = ngc_now_us(&t1);
     const int large = n > DS4_NGRAM_CACHE_SMALL_PASS;
     c->pub.gathers[large]++;
